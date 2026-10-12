@@ -82,9 +82,10 @@ and you can read, search, write, and file mail with no connection at all.
 curl -fsSL https://raw.githubusercontent.com/last-refuge/overlook/main/install.sh | bash
 ```
 
-It builds a real package from source and installs it with `pacman`, so `pacman` can update and remove it.
-It asks for your password only for `pacman`. On Omarchy, press <kbd>Super</kbd>+<kbd>Space</kbd> and type
-"Overlook". The first build takes a few minutes; later ones are fast.
+It downloads the [latest release](https://github.com/last-refuge/overlook/releases/latest), verifies its
+SHA-256 checksum, and installs the package with `pacman`, so `pacman` can update and remove it. It asks for
+your password only for `pacman`. On Omarchy, press <kbd>Super</kbd>+<kbd>Space</kbd> and type "Overlook".
+If no prebuilt package exists for your machine it builds one from source instead, which takes a few minutes.
 
 Prefer to read it first? [`install.sh`](install.sh) is short. Options: `--dry-run` shows the plan and changes
 nothing, `--prefix DIR` installs into a directory without administrator access, `--ref REF` builds a branch
@@ -98,8 +99,7 @@ fontconfig, FreeType, and a Vulkan driver. Or by hand:
 make install PREFIX=~/.local
 ```
 
-When a release exists for your machine the installer downloads it, verifies its SHA-256 checksum, and
-installs that instead of compiling; `--source` forces a build.
+`--source` forces a build from source even when a release exists.
 
 **Remove it:** `sudo pacman -Rns overlook` on Arch, or `./install.sh --uninstall`. Your mail and settings in
 `~/.local/share/overlook` stay until you delete them.
