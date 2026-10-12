@@ -111,3 +111,5 @@ Brand assets and the HTML design preview keep their existing maintenance command
   toggle was not exercised by click during the review (no pointer automation at the time); verify once by hand.
 
 - v0.1.2 published 2026-10-12 (rendering review: pre-pass, quoted text, inline images, vendored parser patches). Working version is now 0.1.3.
+
+- v0.1.3 published 2026-10-12 (Settings segmented controls show the current choice). Working version is now 0.1.4.
