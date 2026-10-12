@@ -2,7 +2,7 @@
 
 use rusqlite::Connection;
 
-const MIGRATIONS: &[&str] = &[V1];
+const MIGRATIONS: &[&str] = &[V1, V2];
 
 pub fn migrate(conn: &Connection) -> rusqlite::Result<()> {
     let current: i64 = conn.query_row("PRAGMA user_version", [], |r| r.get(0))?;
@@ -152,5 +152,19 @@ CREATE TRIGGER messages_fts_update AFTER UPDATE OF subject, search_text ON messa
     INSERT INTO messages_fts(messages_fts, rowid, subject, search_text) VALUES ('delete', old.rowid, old.subject, old.search_text);
     INSERT INTO messages_fts(rowid, subject, search_text) VALUES (new.rowid, new.subject, new.search_text);
 END;
+COMMIT;
+"#;
+
+const V2: &str = r#"
+BEGIN;
+ALTER TABLE messages ADD COLUMN category TEXT;
+ALTER TABLE messages ADD COLUMN is_important INTEGER NOT NULL DEFAULT 0;
+ALTER TABLE messages ADD COLUMN focus_override INTEGER;
+CREATE TABLE focus_rules (
+    account_id TEXT NOT NULL REFERENCES accounts(id) ON DELETE CASCADE,
+    email TEXT NOT NULL,
+    focused INTEGER NOT NULL,
+    PRIMARY KEY (account_id, email)
+);
 COMMIT;
 "#;

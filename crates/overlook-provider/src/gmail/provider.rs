@@ -297,6 +297,19 @@ impl MailProvider for GmailProvider {
         })
     }
 
+    fn fetch_attachment(&self, account: &Account, message: &Message, attachment: &Attachment) -> BoxFuture<'_, Result<Vec<u8>, ProviderError>> {
+        let message_id = message.provider_id.as_ref().map(|p| p.0.clone()).or_else(|| gmail_id(&account.id, message.id.as_str()));
+        let attachment_id = attachment.provider_id.as_ref().map(|p| p.0.clone());
+        Box::pin(async move {
+            let (Some(mid), Some(aid)) = (message_id, attachment_id) else {
+                return Err(ProviderError::Rejected("this attachment has no Gmail id".into()));
+            };
+            let v = self.client.get(&format!("messages/{mid}/attachments/{aid}"), &[])?;
+            let data = v.get("data").and_then(|d| d.as_str()).ok_or_else(|| ProviderError::Rejected("Gmail returned no attachment data".into()))?;
+            Ok(mapping::base64url_decode(data))
+        })
+    }
+
     fn send(&self, account: &Account, draft: &Draft, context: SendContext) -> BoxFuture<'_, Result<SentReceipt, ProviderError>> {
         let account = account.clone();
         let draft = draft.clone();

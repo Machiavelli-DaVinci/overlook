@@ -10,11 +10,12 @@
 
 mod schema;
 
+use overlook_core::focus::{classify_focus, FocusRule, FocusTab};
 use overlook_core::sanitize::html_to_text;
 use overlook_core::time::{now, Timestamp};
 use overlook_core::*;
 use rusqlite::{params, Connection, OptionalExtension, Row, Transaction};
-use std::collections::{BTreeMap, BTreeSet};
+use std::collections::{BTreeMap, BTreeSet, HashMap, HashSet};
 use std::path::Path;
 use std::sync::Mutex;
 
@@ -246,6 +247,9 @@ impl Store {
                             }
                         }
                     }
+                    if merged.focus_override.is_none() {
+                        merged.focus_override = local.focus_override;
+                    }
                     if protected.contains(&incoming.id) {
                         merged.is_read = local.is_read;
                         merged.is_starred = local.is_starred;
@@ -293,13 +297,15 @@ impl Store {
         self.with_conn(|c| load_messages(c, "WHERE m.account_id=?1", params![account.0]))
     }
 
-    /// Conversation summaries for a mailbox view, newest first.
+    /// Conversation summaries for a mailbox view, newest first. `focus` splits the Inbox
+    /// into Focused and Other; `None` shows everything.
     pub fn conversations(
         &self,
         account: &AccountId,
         owner_email: &str,
         view: &MailboxView,
         filter: ListFilter,
+        focus: Option<FocusTab>,
     ) -> Result<Vec<ConversationSummary>> {
         let labels = self.labels(account)?;
         let kind_of = |id: &LabelId| labels.iter().find(|l| &l.id == id).map(|l| l.kind);
@@ -313,6 +319,11 @@ impl Store {
 
         let all = self.messages_for_account(account)?;
         let pending = self.pending_message_ids(account)?;
+        let (rules, correspondents) = if focus.is_some() {
+            (self.focus_rule_map(account)?, self.sent_recipients(account)?)
+        } else {
+            (HashMap::new(), HashSet::new())
+        };
 
         // Group every message of the account by conversation first, then decide which
         // conversations belong to the view. This keeps conversation counts consistent
@@ -348,6 +359,15 @@ impl Store {
                 MailboxView::Kind(LabelKind::Trash) => msgs.into_iter().filter(|m| in_trash(m)).collect(),
                 _ => msgs.into_iter().filter(|m| !in_trash(m)).collect(),
             };
+            if let Some(tab) = focus {
+                // A conversation follows its newest incoming message; threads with only our
+                // own mail count as Focused.
+                let decisive = visible.iter().filter(|m| !m.is_outgoing).max_by_key(|m| m.date).or_else(|| visible.iter().max_by_key(|m| m.date));
+                let focused = decisive.map(|m| classify_focus(m, &rules, &correspondents)).unwrap_or(true);
+                if focused != (tab == FocusTab::Focused) {
+                    continue;
+                }
+            }
             let Some(summary) = ConversationSummary::from_messages(&visible, owner_email, &pending) else { continue };
             let keep = match filter {
                 ListFilter::All => true,
@@ -363,11 +383,76 @@ impl Store {
     }
 
     /// Unread conversation count for Inbox, starred count, and so on, for sidebar badges.
-    pub fn view_count(&self, account: &AccountId, owner_email: &str, view: &MailboxView) -> Result<usize> {
-        let convs = self.conversations(account, owner_email, view, ListFilter::All)?;
+    pub fn view_count(&self, account: &AccountId, owner_email: &str, view: &MailboxView, focus: Option<FocusTab>) -> Result<usize> {
+        let convs = self.conversations(account, owner_email, view, ListFilter::All, focus)?;
         Ok(match view {
             MailboxView::Kind(LabelKind::Inbox) | MailboxView::Label(_) => convs.iter().filter(|c| c.is_unread()).count(),
             _ => convs.len(),
+        })
+    }
+
+    // ------------------------------------------------------------ focused inbox
+
+    pub fn focus_rules(&self, account: &AccountId) -> Result<Vec<FocusRule>> {
+        self.with_conn(|c| {
+            let mut stmt = c.prepare("SELECT email, focused FROM focus_rules WHERE account_id=?1 ORDER BY email")?;
+            let rows = stmt.query_map([&account.0], |r| Ok(FocusRule { email: r.get(0)?, focused: r.get(1)? }))?;
+            Ok(rows.collect::<std::result::Result<Vec<_>, _>>()?)
+        })
+    }
+
+    fn focus_rule_map(&self, account: &AccountId) -> Result<HashMap<String, bool>> {
+        Ok(self.focus_rules(account)?.into_iter().map(|r| (r.email.to_ascii_lowercase(), r.focused)).collect())
+    }
+
+    /// Sets (or with `None` clears) the standing rule for a sender.
+    pub fn set_focus_rule(&self, account: &AccountId, email: &str, focused: Option<bool>) -> Result<()> {
+        let email = email.to_ascii_lowercase();
+        self.with_conn(|c| {
+            match focused {
+                Some(f) => {
+                    c.execute(
+                        "INSERT INTO focus_rules(account_id, email, focused) VALUES(?1,?2,?3) ON CONFLICT(account_id, email) DO UPDATE SET focused=excluded.focused",
+                        params![account.0, email, f],
+                    )?;
+                }
+                None => {
+                    c.execute("DELETE FROM focus_rules WHERE account_id=?1 AND email=?2", params![account.0, email])?;
+                }
+            }
+            Ok(())
+        })
+    }
+
+    /// Per-message override for Focused Inbox (`None` clears it).
+    pub fn set_focus_override(&self, ids: &[MessageId], focused: Option<bool>) -> Result<()> {
+        self.with_tx(|tx| {
+            for id in ids {
+                tx.execute("UPDATE messages SET focus_override=?2 WHERE id=?1", params![id.0, focused])?;
+            }
+            Ok(())
+        })
+    }
+
+    /// Lowercase addresses the account owner has sent mail to.
+    pub fn sent_recipients(&self, account: &AccountId) -> Result<HashSet<String>> {
+        let mut out = HashSet::new();
+        for m in self.messages_for_account(account)? {
+            if m.is_outgoing {
+                for a in m.to.iter().chain(m.cc.iter()) {
+                    out.insert(a.email.to_ascii_lowercase());
+                }
+            }
+        }
+        Ok(out)
+    }
+
+    // -------------------------------------------------------------- attachments
+
+    pub fn set_attachment_local_path(&self, id: &AttachmentId, path: Option<&str>) -> Result<()> {
+        self.with_conn(|c| {
+            c.execute("UPDATE attachments SET local_path=?2 WHERE id=?1", params![id.0, path])?;
+            Ok(())
         })
     }
 
@@ -700,14 +785,16 @@ fn row_to_operation(r: &Row<'_>) -> rusqlite::Result<PendingOperation> {
 fn upsert_message_tx(tx: &Connection, m: &Message) -> Result<()> {
     tx.execute(
         "INSERT INTO messages(id, account_id, conversation_id, provider_id, from_json, to_json, cc_json, bcc_json, reply_to_json,
-            subject, snippet, body_text, body_html, search_text, date, is_read, is_starred, is_outgoing, rfc_message_id, in_reply_to)
-         VALUES(?1,?2,?3,?4,?5,?6,?7,?8,?9,?10,?11,?12,?13,?14,?15,?16,?17,?18,?19,?20)
+            subject, snippet, body_text, body_html, search_text, date, is_read, is_starred, is_outgoing, rfc_message_id, in_reply_to,
+            category, is_important, focus_override)
+         VALUES(?1,?2,?3,?4,?5,?6,?7,?8,?9,?10,?11,?12,?13,?14,?15,?16,?17,?18,?19,?20,?21,?22,?23)
          ON CONFLICT(id) DO UPDATE SET conversation_id=excluded.conversation_id, provider_id=excluded.provider_id,
             from_json=excluded.from_json, to_json=excluded.to_json, cc_json=excluded.cc_json, bcc_json=excluded.bcc_json,
             reply_to_json=excluded.reply_to_json, subject=excluded.subject, snippet=excluded.snippet,
             body_text=excluded.body_text, body_html=excluded.body_html, search_text=excluded.search_text, date=excluded.date,
             is_read=excluded.is_read, is_starred=excluded.is_starred, is_outgoing=excluded.is_outgoing,
-            rfc_message_id=excluded.rfc_message_id, in_reply_to=excluded.in_reply_to",
+            rfc_message_id=excluded.rfc_message_id, in_reply_to=excluded.in_reply_to,
+            category=excluded.category, is_important=excluded.is_important, focus_override=excluded.focus_override",
         params![
             m.id.0,
             m.account_id.0,
@@ -729,6 +816,9 @@ fn upsert_message_tx(tx: &Connection, m: &Message) -> Result<()> {
             m.is_outgoing,
             m.rfc_message_id,
             m.in_reply_to,
+            m.category,
+            m.is_important,
+            m.focus_override,
         ],
     )?;
     tx.execute("DELETE FROM message_labels WHERE message_id=?1", [&m.id.0])?;
@@ -762,7 +852,8 @@ fn search_text(m: &Message) -> String {
 fn load_messages(c: &Connection, where_clause: &str, args: impl rusqlite::Params) -> Result<Vec<Message>> {
     let sql = format!(
         "SELECT m.id, m.account_id, m.conversation_id, m.provider_id, m.from_json, m.to_json, m.cc_json, m.bcc_json, m.reply_to_json,
-                m.subject, m.snippet, m.body_text, m.body_html, m.date, m.is_read, m.is_starred, m.is_outgoing, m.rfc_message_id, m.in_reply_to
+                m.subject, m.snippet, m.body_text, m.body_html, m.date, m.is_read, m.is_starred, m.is_outgoing, m.rfc_message_id, m.in_reply_to,
+                m.category, m.is_important, m.focus_override
          FROM messages m {where_clause} ORDER BY m.date DESC"
     );
     let mut stmt = c.prepare(&sql)?;
@@ -789,6 +880,9 @@ fn load_messages(c: &Connection, where_clause: &str, args: impl rusqlite::Params
                 is_outgoing: r.get(16)?,
                 rfc_message_id: r.get(17)?,
                 in_reply_to: r.get(18)?,
+                category: r.get(19)?,
+                is_important: r.get(20)?,
+                focus_override: r.get(21)?,
             })
         })?
         .collect::<std::result::Result<Vec<_>, _>>()?
@@ -851,6 +945,9 @@ struct RawMessage {
     is_outgoing: bool,
     rfc_message_id: Option<String>,
     in_reply_to: Option<String>,
+    category: Option<String>,
+    is_important: bool,
+    focus_override: Option<bool>,
 }
 
 impl RawMessage {
@@ -876,6 +973,9 @@ impl RawMessage {
             attachments: Vec::new(),
             rfc_message_id: self.rfc_message_id,
             in_reply_to: self.in_reply_to,
+            category: self.category,
+            is_important: self.is_important,
+            focus_override: self.focus_override,
         })
     }
 }
@@ -1111,6 +1211,9 @@ mod tests {
             attachments: vec![],
             rfc_message_id: None,
             in_reply_to: None,
+            category: None,
+            is_important: false,
+            focus_override: None,
         }
     }
 
@@ -1156,10 +1259,10 @@ mod tests {
         assert!(matches!(ops[0].kind, OperationKind::SetStarred { starred: true, .. }));
         assert!(matches!(ops[1].kind, OperationKind::Archive { .. }));
         assert!(store.message(&MessageId::from("m1")).unwrap().unwrap().is_starred);
-        let inbox = store.conversations(&acct, "jason@example.com", &MailboxView::Kind(LabelKind::Inbox), ListFilter::All).unwrap();
+        let inbox = store.conversations(&acct, "jason@example.com", &MailboxView::Kind(LabelKind::Inbox), ListFilter::All, None).unwrap();
         assert_eq!(inbox.len(), 1, "archived message left the inbox");
         assert!(inbox[0].pending, "pending indicator is derived from the queue");
-        let archive = store.conversations(&acct, "jason@example.com", &MailboxView::Kind(LabelKind::Archive), ListFilter::All).unwrap();
+        let archive = store.conversations(&acct, "jason@example.com", &MailboxView::Kind(LabelKind::Archive), ListFilter::All, None).unwrap();
         assert_eq!(archive.len(), 1);
         assert_eq!(store.account_status(&acct).unwrap().pending_operations, 2);
     }
@@ -1230,7 +1333,7 @@ mod tests {
         store.complete_send(&draft.id, &op.id, &sent).unwrap();
         assert!(store.draft(&draft.id).unwrap().is_none());
         assert_eq!(store.pending_count(&acct).unwrap(), 0);
-        let sent_view = store.conversations(&acct, "jason@example.com", &MailboxView::Kind(LabelKind::Sent), ListFilter::All).unwrap();
+        let sent_view = store.conversations(&acct, "jason@example.com", &MailboxView::Kind(LabelKind::Sent), ListFilter::All, None).unwrap();
         assert_eq!(sent_view.len(), 1);
         assert_eq!(sent_view[0].participant_line(), "Maya Chen", "sent conversations name the recipients");
     }
@@ -1304,15 +1407,39 @@ mod tests {
     }
 
     #[test]
+    fn focused_inbox_splits_and_respects_rules() {
+        let store = Store::open_in_memory().unwrap();
+        seeded(&store);
+        let acct = AccountId::from("acct-1");
+        let mut promo = message("m3", "Big sale", "Everything must go", &["label-inbox"]);
+        promo.from = Address::named("Shop", "deals@shop.example");
+        promo.category = Some("promotions".into());
+        store.upsert_messages(&[promo]).unwrap();
+        let focused = store.conversations(&acct, "jason@example.com", &MailboxView::Kind(LabelKind::Inbox), ListFilter::All, Some(FocusTab::Focused)).unwrap();
+        let other = store.conversations(&acct, "jason@example.com", &MailboxView::Kind(LabelKind::Inbox), ListFilter::All, Some(FocusTab::Other)).unwrap();
+        assert_eq!(focused.len(), 2);
+        assert_eq!(other.len(), 1);
+        assert_eq!(other[0].subject, "Big sale");
+        store.set_focus_rule(&acct, "DEALS@shop.example", Some(true)).unwrap();
+        let other = store.conversations(&acct, "jason@example.com", &MailboxView::Kind(LabelKind::Inbox), ListFilter::All, Some(FocusTab::Other)).unwrap();
+        assert!(other.is_empty(), "rule moves the sender to Focused");
+        store.set_focus_rule(&acct, "deals@shop.example", None).unwrap();
+        store.set_focus_override(&[MessageId::from("m1")], Some(false)).unwrap();
+        let other = store.conversations(&acct, "jason@example.com", &MailboxView::Kind(LabelKind::Inbox), ListFilter::All, Some(FocusTab::Other)).unwrap();
+        assert_eq!(other.len(), 2);
+        assert_eq!(store.view_count(&acct, "jason@example.com", &MailboxView::Kind(LabelKind::Inbox), Some(FocusTab::Focused)).unwrap(), 1);
+    }
+
+    #[test]
     fn trash_and_untrash_round_trip() {
         let store = Store::open_in_memory().unwrap();
         seeded(&store);
         let acct = AccountId::from("acct-1");
         store.apply_change(&acct, LocalChange::Trash { message_ids: vec![MessageId::from("m1")] }).unwrap();
-        let trash = store.conversations(&acct, "jason@example.com", &MailboxView::Kind(LabelKind::Trash), ListFilter::All).unwrap();
+        let trash = store.conversations(&acct, "jason@example.com", &MailboxView::Kind(LabelKind::Trash), ListFilter::All, None).unwrap();
         assert_eq!(trash.len(), 1);
-        assert_eq!(store.view_count(&acct, "jason@example.com", &MailboxView::Kind(LabelKind::Inbox)).unwrap(), 1);
+        assert_eq!(store.view_count(&acct, "jason@example.com", &MailboxView::Kind(LabelKind::Inbox), None).unwrap(), 1);
         store.apply_change(&acct, LocalChange::Untrash { message_ids: vec![MessageId::from("m1")] }).unwrap();
-        assert_eq!(store.view_count(&acct, "jason@example.com", &MailboxView::Kind(LabelKind::Inbox)).unwrap(), 2);
+        assert_eq!(store.view_count(&acct, "jason@example.com", &MailboxView::Kind(LabelKind::Inbox), None).unwrap(), 2);
     }
 }

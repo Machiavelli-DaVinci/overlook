@@ -154,6 +154,9 @@ pub fn message_from_json(account: &Account, v: &Value, labels: &HashMap<String, 
         attachments,
         rfc_message_id: header("Message-ID").or_else(|| header("Message-Id")),
         in_reply_to: header("In-Reply-To"),
+        category: label_ids_raw.iter().find_map(|l| l.strip_prefix("CATEGORY_").map(|c| c.to_ascii_lowercase())),
+        is_important: has("IMPORTANT"),
+        focus_override: None,
     })
 }
 
@@ -303,7 +306,7 @@ mod tests {
     #[test]
     fn maps_full_message() {
         let json = serde_json::json!({
-            "id": "18f1", "threadId": "18f0", "labelIds": ["INBOX", "UNREAD", "STARRED", "Label_7"],
+            "id": "18f1", "threadId": "18f0", "labelIds": ["INBOX", "UNREAD", "STARRED", "Label_7", "IMPORTANT"],
             "snippet": "Hi Jason &amp; team",
             "internalDate": "1760000000000",
             "payload": {
@@ -339,12 +342,16 @@ mod tests {
         assert!(!m.is_read);
         assert!(m.is_starred);
         assert_eq!(m.label_ids.len(), 2, "UNREAD and STARRED are flags, not labels");
+        assert_eq!(m.category, None);
         assert_eq!(m.body.text.as_deref(), Some("Hello there"));
         assert_eq!(m.body.html.as_deref(), Some("<p>Hello there</p>"));
         assert_eq!(m.attachments.len(), 1);
         assert_eq!(m.attachments[0].provider_id.as_ref().unwrap().as_str(), "ATT1");
         assert_eq!(m.rfc_message_id.as_deref(), Some("<abc@northstar.example>"));
+        assert!(m.is_important);
         assert_eq!(gmail_id(&account().id, m.id.as_str()).as_deref(), Some("18f1"));
+        let promo = serde_json::json!({"id": "p1", "threadId": "p1", "labelIds": ["INBOX", "CATEGORY_PROMOTIONS"]});
+        assert_eq!(message_from_json(&account(), &promo, &HashMap::new()).unwrap().category.as_deref(), Some("promotions"));
     }
 
     #[test]

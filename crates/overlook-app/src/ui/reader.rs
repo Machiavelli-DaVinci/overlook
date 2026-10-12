@@ -5,6 +5,7 @@ use super::MailWindow;
 use crate::assets::icon;
 use crate::theme::ActivePalette;
 use gpui_kit::component::button::{Button, ButtonVariants};
+use gpui_kit::component::menu::{DropdownMenu, PopupMenuItem};
 use gpui_kit::component::scroll::ScrollableElement;
 use gpui_kit::component::text::TextView;
 use gpui_kit::component::{Sizable, StyledExt};
@@ -84,6 +85,33 @@ impl MailWindow {
                     move |this, _, window, cx| this.set_read(ids.clone(), unread_any, window, cx)
                 }),
             ))
+            .when(self.focused_enabled && self.view == overlook_store::MailboxView::Kind(LabelKind::Inbox), |bar| {
+                let in_focused = self.inbox_tab == FocusTab::Focused;
+                let target = if in_focused { "Other" } else { "Focused" };
+                let sender = self.thread.iter().filter(|m| !m.is_outgoing).max_by_key(|m| m.date).map(|m| m.from.display_name());
+                let t = cx.entity().downgrade();
+                bar.child(
+                    Button::new("move-focus")
+                        .ghost()
+                        .small()
+                        .icon(icon("arrow-right-left").size(px(16.)))
+                        .label(format!("Move to {target}"))
+                        .dropdown_menu(move |menu, _window, _cx| {
+                            let a = t.clone();
+                            let b = t.clone();
+                            let move_to = !in_focused;
+                            let mut menu = menu.item(PopupMenuItem::new(format!("Move this conversation to {target}")).on_click(move |_, window, cx| {
+                                let _ = a.update(cx, |this, cx| this.move_focus(move_to, false, window, cx));
+                            }));
+                            if let Some(name) = &sender {
+                                menu = menu.item(PopupMenuItem::new(format!("Always move messages from {name} to {target}")).on_click(move |_, window, cx| {
+                                    let _ = b.update(cx, |this, cx| this.move_focus(move_to, true, window, cx));
+                                }));
+                            }
+                            menu
+                        }),
+                )
+            })
             .child(div().flex_1())
             .child(toolbar_button("reply", "Reply", "Reply (Ctrl R)", cx.listener(|this, _, window, cx| this.reply(DraftKind::Reply, window, cx))))
             .child(toolbar_button("reply-all", "Reply all", "Reply all (Ctrl Shift R)", cx.listener(|this, _, window, cx| this.reply(DraftKind::ReplyAll, window, cx))))
@@ -386,10 +414,33 @@ impl MailWindow {
                             h_flex()
                                 .flex_wrap()
                                 .gap(px(10.))
-                                .children(m.attachments.iter().map(|a| attachment_card(a, &p))),
+                                .children(m.attachments.iter().map(|a| self.render_attachment(a, cx))),
                         ),
                 )
             })
+    }
+
+    fn render_attachment(&self, a: &Attachment, cx: &mut Context<Self>) -> impl IntoElement {
+        let p = *cx.palette();
+        let downloading = self.downloading.contains(&a.id);
+        let open = a.clone();
+        let save = a.clone();
+        attachment_card(a, &p, downloading)
+            .id(SharedString::from(format!("att-{}", a.id)))
+            .cursor_pointer()
+            .hover(|d| d.bg(p.hover))
+            .child(
+                Button::new(SharedString::from(format!("save-{}", a.id)))
+                    .ghost()
+                    .xsmall()
+                    .icon(icon("download").size(px(14.)))
+                    .tooltip("Save as…")
+                    .on_click(cx.listener(move |this, _, window, cx| {
+                        cx.stop_propagation();
+                        this.save_attachment(save.clone(), window, cx);
+                    })),
+            )
+            .on_click(cx.listener(move |this, _, window, cx| this.open_attachment(open.clone(), window, cx)))
     }
 
     fn render_outbox_item(&self, d: &Draft, cx: &mut Context<Self>) -> impl IntoElement {
@@ -458,7 +509,7 @@ fn toolbar_button(
         .on_click(on_click)
 }
 
-fn attachment_card(a: &Attachment, p: &crate::theme::Palette) -> Div {
+fn attachment_card(a: &Attachment, p: &crate::theme::Palette, downloading: bool) -> Div {
     let badge_bg = match a.badge().as_str() {
         "PDF" => (c(0xFBE9E7, p), c(0xA13E37, p)),
         "FIG" | "PNG" | "JPG" | "SVG" => (c(0xEEE8FA, p), c(0x6E55B7, p)),
@@ -497,10 +548,12 @@ fn attachment_card(a: &Attachment, p: &crate::theme::Palette) -> Div {
                     div()
                         .text_size(px(11.))
                         .text_color(p.muted)
-                        .child(if a.is_downloaded() {
-                            a.human_size()
+                        .child(if downloading {
+                            format!("{} · Downloading…", a.human_size())
+                        } else if a.is_downloaded() {
+                            format!("{} · Open", a.human_size())
                         } else {
-                            format!("{} · Not downloaded", a.human_size())
+                            format!("{} · Click to download", a.human_size())
                         }),
                 ),
         )

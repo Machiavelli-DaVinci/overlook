@@ -102,6 +102,11 @@ impl Nav {
     }
 }
 
+pub enum AfterDownload {
+    Open,
+    SaveTo(PathBuf),
+}
+
 pub enum ListRow {
     Group(SharedString, usize),
     Conversation(ConversationSummary),
@@ -153,6 +158,12 @@ pub struct MailWindow {
     reading_pane: ReadingPane,
     /// Sidebar sections the user collapsed ("favorites", "labels"); persisted.
     collapsed_sections: HashSet<String>,
+    /// Focused Inbox: enabled per profile, with the selected tab.
+    focused_enabled: bool,
+    inbox_tab: FocusTab,
+    /// Attachments being fetched right now.
+    downloading: HashSet<AttachmentId>,
+    attachments_dir: PathBuf,
     sidebar_width: f32,
     list_width: f32,
     list_height: f32,
@@ -212,6 +223,8 @@ impl MailWindow {
         let reading_pane = store.setting::<ReadingPane>("reading_pane").ok().flatten().unwrap_or_default();
         let sidebar_width = store.setting::<f32>("panes.sidebar").ok().flatten().unwrap_or(232.);
         let collapsed_sections: HashSet<String> = store.setting::<Vec<String>>("sidebar.collapsed").ok().flatten().unwrap_or_default().into_iter().collect();
+        let focused_enabled = store.setting::<bool>("focused_inbox").ok().flatten().unwrap_or(true);
+        let attachments_dir = crate::data_dir().join("attachments");
         let list_width = store.setting::<f32>("panes.list").ok().flatten().unwrap_or(340.);
         let list_height = store.setting::<f32>("panes.list_height").ok().flatten().unwrap_or(300.);
         let outgoing_dir = crate::data_dir().join("outgoing");
@@ -249,6 +262,10 @@ impl MailWindow {
             density,
             reading_pane,
             collapsed_sections,
+            focused_enabled,
+            inbox_tab: FocusTab::Focused,
+            downloading: HashSet::new(),
+            attachments_dir,
             sidebar_width,
             list_width,
             list_height,
@@ -494,8 +511,9 @@ impl MailWindow {
         let acct = self.account.id.clone();
         let owner = self.account.email.clone();
         self.labels = self.store.labels(&acct).unwrap_or_default();
+        let focus = self.inbox_focus();
         self.conversations = if self.search_query.trim().is_empty() {
-            self.store.conversations(&acct, &owner, &self.view, self.filter).unwrap_or_default()
+            self.store.conversations(&acct, &owner, &self.view, self.filter, focus).unwrap_or_default()
         } else {
             self.search_results()
         };
@@ -505,7 +523,8 @@ impl MailWindow {
             .into_iter()
             .chain(self.labels.iter().filter(|l| l.kind == LabelKind::User).map(|l| MailboxView::Label(l.id.clone())))
         {
-            let n = self.store.view_count(&acct, &owner, &view).unwrap_or(0);
+            let focus = if view == MailboxView::Kind(LabelKind::Inbox) && self.focused_enabled { Some(FocusTab::Focused) } else { None };
+            let n = self.store.view_count(&acct, &owner, &view, focus).unwrap_or(0);
             counts.insert(view, n);
         }
         self.counts = counts;
@@ -568,6 +587,133 @@ impl MailWindow {
             .collect();
         out.sort_by_key(|c| std::cmp::Reverse(c.latest));
         out
+    }
+
+    /// The Focused/Other split applies only to the Inbox when the feature is on.
+    pub(crate) fn inbox_focus(&self) -> Option<FocusTab> {
+        (self.focused_enabled && self.view == MailboxView::Kind(LabelKind::Inbox)).then_some(self.inbox_tab)
+    }
+
+    pub(crate) fn set_inbox_tab(&mut self, tab: FocusTab, window: &mut Window, cx: &mut Context<Self>) {
+        self.inbox_tab = tab;
+        self.reload(cx);
+        if !self.conversations.iter().any(|c| Some(&c.id) == self.selected.as_ref()) {
+            self.selected = self.conversations.first().map(|c| c.id.clone());
+            self.expanded.clear();
+            self.load_thread();
+        }
+        self.list_focus.focus(window, cx);
+        cx.notify();
+    }
+
+    pub(crate) fn toggle_focused_inbox(&mut self, cx: &mut Context<Self>) {
+        self.focused_enabled = !self.focused_enabled;
+        let _ = self.store.set_setting("focused_inbox", &self.focused_enabled);
+        self.inbox_tab = FocusTab::Focused;
+        self.reload(cx);
+    }
+
+    /// Moves the selected conversation to Focused or Other. With `always`, future mail from
+    /// the sender follows too.
+    pub(crate) fn move_focus(&mut self, focused: bool, always: bool, window: &mut Window, cx: &mut Context<Self>) {
+        let ids: Vec<MessageId> = self.thread.iter().map(|m| m.id.clone()).collect();
+        if ids.is_empty() {
+            return;
+        }
+        let sender = self.thread.iter().filter(|m| !m.is_outgoing).max_by_key(|m| m.date).map(|m| m.from.clone());
+        let _ = self.store.set_focus_override(&ids, Some(focused));
+        if always {
+            if let Some(sender) = &sender {
+                let _ = self.store.set_focus_rule(&self.account.id, &sender.email, Some(focused));
+            }
+        }
+        let target = if focused { "Focused" } else { "Other" };
+        let text = match (&sender, always) {
+            (Some(s), true) => format!("Moved to {target}. Messages from {} will go to {target}.", s.display_name()),
+            _ => format!("Moved to {target}."),
+        };
+        let next = self.neighbour_after_removal();
+        self.reload(cx);
+        self.select_after_removal(next, window, cx);
+        window.push_notification(Notification::info(text), cx);
+    }
+
+    // -------------------------------------------------------------- attachments
+
+    pub(crate) fn open_attachment(&mut self, attachment: Attachment, window: &mut Window, cx: &mut Context<Self>) {
+        if let Some(path) = attachment.local_path.as_deref().map(PathBuf::from).filter(|p| p.exists()) {
+            cx.open_with_system(&path);
+            return;
+        }
+        self.download_attachment(attachment, AfterDownload::Open, window, cx);
+    }
+
+    pub(crate) fn save_attachment(&mut self, attachment: Attachment, window: &mut Window, cx: &mut Context<Self>) {
+        let downloads = directories::UserDirs::new()
+            .and_then(|u| u.download_dir().map(|p| p.to_path_buf()))
+            .unwrap_or_else(|| PathBuf::from("."));
+        let receiver = cx.prompt_for_new_path(&downloads, Some(&attachment.filename));
+        cx.spawn_in(window, async move |this, cx| {
+            let Ok(Ok(Some(target))) = receiver.await else { return };
+            let _ = this.update_in(cx, |this, window, cx| {
+                match attachment.local_path.as_deref().map(PathBuf::from).filter(|p| p.exists()) {
+                    Some(local) => this.finish_save(&local, &target, window, cx),
+                    None => this.download_attachment(attachment.clone(), AfterDownload::SaveTo(target), window, cx),
+                }
+            });
+        })
+        .detach();
+    }
+
+    fn finish_save(&mut self, local: &std::path::Path, target: &std::path::Path, window: &mut Window, cx: &mut Context<Self>) {
+        match std::fs::copy(local, target) {
+            Ok(_) => window.push_notification(Notification::success(format!("Saved to {}", target.display())), cx),
+            Err(e) => window.push_notification(Notification::error(format!("Couldn’t save the file: {e}")), cx),
+        }
+    }
+
+    fn download_attachment(&mut self, attachment: Attachment, after: AfterDownload, window: &mut Window, cx: &mut Context<Self>) {
+        if self.downloading.contains(&attachment.id) {
+            return;
+        }
+        let Some(message) = self.store.message(&attachment.message_id).ok().flatten() else { return };
+        let Some(provider) = self.providers.get(&self.account.id).cloned() else {
+            window.push_notification(Notification::warning("Sign in again to download attachments."), cx);
+            return;
+        };
+        let account = self.account.clone();
+        let safe_name: String = attachment.filename.chars().map(|c| if matches!(c, '/' | '\\' | '\0') { '_' } else { c }).collect();
+        let dir = self.attachments_dir.join(account.id.as_str().replace([':', '/'], "_")).join(message.id.as_str().replace([':', '/'], "_"));
+        let dest = dir.join(if safe_name.trim().is_empty() || safe_name.starts_with('.') { format!("attachment{}", safe_name) } else { safe_name });
+        self.downloading.insert(attachment.id.clone());
+        cx.notify();
+        let att = attachment.clone();
+        cx.spawn_in(window, async move |this, cx| {
+            let result = cx
+                .background_spawn(async move {
+                    let bytes = provider.fetch_attachment(&account, &message, &att).await?;
+                    std::fs::create_dir_all(&dir).map_err(|e| overlook_provider::ProviderError::Rejected(e.to_string()))?;
+                    std::fs::write(&dest, &bytes).map_err(|e| overlook_provider::ProviderError::Rejected(e.to_string()))?;
+                    Ok::<PathBuf, overlook_provider::ProviderError>(dest)
+                })
+                .await;
+            let _ = this.update_in(cx, |this, window, cx| {
+                this.downloading.remove(&attachment.id);
+                match result {
+                    Ok(path) => {
+                        let _ = this.store.set_attachment_local_path(&attachment.id, Some(&path.to_string_lossy()));
+                        this.load_thread();
+                        match after {
+                            AfterDownload::Open => cx.open_with_system(&path),
+                            AfterDownload::SaveTo(target) => this.finish_save(&path, &target, window, cx),
+                        }
+                    }
+                    Err(e) => window.push_notification(Notification::error(format!("Couldn’t download {}: {e}", attachment.filename)), cx),
+                }
+                cx.notify();
+            });
+        })
+        .detach();
     }
 
     fn selected_summary(&self) -> Option<&ConversationSummary> {
@@ -990,6 +1136,7 @@ impl MailWindow {
         let appearance = self.appearance;
         let reading_pane = self.reading_pane;
         let density = self.density;
+        let focused_enabled = self.focused_enabled;
         let this = cx.entity().downgrade();
         let this2 = cx.entity().downgrade();
 
@@ -1069,6 +1216,7 @@ impl MailWindow {
                                 let a = this2.clone();
                                 let b = this2.clone();
                                 let c = this2.clone();
+                                let d = this2.clone();
                                 menu.label("Reading pane")
                                     .item(PopupMenuItem::new("On the right").checked(reading_pane == ReadingPane::Right).on_click(move |_, _w, cx| {
                                         let _ = a.update(cx, |this, cx| this.set_reading_pane(ReadingPane::Right, cx));
@@ -1080,6 +1228,11 @@ impl MailWindow {
                                     .label("Density")
                                     .item(PopupMenuItem::new(if density == Density::Compact { "Comfortable" } else { "Compact" }).on_click(move |_, window, cx| {
                                         let _ = c.update(cx, |this, cx| this.toggle_density(window, cx));
+                                    }))
+                                    .separator()
+                                    .label("Inbox")
+                                    .item(PopupMenuItem::new("Focused Inbox").checked(focused_enabled).on_click(move |_, _w, cx| {
+                                        let _ = d.update(cx, |this, cx| this.toggle_focused_inbox(cx));
                                     }))
                             }),
                     )

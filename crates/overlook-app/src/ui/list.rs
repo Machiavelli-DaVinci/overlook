@@ -5,6 +5,7 @@ use super::{ListRow, MailWindow};
 use crate::assets::icon;
 use crate::theme::ActivePalette;
 use gpui_kit::component::button::{Button, ButtonVariants};
+use gpui_kit::component::menu::{DropdownMenu, PopupMenuItem};
 use gpui_kit::component::scroll::ScrollableElement;
 use gpui_kit::component::{Sizable, StyledExt};
 use gpui_kit::prelude::*;
@@ -26,6 +27,10 @@ impl MailWindow {
         };
         let rows = self.list_rows();
         let total = rows.iter().filter(|r| !matches!(r, ListRow::Group(..))).count();
+        let focus_split = self.inbox_focus().is_some();
+        let inbox_tab = self.inbox_tab;
+        let filter = self.filter;
+        let this = cx.entity().downgrade();
 
         let tab = |this: &Self, label: &'static str, filter: ListFilter, cx: &mut Context<Self>| {
             let active = this.filter == filter;
@@ -58,6 +63,26 @@ impl MailWindow {
                     )
                     .child(chip(total.to_string(), &p))
                     .child(div().flex_1())
+                    .when(focus_split, |row| {
+                        let t = this.clone();
+                        row.child(
+                            Button::new("list-filter")
+                                .ghost()
+                                .small()
+                                .icon(icon(if filter == ListFilter::All { "list-filter" } else { "funnel" }).size(px(16.)))
+                                .tooltip("Filter")
+                                .dropdown_menu(move |menu, _window, _cx| {
+                                    let mut menu = menu.label("Show");
+                                    for (label, f) in [("All", ListFilter::All), ("Unread", ListFilter::Unread), ("With attachments", ListFilter::Attachments)] {
+                                        let t = t.clone();
+                                        menu = menu.item(PopupMenuItem::new(label).checked(filter == f).on_click(move |_, window, cx| {
+                                            let _ = t.update(cx, |this, cx| this.set_filter(f, window, cx));
+                                        }));
+                                    }
+                                    menu
+                                }),
+                        )
+                    })
                     .child(
                         Button::new("density")
                             .ghost()
@@ -73,9 +98,28 @@ impl MailWindow {
                     .mt(px(14.))
                     .border_b_1()
                     .border_color(p.divider)
-                    .child(tab(self, "All", ListFilter::All, cx))
-                    .child(tab(self, "Unread", ListFilter::Unread, cx))
-                    .child(tab(self, "Attachments", ListFilter::Attachments, cx)),
+                    .when(focus_split, |row| {
+                        let focus_tab = |label: &'static str, tab: FocusTab, cx: &mut Context<Self>| {
+                            let active = inbox_tab == tab;
+                            div()
+                                .id(SharedString::from(format!("focus-{label}")))
+                                .pb(px(10.))
+                                .border_b_2()
+                                .border_color(if active { p.accent } else { gpui_kit::transparent_black() })
+                                .text_size(px(13.))
+                                .text_color(if active { p.accent } else { p.muted })
+                                .font_weight(if active { FontWeight::MEDIUM } else { FontWeight::NORMAL })
+                                .cursor_pointer()
+                                .child(label)
+                                .on_click(cx.listener(move |this, _, window, cx| this.set_inbox_tab(tab, window, cx)))
+                        };
+                        row.child(focus_tab("Focused", FocusTab::Focused, cx)).child(focus_tab("Other", FocusTab::Other, cx))
+                    })
+                    .when(!focus_split, |row| {
+                        row.child(tab(self, "All", ListFilter::All, cx))
+                            .child(tab(self, "Unread", ListFilter::Unread, cx))
+                            .child(tab(self, "Attachments", ListFilter::Attachments, cx))
+                    }),
             );
 
         let coverage = if self.search_query.is_empty() {
@@ -100,6 +144,7 @@ impl MailWindow {
             let (title, hint): (String, String) = match (&self.view, self.search_query.is_empty()) {
                 _ if nothing_local => ("Downloading recent mail…".into(), paused_hint),
                 (_, false) => ("No results".into(), "Try another name or keyword.".into()),
+                (MailboxView::Kind(LabelKind::Inbox), _) if focus_split && inbox_tab == FocusTab::Other => ("Nothing in Other.".into(), "Newsletters and automated mail land here.".into()),
                 (MailboxView::Kind(LabelKind::Inbox), _) => ("Your inbox is clear.".into(), "New mail will appear here.".into()),
                 (MailboxView::Kind(LabelKind::Drafts), _) => ("No drafts".into(), "Messages you start are saved on this device.".into()),
                 (MailboxView::Kind(LabelKind::Outbox), _) => ("Outbox is empty".into(), "Messages waiting to be sent appear here.".into()),

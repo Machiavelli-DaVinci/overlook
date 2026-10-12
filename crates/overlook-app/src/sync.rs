@@ -33,18 +33,20 @@ const DOWNLOAD_BATCH: usize = 20;
 
 /// Bump when the set of views the first download covers changes; accounts downloaded with
 /// an older version list the new views and queue what is missing, keeping their checkpoint.
-const COVERAGE_VERSION: u32 = 2;
+const COVERAGE_VERSION: u32 = 3;
 
 fn coverage_key(account: &AccountId) -> String {
     format!("download_coverage:{}", account.0)
 }
 
-/// Adds snapshot ids that are not on disk to the backlog (de-duplicated).
-fn enqueue_missing(store: &Store, account: &AccountId, ids: Vec<ProviderId>) {
+/// Adds snapshot ids to the backlog (de-duplicated). With `only_missing`, ids already on
+/// disk are skipped; otherwise they are re-downloaded (used when the mapping gained fields).
+fn enqueue(store: &Store, account: &AccountId, ids: Vec<ProviderId>, only_missing: bool) {
     let mut backlog = backlog(store, account);
     for pid in ids {
         let local = MessageId(format!("{}:{}", account.0, pid.0));
-        if store.message(&local).ok().flatten().is_none() && !backlog.contains(&pid) {
+        let present = store.message(&local).ok().flatten().is_some();
+        if (!only_missing || !present) && !backlog.contains(&pid) {
             backlog.push(pid);
         }
     }
@@ -116,7 +118,7 @@ fn download(store: &Store, provider: &dyn MailProvider, account: &Account, outco
         store.set_checkpoint(acct, snapshot.checkpoint.as_deref()).map_err(|e| ProviderError::Temporary(e.to_string()))?;
         outcome.downloaded += snapshot.messages.len();
         // Queue bodies that are not on disk yet; the backlog survives restarts.
-        enqueue_missing(store, acct, snapshot.message_ids);
+        enqueue(store, acct, snapshot.message_ids, true);
         let _ = store.set_setting(&coverage_key(acct), &COVERAGE_VERSION);
         drain_backlog(store, provider, account, outcome)?;
         Ok(outcome.downloaded)
@@ -132,7 +134,8 @@ fn download(store: &Store, provider: &dyn MailProvider, account: &Account, outco
         let snapshot = pollster_block(provider.fetch_snapshot(account))?;
         store.replace_labels(acct, &snapshot.labels).map_err(|e| ProviderError::Temporary(e.to_string()))?;
         store.merge_remote_messages(&snapshot.messages, &protected).map_err(|e| ProviderError::Temporary(e.to_string()))?;
-        enqueue_missing(store, acct, snapshot.message_ids);
+        // Version 3 added category/importance hints to the mapping: refresh what is stored.
+        enqueue(store, acct, snapshot.message_ids, covered >= 3);
         let _ = store.set_setting(&coverage_key(acct), &COVERAGE_VERSION);
         info!("extended download coverage for {}", account.email);
         drain_backlog(store, provider, account, outcome)
@@ -414,7 +417,7 @@ mod tests {
         assert_eq!(outcome.sent, vec!["Agenda".to_owned()]);
         assert_eq!(store.pending_count(&account.id).unwrap(), 0);
         assert!(store.draft(&draft.id).unwrap().is_none(), "draft row removed after acceptance");
-        let sent = store.conversations(&account.id, &account.email, &overlook_store::MailboxView::Kind(LabelKind::Sent), overlook_store::ListFilter::All).unwrap();
+        let sent = store.conversations(&account.id, &account.email, &overlook_store::MailboxView::Kind(LabelKind::Sent), overlook_store::ListFilter::All, None).unwrap();
         assert!(sent.iter().any(|c| c.subject == "Agenda"));
         assert_eq!(store.account_status(&account.id).unwrap().state, SyncState::UpToDate);
         assert_eq!(provider.applied_operations().len(), 2, "two idempotent operations reached the provider in order");

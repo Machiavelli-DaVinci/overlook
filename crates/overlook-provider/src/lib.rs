@@ -116,6 +116,11 @@ pub trait MailProvider: Send + Sync {
     /// Applies an idempotent mailbox operation.
     fn apply(&self, account: &Account, op: &PendingOperation, messages: &[Message], labels: &[Label]) -> BoxFuture<'_, Result<(), ProviderError>>;
 
+    /// Downloads one attachment's bytes.
+    fn fetch_attachment(&self, _account: &Account, _message: &Message, _attachment: &Attachment) -> BoxFuture<'_, Result<Vec<u8>, ProviderError>> {
+        Box::pin(async { Err(ProviderError::Rejected("this account cannot download attachments".into())) })
+    }
+
     /// Submits a message. Only a returned receipt means "Sent".
     fn send(&self, account: &Account, draft: &Draft, context: SendContext) -> BoxFuture<'_, Result<SentReceipt, ProviderError>>;
 

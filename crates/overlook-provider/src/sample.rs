@@ -194,6 +194,9 @@ pub fn sent_message(
         attachments: Vec::new(),
         rfc_message_id: Some(rfc_id.to_owned()),
         in_reply_to: None,
+        category: None,
+        is_important: false,
+        focus_override: None,
     }
 }
 
@@ -271,6 +274,9 @@ pub fn sample_mailbox(account: &Account, now: Timestamp) -> MailboxSnapshot {
                 .collect(),
             rfc_message_id: None,
             in_reply_to: None,
+            category: None,
+            is_important: false,
+            focus_override: None,
         }
     };
 

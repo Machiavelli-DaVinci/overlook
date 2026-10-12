@@ -303,6 +303,12 @@ pub struct Message {
     /// RFC 5322 Message-ID header, when known.
     pub rfc_message_id: Option<String>,
     pub in_reply_to: Option<String>,
+    /// Provider category hint (Gmail: personal, social, promotions, updates, forums).
+    pub category: Option<String>,
+    /// Provider importance hint (Gmail IMPORTANT).
+    pub is_important: bool,
+    /// User override for Focused Inbox: `Some(true)` forces Focused, `Some(false)` Other.
+    pub focus_override: Option<bool>,
 }
 
 impl Message {
@@ -706,6 +712,9 @@ mod tests {
             attachments: vec![],
             rfc_message_id: None,
             in_reply_to: None,
+            category: None,
+            is_important: false,
+            focus_override: None,
         }
     }
 
