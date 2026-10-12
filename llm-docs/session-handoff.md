@@ -41,6 +41,10 @@ Working end to end against the user's real account: sign-in through the system b
 
 Focused Inbox (local classification with per-sender rules), attachment download/open/save, and Google Calendar (week/day/month/agenda, invitations with Accept/Tentative/Decline in the calendar and inside the mail reader, new/edit/delete event, reminders with desktop notifications, event colors, incremental sync) are implemented and validated against the user's real account: 1,189 event instances downloaded, working-location entries shown in the day header. Calendar was deferred in the product plan; the user explicitly moved it up. See `overlook-native-app.md`.
 
+## Distribution and README (added later on 12 October 2026)
+
+`install.sh` at the repository root is the one-command installer in the Last Refuge style (`curl -fsSL https://raw.githubusercontent.com/last-refuge/overlook/main/install.sh | bash`): on Arch/Omarchy it builds a package from `packaging/PKGBUILD` with makepkg and installs it with pacman; elsewhere, or with `--prefix`, it builds into a user prefix. `--dry-run`, `--uninstall`, `--ref`, `--yes`. A `Makefile` offers `make install PREFIX=…`. The README is the public front page with screenshots in `docs/screenshots/` taken from the sample profile (the sample provider now also serves a sample calendar with a week of fictional events, so the calendar can be demonstrated without Google). Refresh screenshots with the capture scripts when the shell changes visibly. There is no release pipeline yet: a GitHub Actions workflow that builds the package and attaches `install.sh` to releases is the natural next step, after which the README's curl URL should point at the latest release asset like omarchy-facet does.
+
 ## Settings (added later on 12 October 2026)
 
 A Settings dialog (`Ctrl ,`) with Accounts (signatures, sender name, status, remove), General, Mail, Calendar, and About pages; see `overlook-native-app.md` → Settings. Preferences are typed in `overlook_core::prefs` and every control changes real behaviour. Not built: multiple signatures, automatic replies, rules/sweep.

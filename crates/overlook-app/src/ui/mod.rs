@@ -509,7 +509,7 @@ impl MailWindow {
         self.accounts = self.store.accounts().unwrap_or_default();
         if self.accounts.is_empty() {
             if let Ok(sample) = crate::seed_sample_account(&self.store) {
-                self.providers.insert(sample.id.clone(), providers::AccountProviders { mail: Arc::new(self.sample.clone()), calendar: None });
+                self.providers.insert(sample.id.clone(), providers::AccountProviders { mail: Arc::new(self.sample.clone()), calendar: Some(Arc::new(self.sample.clone())) });
                 self.accounts.push(sample);
             }
         }

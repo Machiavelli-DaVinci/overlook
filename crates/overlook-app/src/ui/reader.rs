@@ -65,9 +65,10 @@ impl MailWindow {
         let (in_trash, in_inbox) = self.thread_state();
         let toolbar = h_flex()
             .items_center()
-            .gap(px(4.))
+            .gap(px(2.))
             .h(px(48.))
-            .px(px(16.))
+            .px(px(12.))
+            .overflow_hidden()
             .border_b_1()
             .border_color(p.divider)
             .when(in_trash, |bar| {
@@ -128,7 +129,7 @@ impl MailWindow {
             })
             .child(toolbar_button(
                 if unread_any { "mail-open" } else { "mail" },
-                if unread_any { "Mark as read" } else { "Mark as unread" },
+                if unread_any { "Mark read" } else { "Mark unread" },
                 "Toggle read (Ctrl U)",
                 cx.listener({
                     let ids = selected_ids.clone();
@@ -166,7 +167,7 @@ impl MailWindow {
             .child(toolbar_button("reply", "Reply", "Reply (Ctrl R)", cx.listener(|this, _, window, cx| this.reply(DraftKind::Reply, window, cx))))
             .child(toolbar_button("reply-all", "Reply all", "Reply all (Ctrl Shift R)", cx.listener(|this, _, window, cx| this.reply(DraftKind::ReplyAll, window, cx))))
             .child(toolbar_button("forward", "Forward", "Forward (Ctrl F)", cx.listener(|this, _, window, cx| this.reply(DraftKind::Forward, window, cx))))
-            .child(div().w(px(8.)))
+            .child(div().w(px(2.)))
             .child(
                 Button::new("prev-conv")
                     .ghost()

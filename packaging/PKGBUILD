@@ -1,0 +1,48 @@
+# Maintainer: Last Refuge <hello@lastrefuge.ai>
+# Built by install.sh from a checkout (OVERLOOK_SRC) or from the repository when run alone.
+pkgname=overlook
+pkgver=0.1.0
+pkgrel=1
+pkgdesc="A clear view of what matters. A native mail and calendar client for Linux by Last Refuge."
+arch=('x86_64')
+url="https://github.com/last-refuge/overlook"
+license=('LicenseRef-Proprietary')
+depends=('vulkan-icd-loader' 'libxkbcommon' 'wayland' 'fontconfig' 'freetype2' 'xdg-desktop-portal')
+makedepends=('git' 'rust')
+optdepends=('gnome-keyring: stores Gmail sign-in tokens' 'kwallet: alternative keyring' 'xdg-desktop-portal-gtk: Follow system theme and file dialogs on Hyprland')
+options=('!lto')
+
+prepare() {
+  rm -rf "$srcdir/overlook"
+  if [[ -n "${OVERLOOK_SRC:-}" && -d "$OVERLOOK_SRC" ]]; then
+    cp -r "$OVERLOOK_SRC" "$srcdir/overlook"
+  else
+    git clone --depth 1 "$url.git" "$srcdir/overlook"
+  fi
+}
+
+pkgver() {
+  cd "$srcdir/overlook"
+  local base
+  base=$(grep -m1 '^version' Cargo.toml | sed 's/.*"\(.*\)".*/\1/')
+  printf '%s.r%s.%s' "$base" "$(git rev-list --count HEAD 2>/dev/null || echo 0)" "$(git rev-parse --short HEAD 2>/dev/null || echo local)"
+}
+
+build() {
+  cd "$srcdir/overlook"
+  export CARGO_HOME="${CARGO_HOME:-$HOME/.cargo}"
+  cargo build --release --locked -p overlook
+}
+
+package() {
+  cd "$srcdir/overlook"
+  install -Dm755 target/release/overlook "$pkgdir/usr/bin/overlook"
+  install -Dm644 packaging/ai.lastrefuge.Overlook.desktop "$pkgdir/usr/share/applications/ai.lastrefuge.Overlook.desktop"
+  install -Dm644 packaging/ai.lastrefuge.Overlook.metainfo.xml "$pkgdir/usr/share/metainfo/ai.lastrefuge.Overlook.metainfo.xml"
+  install -Dm644 branding/assets/overlook-app-icon.svg "$pkgdir/usr/share/icons/hicolor/scalable/apps/ai.lastrefuge.Overlook.svg"
+  for s in 16 24 32 48 64 128 256 512; do
+    install -Dm644 "branding/assets/overlook-icon-$s.png" "$pkgdir/usr/share/icons/hicolor/${s}x${s}/apps/ai.lastrefuge.Overlook.png"
+  done
+  install -Dm644 branding/fonts/Inter-LICENSE.txt "$pkgdir/usr/share/licenses/$pkgname/Inter-LICENSE.txt"
+  install -Dm644 branding/fonts/SourceSerif-LICENSE.md "$pkgdir/usr/share/licenses/$pkgname/SourceSerif-LICENSE.md"
+}

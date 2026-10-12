@@ -43,7 +43,7 @@ pub fn gmail_providers(account: &Account, tokens: OAuthTokens) -> Result<Account
 /// Builds the providers for `account`, reading stored tokens where needed.
 pub fn providers_for(account: &Account, sample: &SampleProvider) -> Result<AccountProviders, ProviderIssue> {
     match account.provider {
-        ProviderKind::Sample => Ok(AccountProviders { mail: Arc::new(sample.clone()), calendar: None }),
+        ProviderKind::Sample => Ok(AccountProviders { mail: Arc::new(sample.clone()), calendar: Some(Arc::new(sample.clone())) }),
         ProviderKind::Gmail => match credentials::load_tokens(&account.id) {
             Ok(Some(tokens)) => gmail_providers(account, tokens).map_err(ProviderIssue::SignInRequired),
             Ok(None) => Err(ProviderIssue::SignInRequired("Sign in again to continue syncing. Your local drafts are safe.".into())),

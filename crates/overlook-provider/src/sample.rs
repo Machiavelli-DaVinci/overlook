@@ -6,7 +6,7 @@
 //! delivery. Its connection state is controlled by the app (a visible switch) and never
 //! pretends to be a real account: the account is labelled "Sample account".
 
-use crate::{BoxFuture, MailProvider, MailboxSnapshot, ProviderError, RemoteChanges, SendContext, SendOutcome, SentReceipt};
+use crate::{BoxFuture, CalendarProvider, EventChanges, MailProvider, MailboxSnapshot, ProviderError, RemoteChanges, SendContext, SendOutcome, SentReceipt};
 use overlook_core::time::{days_from_civil, Timestamp};
 use overlook_core::*;
 use std::collections::{BTreeSet, HashSet};
@@ -28,6 +28,9 @@ struct Inner {
     /// Message-IDs the "server" has accepted, for reconciliation.
     accepted: Mutex<HashSet<String>>,
     applied_ops: Mutex<Vec<OperationId>>,
+    /// Calendar events created or changed through the provider in this session.
+    event_overrides: Mutex<Vec<Event>>,
+    deleted_events: Mutex<HashSet<String>>,
 }
 
 impl Default for SampleProvider {
@@ -46,6 +49,8 @@ impl SampleProvider {
                 counter: AtomicU64::new(1),
                 accepted: Mutex::new(HashSet::new()),
                 applied_ops: Mutex::new(Vec::new()),
+                event_overrides: Mutex::new(Vec::new()),
+                deleted_events: Mutex::new(HashSet::new()),
             }),
         }
     }
@@ -156,6 +161,157 @@ impl MailProvider for SampleProvider {
             } else {
                 Ok(SendOutcome::NotDelivered)
             }
+        })
+    }
+}
+
+pub const SAMPLE_CALENDAR_ID: &str = "sample-calendar";
+
+fn sample_calendar(account: &Account) -> Calendar {
+    Calendar {
+        id: CalendarId(format!("{}:cal:{SAMPLE_CALENDAR_ID}", account.id.0)),
+        account_id: account.id.clone(),
+        provider_id: Some(ProviderId(SAMPLE_CALENDAR_ID.into())),
+        name: "Calendar".into(),
+        color: Some("#365F73".into()),
+        is_primary: true,
+        can_edit: true,
+        visible: true,
+        sort_order: 0,
+        default_reminders: vec![10],
+    }
+}
+
+/// Fictional events for the current week and the next, anchored to `now`.
+pub fn sample_events(account: &Account, now: Timestamp) -> Vec<Event> {
+    use overlook_core::tz;
+    let calendar = sample_calendar(account);
+    let week = tz::week_start(now, true);
+    let me = Address::named(&account.display_name, &account.email);
+    let maya = Address::named("Maya Chen", "maya@northstar.example");
+    let alex = Address::named("Alex Rivera", "alex@studio.example");
+    let daniel = Address::named("Daniel Park", "daniel@studio.example");
+    let sophie = Address::named("Sophie Williams", "sophie@example.com");
+    let att = |a: &Address, response: ResponseStatus, organizer: bool| Attendee { email: a.email.clone(), name: a.name.clone(), response, is_self: a.email == account.email, is_organizer: organizer, optional: false };
+    let mut n = 0;
+    let mut ev = |day: i32, hour: f32, minutes: i64, summary: &str, location: Option<&str>, organizer: &Address, attendees: Vec<Attendee>, all_day: bool, event_type: Option<&str>| {
+        n += 1;
+        let start = tz::add_days(week, day) + (hour * 3_600_000.) as i64;
+        let (start, end) = if all_day { (tz::add_days(week, day), tz::add_days(week, day + 1)) } else { (start, start + minutes * 60_000) };
+        Event {
+            id: EventId(format!("{}:ev-{n}", calendar.id.0)),
+            account_id: account.id.clone(),
+            calendar_id: calendar.id.clone(),
+            provider_id: Some(ProviderId(format!("ev-{n}"))),
+            ical_uid: Some(format!("ev-{n}@overlook.sample")),
+            summary: summary.into(),
+            description: None,
+            location: location.map(str::to_owned),
+            start,
+            end,
+            all_day,
+            status: EventStatus::Confirmed,
+            organizer: Some(organizer.clone()),
+            attendees,
+            html_link: None,
+            conference_url: None,
+            recurring_event_id: None,
+            updated: now,
+            event_type: event_type.map(str::to_owned),
+            color: None,
+            reminders: None,
+            pending: false,
+        }
+    };
+    let mut events = Vec::new();
+    for day in 0..5 {
+        events.push(ev(day, 0., 0, if day == 2 { "Studio" } else { "Home" }, None, &me, vec![], true, Some("working-location")));
+    }
+    events.push(ev(0, 9., 60, "Weekly build leaders", Some("Room 4"), &me, vec![att(&me, ResponseStatus::Accepted, true), att(&alex, ResponseStatus::Accepted, false), att(&daniel, ResponseStatus::Tentative, false)], false, None));
+    events.push(ev(0, 10.5, 30, "Launch creative review", Some("Northstar Studio"), &maya, vec![att(&maya, ResponseStatus::Accepted, true), att(&me, ResponseStatus::NeedsAction, false)], false, None));
+    events.push(ev(0, 14., 55, "Haircut", None, &me, vec![], false, None));
+    events.push(ev(1, 9., 60, "Executive meeting", Some("Boardroom"), &me, vec![att(&me, ResponseStatus::Accepted, true), att(&daniel, ResponseStatus::Accepted, false)], false, None));
+    events.push(ev(1, 11., 30, "Daniel / Jason 1:1", None, &daniel, vec![att(&daniel, ResponseStatus::Accepted, true), att(&me, ResponseStatus::Accepted, false)], false, None));
+    events.push(ev(1, 13.5, 45, "Homepage copy review", None, &alex, vec![att(&alex, ResponseStatus::Accepted, true), att(&me, ResponseStatus::Accepted, false), att(&maya, ResponseStatus::Accepted, false)], false, None));
+    events.push(ev(2, 10., 90, "Campaign working session", Some("Northstar Studio"), &maya, vec![att(&maya, ResponseStatus::Accepted, true), att(&me, ResponseStatus::Accepted, false)], false, None));
+    events.push(ev(2, 12.5, 60, "Lunch with Sophie", Some("Field & Vine"), &sophie, vec![att(&sophie, ResponseStatus::Accepted, true), att(&me, ResponseStatus::Accepted, false)], false, None));
+    events.push(ev(3, 9.5, 30, "Sprint planning", None, &me, vec![att(&me, ResponseStatus::Accepted, true), att(&alex, ResponseStatus::Accepted, false), att(&daniel, ResponseStatus::Accepted, false)], false, None));
+    events.push(ev(3, 15., 60, "Quarterly review prep", None, &me, vec![], false, None));
+    events.push(ev(4, 0., 0, "Offsite planning day", Some("The Overlook, Pine Ridge"), &me, vec![], true, None));
+    events.push(ev(5, 8., 180, "Trail walk", Some("Ridge trailhead"), &sophie, vec![att(&sophie, ResponseStatus::Accepted, true), att(&me, ResponseStatus::Accepted, false)], false, None));
+    events.push(ev(7, 9., 60, "Weekly build leaders", Some("Room 4"), &me, vec![att(&me, ResponseStatus::Accepted, true), att(&alex, ResponseStatus::Accepted, false)], false, None));
+    events.push(ev(8, 14., 60, "Launch day go/no-go", Some("Boardroom"), &maya, vec![att(&maya, ResponseStatus::Accepted, true), att(&me, ResponseStatus::NeedsAction, false)], false, None));
+    events
+}
+
+impl CalendarProvider for SampleProvider {
+    fn has_calendar_access(&self) -> bool {
+        true
+    }
+
+    fn list_calendars(&self, account: &Account) -> BoxFuture<'_, Result<Vec<Calendar>, ProviderError>> {
+        let account = account.clone();
+        Box::pin(async move {
+            self.require_online()?;
+            Ok(vec![sample_calendar(&account)])
+        })
+    }
+
+    fn fetch_events(&self, account: &Account, _calendar: &Calendar, sync_token: Option<&str>) -> BoxFuture<'_, Result<EventChanges, ProviderError>> {
+        let account = account.clone();
+        let incremental = sync_token.is_some();
+        Box::pin(async move {
+            self.require_online()?;
+            self.sleep().await;
+            let mut upserts = if incremental { Vec::new() } else { sample_events(&account, overlook_core::time::now()) };
+            let deleted = self.inner.deleted_events.lock().unwrap().clone();
+            upserts.retain(|e| !deleted.contains(&e.id.0));
+            for o in self.inner.event_overrides.lock().unwrap().iter() {
+                upserts.retain(|e| e.id != o.id);
+                upserts.push(o.clone());
+            }
+            Ok(EventChanges { upserts, deleted: Vec::new(), next_sync_token: Some("sample-cal-1".into()) })
+        })
+    }
+
+    fn respond(&self, _account: &Account, _calendar: &Calendar, event: &Event, response: ResponseStatus) -> BoxFuture<'_, Result<(), ProviderError>> {
+        let mut event = event.clone();
+        Box::pin(async move {
+            self.require_online()?;
+            for a in &mut event.attendees {
+                if a.is_self {
+                    a.response = response;
+                }
+            }
+            event.pending = false;
+            let mut overrides = self.inner.event_overrides.lock().unwrap();
+            overrides.retain(|e| e.id != event.id);
+            overrides.push(event);
+            Ok(())
+        })
+    }
+
+    fn create_event(&self, _account: &Account, _calendar: &Calendar, event: &Event) -> BoxFuture<'_, Result<Event, ProviderError>> {
+        let mut event = event.clone();
+        Box::pin(async move {
+            self.require_online()?;
+            event.pending = false;
+            self.inner.event_overrides.lock().unwrap().push(event.clone());
+            Ok(event)
+        })
+    }
+
+    fn update_event(&self, account: &Account, calendar: &Calendar, event: &Event) -> BoxFuture<'_, Result<Event, ProviderError>> {
+        self.create_event(account, calendar, event)
+    }
+
+    fn delete_event(&self, _account: &Account, calendar: &Calendar, provider_id: &ProviderId) -> BoxFuture<'_, Result<(), ProviderError>> {
+        let id = format!("{}:{}", calendar.id.0, provider_id.0);
+        Box::pin(async move {
+            self.require_online()?;
+            self.inner.deleted_events.lock().unwrap().insert(id.clone());
+            self.inner.event_overrides.lock().unwrap().retain(|e| e.id.0 != id);
+            Ok(())
         })
     }
 }
@@ -388,6 +544,21 @@ mod tests {
             }
             assert!(m.body.is_cached());
         }
+    }
+
+    #[test]
+    fn sample_calendar_has_a_week_of_events() {
+        let events = sample_events(&account(), overlook_core::time::now());
+        assert!(events.len() >= 15);
+        assert!(events.iter().any(|e| e.is_invitation() && e.my_response() == Some(ResponseStatus::NeedsAction)));
+        assert!(events.iter().any(|e| e.is_working_location()));
+        let p = SampleProvider::new().with_latency(Duration::ZERO);
+        p.set_online(true);
+        let cal = sample_calendar(&account());
+        let first = block_on(p.fetch_events(&account(), &cal, None)).unwrap();
+        assert!(first.next_sync_token.is_some());
+        let again = block_on(p.fetch_events(&account(), &cal, first.next_sync_token.as_deref())).unwrap();
+        assert!(again.upserts.is_empty());
     }
 
     #[test]

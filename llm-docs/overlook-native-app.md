@@ -2,6 +2,10 @@
 
 Status as of 12 October 2026: foundation milestones 2 to 5 implemented (see the [foundation plan](foundation-implementation-plan.md)), plus the three daily-use features the user asked for: Focused Inbox, attachments, and Google Calendar. This is a native Rust + GPUI application with a durable local store, a sample provider, and working Gmail accounts (sign-in, download, incremental sync, mailbox actions, send).
 
+## Install
+
+End users: `curl -fsSL https://raw.githubusercontent.com/last-refuge/overlook/main/install.sh | bash` (see the README). Developers: read on.
+
 ## Build and run
 
 Requirements on Arch/Omarchy: `rustup` with Rust 1.99 (pinned in `rust-toolchain.toml`), Vulkan drivers, Wayland. No GTK or WebKit packages are needed.
