@@ -100,3 +100,5 @@ Brand assets and the HTML design preview keep their existing maintenance command
   tarball, SHA256SUMS, install.sh). First attempt failed on a missing `libxkbcommon-x11` in the CI
   container; it is now a declared dependency. The working version is 0.1.1 so the next tag reads as newer.
   makepkg also uploads a `-debug-` package; the updater and installer skip it when choosing an asset.
+
+- v0.1.1 published 2026-10-12 (Gmail line-break fix, calendar shortcut and sync fixes, updater skips debug package). Working version is now 0.1.2.
