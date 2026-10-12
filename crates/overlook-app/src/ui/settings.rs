@@ -648,22 +648,38 @@ fn choice<T: Copy + PartialEq + 'static>(
     cx: &mut Context<MailWindow>,
     on_select: impl Fn(&mut MailWindow, T, &mut Window, &mut Context<MailWindow>) + 'static,
 ) -> AnyElement {
+    let p = *cx.palette();
     let on_select = std::rc::Rc::new(on_select);
+    // A segmented control: the chosen segment is raised on a surface card with full-strength
+    // text; the others sit flat in the track in muted text.
     h_flex()
         .gap(px(2.))
         .p(px(3.))
         .rounded(px(8.))
-        .bg(cx.palette().sidebar)
+        .bg(p.sidebar)
         .border_1()
-        .border_color(cx.palette().divider)
+        .border_color(p.divider)
         .children(options.iter().map(|(label, value)| {
             let value = *value;
+            let selected = value == current;
             let on_select = on_select.clone();
-            Button::new(SharedString::from(format!("choice-{label}")))
-                .ghost()
-                .small()
-                .label(*label)
-                .toggled(value == current)
+            div()
+                .id(SharedString::from(format!("choice-{label}")))
+                .px(px(10.))
+                .py(px(4.))
+                .rounded(px(6.))
+                .text_size(px(13.))
+                .cursor_pointer()
+                .when(selected, |d| {
+                    d.bg(p.surface)
+                        .text_color(p.foreground)
+                        .font_weight(FontWeight::SEMIBOLD)
+                        .border_1()
+                        .border_color(p.control_border)
+                        .shadow_sm()
+                })
+                .when(!selected, |d| d.text_color(p.muted).hover(|d| d.bg(p.hover).text_color(p.foreground)))
+                .child(*label)
                 .on_click(cx.listener(move |this, _, window, cx| on_select(this, value, window, cx)))
         }))
         .into_any_element()
