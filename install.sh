@@ -200,7 +200,7 @@ if (( IS_ARCH )); then
   command -v git >/dev/null 2>&1 || pkgs+=(git)
   command -v cargo >/dev/null 2>&1 || pkgs+=(rustup)
   command -v makepkg >/dev/null 2>&1 || pkgs+=(base-devel)
-  for p in vulkan-icd-loader libxkbcommon wayland fontconfig; do pacman -Qi "$p" >/dev/null 2>&1 || pkgs+=("$p"); done
+  for p in vulkan-icd-loader libxkbcommon libxkbcommon-x11 libxcb wayland fontconfig; do pacman -Qi "$p" >/dev/null 2>&1 || pkgs+=("$p"); done
   if (( ${#pkgs[@]} )); then
     note "Installing build requirements: ${pkgs[*]}"
     step "Install build requirements" sudo pacman -S --needed --noconfirm "${pkgs[@]}"

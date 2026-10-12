@@ -11,7 +11,7 @@ jobs:
     steps:
       - name: Install toolchain and libraries
         run: |
-          pacman -Syu --noconfirm git rustup vulkan-icd-loader libxkbcommon wayland fontconfig freetype2 openssl pkgconf
+          pacman -Syu --noconfirm git rustup vulkan-icd-loader libxkbcommon libxkbcommon-x11 libxcb wayland fontconfig freetype2 openssl pkgconf
           rustup default stable
       - uses: actions/checkout@v4
       - name: Trust the checkout
