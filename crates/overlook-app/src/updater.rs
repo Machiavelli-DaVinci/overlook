@@ -40,8 +40,10 @@ pub struct ReleaseAsset {
 }
 
 impl ReleaseInfo {
+    /// The first asset with this suffix, skipping makepkg's companion `-debug-` package,
+    /// which shares the `.pkg.tar.zst` suffix.
     pub fn asset_ending_with(&self, suffix: &str) -> Option<&ReleaseAsset> {
-        self.assets.iter().find(|a| a.name.ends_with(suffix))
+        self.assets.iter().find(|a| a.name.ends_with(suffix) && !a.name.contains("-debug-"))
     }
 
     pub fn package(&self) -> Option<&ReleaseAsset> {
@@ -383,6 +385,19 @@ mod tests {
         assert_eq!(parse_sha256sums(sums, "overlook-0.2.0-x86_64-linux.tar.gz").as_deref(), Some("def456"));
         assert_eq!(parse_sha256sums(sums, "overlook-0.2.0-1-x86_64.pkg.tar.zst").as_deref(), Some("abc123"));
         assert!(parse_sha256sums(sums, "missing").is_none());
+    }
+
+    #[test]
+    fn skips_debug_package_asset() {
+        let asset = |name: &str| ReleaseAsset { name: name.into(), url: String::new(), size: 0 };
+        let info = ReleaseInfo {
+            version: "0.1.0".into(),
+            tag: "v0.1.0".into(),
+            html_url: String::new(),
+            notes: String::new(),
+            assets: vec![asset("overlook-debug-0.1.0-1-x86_64.pkg.tar.zst"), asset("overlook-0.1.0-1-x86_64.pkg.tar.zst"), asset("SHA256SUMS")],
+        };
+        assert_eq!(info.package().unwrap().name, "overlook-0.1.0-1-x86_64.pkg.tar.zst");
     }
 
     #[test]

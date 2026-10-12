@@ -164,7 +164,7 @@ if (( ! FORCE_SOURCE )) && [[ "$(uname -m)" == x86_64 ]]; then
   if json=$(curl -fsSL -H 'Accept: application/vnd.github+json' "$API_LATEST" 2>/dev/null); then
     LATEST_TAG=$(printf '%s' "$json" | sed -n 's/.*"tag_name": *"\([^"]*\)".*/\1/p' | head -n1)
     if (( IS_ARCH )); then want='x86_64.pkg.tar.zst'; else want='x86_64-linux.tar.gz'; fi
-    ASSET_URL=$(printf '%s' "$json" | grep -o '"browser_download_url": *"[^"]*' | sed 's/.*"//' | grep -- "$want" | head -n1 || true)
+    ASSET_URL=$(printf '%s' "$json" | grep -o '"browser_download_url": *"[^"]*' | sed 's/.*"//' | grep -- "$want" | grep -v -- "-debug-" | head -n1 || true)
     SUMS_URL=$(printf '%s' "$json" | grep -o '"browser_download_url": *"[^"]*' | sed 's/.*"//' | grep -- '/SHA256SUMS$' | head -n1 || true)
     ASSET_NAME=${ASSET_URL##*/}
   fi

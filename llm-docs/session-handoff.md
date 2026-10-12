@@ -95,3 +95,8 @@ Brand assets and the HTML design preview keep their existing maintenance command
   operations (`Store::pending_event_ids`, filtered in `sync_calendar`).
 - `scripts/record-demo.sh` records a full-screen take on a fresh profile for anyone redoing the video by hand.
 - Everything above plus the updater/release batch is uncommitted, awaiting "commit this and push".
+
+- v0.1.0 is published: https://github.com/last-refuge/overlook/releases/tag/v0.1.0 (pacman package,
+  tarball, SHA256SUMS, install.sh). First attempt failed on a missing `libxkbcommon-x11` in the CI
+  container; it is now a declared dependency. The working version is 0.1.1 so the next tag reads as newer.
+  makepkg also uploads a `-debug-` package; the updater and installer skip it when choosing an asset.
