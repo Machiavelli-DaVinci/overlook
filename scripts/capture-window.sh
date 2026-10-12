@@ -31,4 +31,6 @@ import json,sys
 for c in json.load(sys.stdin):
     if c['class']=='ai.lastrefuge.Overlook':
         x,y=c['at']; w,h=c['size']; print(f'{x},{y} {w}x{h}')")
+ACTIVE=$(hyprctl activewindow -j | python3 -c "import json,sys; print(json.load(sys.stdin).get('class',''))")
+if [ "$ACTIVE" != "ai.lastrefuge.Overlook" ]; then echo "skipped: Overlook is not the active window (active=$ACTIVE)"; exit 2; fi
 grim -g "$GEOM" "$OUT" && echo "captured $OUT ($GEOM)"

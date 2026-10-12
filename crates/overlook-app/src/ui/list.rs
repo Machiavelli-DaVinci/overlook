@@ -255,14 +255,17 @@ impl MailWindow {
             .border_color(if selected { gpui_kit::transparent_black() } else { p.divider })
             .cursor_pointer()
             .when(selected, |d| d.bg(p.selection))
+            .when(!selected && unread, |d| d.bg(p.background))
             .when(!selected, |d| d.hover(|d| d.bg(p.hover)))
-            .when(selected, |d| {
+            // Unread and selected both mark the left edge, like Outlook: unread with the
+            // accent bar, selected with the same bar on the tinted background.
+            .when(selected || unread, |d| {
                 d.child(
                     div()
                         .absolute()
                         .left_0()
-                        .top(px(12.))
-                        .bottom(px(12.))
+                        .top(px(if selected { 12. } else { 10. }))
+                        .bottom(px(if selected { 12. } else { 10. }))
                         .w(px(3.))
                         .rounded(px(2.))
                         .bg(p.accent),
@@ -284,7 +287,8 @@ impl MailWindow {
                                     .min_w_0()
                                     .truncate()
                                     .text_size(px(13.))
-                                    .font_weight(if unread { FontWeight::SEMIBOLD } else { FontWeight::MEDIUM })
+                                    .font_weight(if unread { FontWeight::BOLD } else { FontWeight::NORMAL })
+                                    .text_color(p.foreground)
                                     .child(c.participant_line()),
                             )
                             .when(c.message_count > 1, |d| {
@@ -301,6 +305,7 @@ impl MailWindow {
                                 div()
                                     .flex_none()
                                     .text_size(px(11.))
+                                    .font_weight(if unread { FontWeight::SEMIBOLD } else { FontWeight::NORMAL })
                                     .text_color(if unread { p.accent } else { p.muted })
                                     .child(time),
                             ),
@@ -309,7 +314,7 @@ impl MailWindow {
                         div()
                             .truncate()
                             .text_size(px(13.))
-                            .font_weight(if unread { FontWeight::SEMIBOLD } else { FontWeight::NORMAL })
+                            .font_weight(if unread { FontWeight::BOLD } else { FontWeight::NORMAL })
                             .text_color(p.foreground)
                             .child(c.subject.clone()),
                     )

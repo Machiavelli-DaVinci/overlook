@@ -4,7 +4,13 @@
 use gpui_kit::{AssetSource, Result, SharedString};
 use std::borrow::Cow;
 
-pub const INTER_VARIABLE: &[u8] = include_bytes!("../../../branding/fonts/InterVariable.ttf");
+/// Static Inter faces (instanced from the bundled variable font) so weights resolve.
+pub const INTER_FACES: [&[u8]; 4] = [
+    include_bytes!("../../../branding/fonts/static/Inter-Regular.ttf"),
+    include_bytes!("../../../branding/fonts/static/Inter-Medium.ttf"),
+    include_bytes!("../../../branding/fonts/static/Inter-SemiBold.ttf"),
+    include_bytes!("../../../branding/fonts/static/Inter-Bold.ttf"),
+];
 pub const SOURCE_SERIF_DISPLAY: &[u8] =
     include_bytes!("../../../branding/fonts/SourceSerif4Display-Regular.otf");
 

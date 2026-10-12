@@ -86,10 +86,9 @@ fn main() {
 
     gpui_kit::application().with_assets(assets::Assets).run(move |cx| {
         gpui_kit::init(cx);
-        if let Err(e) = cx.text_system().add_fonts(vec![
-            Cow::Borrowed(assets::INTER_VARIABLE),
-            Cow::Borrowed(assets::SOURCE_SERIF_DISPLAY),
-        ]) {
+        let mut fonts: Vec<Cow<'static, [u8]>> = assets::INTER_FACES.iter().map(|f| Cow::Borrowed(*f)).collect();
+        fonts.push(Cow::Borrowed(assets::SOURCE_SERIF_DISPLAY));
+        if let Err(e) = cx.text_system().add_fonts(fonts) {
             tracing::warn!("bundled fonts could not be loaded: {e}");
         }
 
