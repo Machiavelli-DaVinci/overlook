@@ -501,11 +501,7 @@ impl MailWindow {
             CalView::Agenda => format!("{} – {}", tz::format_day(from), tz::format_day(tz::add_days(to, -1))),
         };
         let view_button = |label: &'static str, view: CalView, cx: &mut Context<Self>| {
-            Button::new(SharedString::from(format!("view-{label}")))
-                .ghost()
-                .small()
-                .label(label)
-                .toggled(self.cal_view == view)
+            segment(SharedString::from(format!("view-{label}")), label, self.cal_view == view, &p)
                 .on_click(cx.listener(move |this, _, _w, cx| this.set_cal_view(view, cx)))
         };
         let toolbar = h_flex()
@@ -521,13 +517,7 @@ impl MailWindow {
             .child(div().ml(px(8.)).text_size(px(18.)).font_weight(FontWeight::SEMIBOLD).child(title))
             .child(div().flex_1())
             .child(
-                h_flex()
-                    .gap(px(2.))
-                    .p(px(3.))
-                    .rounded(px(8.))
-                    .bg(p.sidebar)
-                    .border_1()
-                    .border_color(p.divider)
+                segmented(&p)
                     .child(view_button("Day", CalView::Day, cx))
                     .child(view_button("Week", CalView::Week, cx))
                     .child(view_button("Month", CalView::Month, cx))

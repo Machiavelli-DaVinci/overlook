@@ -650,36 +650,11 @@ fn choice<T: Copy + PartialEq + 'static>(
 ) -> AnyElement {
     let p = *cx.palette();
     let on_select = std::rc::Rc::new(on_select);
-    // A segmented control: the chosen segment is raised on a surface card with full-strength
-    // text; the others sit flat in the track in muted text.
-    h_flex()
-        .gap(px(2.))
-        .p(px(3.))
-        .rounded(px(8.))
-        .bg(p.sidebar)
-        .border_1()
-        .border_color(p.divider)
+    segmented(&p)
         .children(options.iter().map(|(label, value)| {
             let value = *value;
-            let selected = value == current;
             let on_select = on_select.clone();
-            div()
-                .id(SharedString::from(format!("choice-{label}")))
-                .px(px(10.))
-                .py(px(4.))
-                .rounded(px(6.))
-                .text_size(px(13.))
-                .cursor_pointer()
-                .when(selected, |d| {
-                    d.bg(p.surface)
-                        .text_color(p.foreground)
-                        .font_weight(FontWeight::SEMIBOLD)
-                        .border_1()
-                        .border_color(p.control_border)
-                        .shadow_sm()
-                })
-                .when(!selected, |d| d.text_color(p.muted).hover(|d| d.bg(p.hover).text_color(p.foreground)))
-                .child(*label)
+            segment(SharedString::from(format!("choice-{label}")), *label, value == current, &p)
                 .on_click(cx.listener(move |this, _, window, cx| on_select(this, value, window, cx)))
         }))
         .into_any_element()

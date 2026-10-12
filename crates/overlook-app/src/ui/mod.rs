@@ -22,6 +22,7 @@ use gpui_kit::component::button::{Button, ButtonVariants};
 use gpui_kit::component::input::{Input, InputEvent, InputState};
 use gpui_kit::component::menu::{DropdownMenu, PopupMenuItem};
 use gpui_kit::component::switch::Switch;
+use gpui_kit::component::tooltip::Tooltip;
 use gpui_kit::component::notification::Notification;
 use gpui_kit::component::{
     h_resizable, resizable_panel, v_resizable, ResizableState, Sizable, TitleBar, WindowExt,
@@ -1743,23 +1744,13 @@ impl MailWindow {
                             .border_1()
                             .border_color(p.divider)
                             .child(
-                                Button::new("module-mail")
-                                    .ghost()
-                                    .small()
-                                    .icon(icon("mail").size(px(15.)))
-                                    .label("Mail")
-                                    .tooltip("Mail (Ctrl 1)")
-                                    .toggled(self.module == Module::Mail)
+                                segment_with_icon("module-mail", icon("mail").size(px(15.)), "Mail", self.module == Module::Mail, &p)
+                                    .tooltip(|window, cx| Tooltip::new("Mail (Ctrl 1)").build(window, cx))
                                     .on_click(cx.listener(|this, _, window, cx| this.set_module(Module::Mail, window, cx))),
                             )
                             .child(
-                                Button::new("module-calendar")
-                                    .ghost()
-                                    .small()
-                                    .icon(icon("calendar").size(px(15.)))
-                                    .label("Calendar")
-                                    .tooltip("Calendar (Ctrl 2)")
-                                    .toggled(self.module == Module::Calendar)
+                                segment_with_icon("module-calendar", icon("calendar").size(px(15.)), "Calendar", self.module == Module::Calendar, &p)
+                                    .tooltip(|window, cx| Tooltip::new("Calendar (Ctrl 2)").build(window, cx))
                                     .on_click(cx.listener(|this, _, window, cx| this.set_module(Module::Calendar, window, cx))),
                             ),
                     )

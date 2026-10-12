@@ -1,6 +1,8 @@
 //! Small presentational helpers shared by the mail views.
 
 use crate::theme::Palette;
+use gpui_kit::base::h_flex;
+use gpui_kit::prelude::*;
 use gpui_kit::*;
 use overlook_core::Address;
 
@@ -62,4 +64,35 @@ pub fn color_dot(color: Hsla) -> Div {
 /// Thin horizontal divider.
 pub fn divider(p: &Palette) -> Div {
     div().w_full().h(px(1.)).bg(p.divider)
+}
+
+/// The track of a segmented control; fill it with [`segment`]s.
+pub fn segmented(p: &Palette) -> Div {
+    h_flex().items_center().gap(px(2.)).p(px(3.)).rounded(px(8.)).bg(p.sidebar).border_1().border_color(p.divider)
+}
+
+/// One option of a segmented control. The chosen segment is a raised card with full-strength,
+/// semibold text; the others sit flat in muted text. Attach `.on_click` and an optional icon
+/// child at the call site.
+pub fn segment(id: impl Into<ElementId>, label: impl Into<SharedString>, selected: bool, p: &Palette) -> Stateful<Div> {
+    segment_base(id, selected, p).child(label.into())
+}
+
+/// A [`segment`] with an icon before its label.
+pub fn segment_with_icon(id: impl Into<ElementId>, icon: impl IntoElement, label: impl Into<SharedString>, selected: bool, p: &Palette) -> Stateful<Div> {
+    segment_base(id, selected, p).child(icon).child(label.into())
+}
+
+fn segment_base(id: impl Into<ElementId>, selected: bool, p: &Palette) -> Stateful<Div> {
+    h_flex()
+        .id(id)
+        .items_center()
+        .gap(px(6.))
+        .px(px(10.))
+        .py(px(4.))
+        .rounded(px(6.))
+        .text_size(px(13.))
+        .cursor_pointer()
+        .when(selected, |d| d.bg(p.surface).text_color(p.foreground).font_weight(FontWeight::SEMIBOLD).border_1().border_color(p.control_border).shadow_sm())
+        .when(!selected, |d| d.text_color(p.muted).hover(|d| d.bg(p.hover).text_color(p.foreground)))
 }
