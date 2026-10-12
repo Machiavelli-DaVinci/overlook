@@ -1,0 +1,23 @@
+name: CI
+on:
+  push:
+    branches: [main]
+  pull_request:
+jobs:
+  test:
+    name: Build and test (Arch)
+    runs-on: ubuntu-latest
+    container: archlinux:base-devel
+    steps:
+      - name: Install toolchain and libraries
+        run: |
+          pacman -Syu --noconfirm git rustup vulkan-icd-loader libxkbcommon wayland fontconfig freetype2 openssl pkgconf
+          rustup default stable
+      - uses: actions/checkout@v4
+      - name: Trust the checkout
+        run: git config --global --add safe.directory "$GITHUB_WORKSPACE"
+      - uses: Swatinem/rust-cache@v2
+      - name: Test
+        run: cargo test --workspace --locked
+      - name: Shell syntax
+        run: bash -n install.sh && bash -n packaging/PKGBUILD && bash -n scripts/make-release-tarball.sh

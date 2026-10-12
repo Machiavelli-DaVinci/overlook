@@ -43,7 +43,7 @@ Focused Inbox (local classification with per-sender rules), attachment download/
 
 ## Distribution and README (added later on 12 October 2026)
 
-`install.sh` at the repository root is the one-command installer in the Last Refuge style (`curl -fsSL https://raw.githubusercontent.com/last-refuge/overlook/main/install.sh | bash`): on Arch/Omarchy it builds a package from `packaging/PKGBUILD` with makepkg and installs it with pacman; elsewhere, or with `--prefix`, it builds into a user prefix. `--dry-run`, `--uninstall`, `--ref`, `--yes`. A `Makefile` offers `make install PREFIX=…`. The README is the public front page with screenshots in `docs/screenshots/` taken from the sample profile (the sample provider now also serves a sample calendar with a week of fictional events, so the calendar can be demonstrated without Google). Refresh screenshots with the capture scripts when the shell changes visibly. There is no release pipeline yet: a GitHub Actions workflow that builds the package and attaches `install.sh` to releases is the natural next step, after which the README's curl URL should point at the latest release asset like omarchy-facet does.
+`install.sh` at the repository root is the one-command installer in the Last Refuge style (`curl -fsSL https://raw.githubusercontent.com/last-refuge/overlook/main/install.sh | bash`): on Arch/Omarchy it builds a package from `packaging/PKGBUILD` with makepkg and installs it with pacman; elsewhere, or with `--prefix`, it builds into a user prefix. `--dry-run`, `--uninstall`, `--ref`, `--yes`. A `Makefile` offers `make install PREFIX=…`. The README is the public front page with screenshots in `docs/screenshots/` taken from the sample profile (the sample provider now also serves a sample calendar with a week of fictional events, so the calendar can be demonstrated without Google). Refresh screenshots with the capture scripts when the shell changes visibly. Release pipeline and in-app updates were added the same day: see `overlook-native-app.md` → Releases and updates. The first release is cut by tagging `v0.1.0` (the workflow refuses tags that do not match `Cargo.toml`). After each release, bump the version in `Cargo.toml` so running builds report themselves as older than the next tag.
 
 ## Settings (added later on 12 October 2026)
 
@@ -84,3 +84,14 @@ scripts/capture-window.sh /tmp/overlook-demo /tmp/overlook.png
 ```
 
 Brand assets and the HTML design preview keep their existing maintenance commands (`branding/source/build_assets.py`, `prepare_mail_preview.py`, `package_brand.py`); see `llm-docs/overlook-brand-assets.md`.
+
+
+## 2026-10-12 (later): Google verification prep
+
+- Scope justifications, demo-video method, and the remaining submission checklist are in
+  `llm-docs/google-verification.md`. The captioned demo is `~/Videos/overlook-oauth-demo.mp4`.
+- Fixed: calendar shortcuts (T/D/W/M/A, arrows) no longer fire while typing in the event editor
+  (`typing_in_event_editor` propagates the key); sync no longer resurrects events with pending local
+  operations (`Store::pending_event_ids`, filtered in `sync_calendar`).
+- `scripts/record-demo.sh` records a full-screen take on a fresh profile for anyone redoing the video by hand.
+- Everything above plus the updater/release batch is uncommitted, awaiting "commit this and push".

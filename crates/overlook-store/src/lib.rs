@@ -652,6 +652,13 @@ impl Store {
     }
 
     /// Message ids referenced by operations that have not been applied yet.
+    /// Events touched by operations that have not reached the provider yet. A download must
+    /// not overwrite or resurrect them (for example a deleted event the server still lists).
+    pub fn pending_event_ids(&self, account: &AccountId) -> Result<BTreeSet<EventId>> {
+        let ops = self.pending_operations(account)?;
+        Ok(ops.iter().filter_map(|op| op.kind.event_id().cloned()).collect())
+    }
+
     pub fn pending_message_ids(&self, account: &AccountId) -> Result<BTreeSet<MessageId>> {
         let ops = self.pending_operations(account)?;
         let mut ids = BTreeSet::new();
@@ -1759,6 +1766,7 @@ mod tests {
         assert_eq!(found[0].my_response(), Some(ResponseStatus::Accepted));
         assert!(found[0].pending);
         store.delete_event_locally(&acct, &event).unwrap();
+        assert!(store.pending_event_ids(&acct).unwrap().contains(&event.id), "a locally deleted event is protected until replayed");
         assert!(store.event(&event.id).unwrap().is_none());
         assert_eq!(store.pending_count(&acct).unwrap(), 2);
     }

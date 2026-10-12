@@ -66,6 +66,8 @@ pub struct Prefs {
     pub default_event_minutes: u32,
     pub default_reminder_minutes: u32,
     pub show_declined_events: bool,
+    // Updates
+    pub check_for_updates: bool,
 }
 
 impl Default for Prefs {
@@ -91,6 +93,7 @@ impl Default for Prefs {
             default_event_minutes: 30,
             default_reminder_minutes: 10,
             show_declined_events: false,
+            check_for_updates: true,
         }
     }
 }

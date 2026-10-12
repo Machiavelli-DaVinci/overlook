@@ -7,8 +7,9 @@
 # pacman can update and remove it. Any other Linux: builds from source into ~/.local with no
 # administrator access. Read it first if you like; it is short and does nothing you cannot see.
 #
+#   --source        build from source even if a prebuilt release is available
 #   --prefix DIR    install into DIR without administrator access (default for non-Arch: ~/.local)
-#   --ref REF       git branch or tag to build (default: main)
+#   --ref REF       git branch or tag to build from source (default: main)
 #   --yes           do not ask for confirmation
 #   --dry-run       show what would happen and change nothing
 #   --uninstall     remove Overlook
@@ -20,6 +21,7 @@ main() {
 REPO="last-refuge/overlook"
 CLONE_URL="https://github.com/$REPO.git"
 PKGNAME="overlook"
+API_LATEST="https://api.github.com/repos/$REPO/releases/latest"
 
 # ---------------------------------------------------------------------------------------------
 # Presentation
@@ -80,8 +82,9 @@ Overlook installer. A clear view of what matters.
 Arch Linux and Omarchy: builds a package from source and installs it with pacman.
 Any other Linux: builds from source into ~/.local, no administrator access needed.
 
+  --source        build from source even if a prebuilt release is available
   --prefix DIR    install into DIR without administrator access
-  --ref REF       git branch or tag to build (default: main)
+  --ref REF       git branch or tag to build from source (default: main)
   --yes           do not ask for confirmation
   --dry-run       show what would happen and change nothing
   --uninstall     remove Overlook
@@ -92,9 +95,10 @@ USAGE
 # ---------------------------------------------------------------------------------------------
 # Arguments
 # ---------------------------------------------------------------------------------------------
-PREFIX=""; REF="main"; ASSUME_YES=0; DRY=0; UNINSTALL=0
+PREFIX=""; REF="main"; ASSUME_YES=0; DRY=0; UNINSTALL=0; FORCE_SOURCE=0
 while (( $# )); do
   case "$1" in
+    --source) FORCE_SOURCE=1 ;;
     --prefix) shift; [[ $# -gt 0 ]] || die "--prefix needs a directory."; PREFIX=$1 ;;
     --prefix=*) PREFIX=${1#--prefix=} ;;
     --ref) shift; [[ $# -gt 0 ]] || die "--ref needs a branch or tag."; REF=$1 ;;
@@ -154,13 +158,32 @@ fi
 # Plan
 # ---------------------------------------------------------------------------------------------
 banner
+# A prebuilt release is used when one exists for this machine; otherwise we build.
+ASSET_URL=""; ASSET_NAME=""; SUMS_URL=""; LATEST_TAG=""
+if (( ! FORCE_SOURCE )) && [[ "$(uname -m)" == x86_64 ]]; then
+  if json=$(curl -fsSL -H 'Accept: application/vnd.github+json' "$API_LATEST" 2>/dev/null); then
+    LATEST_TAG=$(printf '%s' "$json" | sed -n 's/.*"tag_name": *"\([^"]*\)".*/\1/p' | head -n1)
+    if (( IS_ARCH )); then want='x86_64.pkg.tar.zst'; else want='x86_64-linux.tar.gz'; fi
+    ASSET_URL=$(printf '%s' "$json" | grep -o '"browser_download_url": *"[^"]*' | sed 's/.*"//' | grep -- "$want" | head -n1 || true)
+    SUMS_URL=$(printf '%s' "$json" | grep -o '"browser_download_url": *"[^"]*' | sed 's/.*"//' | grep -- '/SHA256SUMS$' | head -n1 || true)
+    ASSET_NAME=${ASSET_URL##*/}
+  fi
+fi
 if (( IS_ARCH )); then
   if (( IS_OMARCHY )) && [[ "$DISTRO" != *marchy* ]]; then DISTRO="$DISTRO with Omarchy"; fi
-  note "$DISTRO: building a package from source and installing it with pacman."
+  if [[ -n "$ASSET_URL" ]]; then
+    note "$DISTRO: installing the prebuilt package for Overlook ${LATEST_TAG#v} with pacman."
+  else
+    note "$DISTRO: building a package from source and installing it with pacman."
+  fi
   note "You may be asked for your password for pacman only."
 else
   P=${PREFIX:-$HOME/.local}
-  note "$DISTRO: building from source into $P (no administrator access needed)."
+  if [[ -n "$ASSET_URL" ]]; then
+    note "$DISTRO: installing the prebuilt Overlook ${LATEST_TAG#v} into $P (no administrator access needed)."
+  else
+    note "$DISTRO: building from source into $P (no administrator access needed)."
+  fi
 fi
 (( DRY )) && note "Dry run: nothing will be changed."
 confirm "Continue?" || { note "Nothing changed."; exit 0; }
@@ -168,6 +191,7 @@ confirm "Continue?" || { note "Nothing changed."; exit 0; }
 # ---------------------------------------------------------------------------------------------
 # Build requirements
 # ---------------------------------------------------------------------------------------------
+if [[ -z "$ASSET_URL" ]]; then
 need_cmds=(git cargo)
 missing=()
 for c in "${need_cmds[@]}"; do command -v "$c" >/dev/null 2>&1 || missing+=("$c"); done
@@ -187,17 +211,59 @@ if (( IS_ARCH )); then
 elif (( ${#missing[@]} )); then
   die "Missing: ${missing[*]}. Install Rust from https://rustup.rs and git, plus development packages for wayland, libxkbcommon, fontconfig, freetype and a Vulkan driver, then run this again."
 fi
+fi
 
 # ---------------------------------------------------------------------------------------------
-# Fetch
+# Fetch: a verified prebuilt release, or the source
 # ---------------------------------------------------------------------------------------------
 SRC="$WORK/src"
-step "Fetch Overlook ($REF)" git clone --depth 1 --branch "$REF" "$CLONE_URL" "$SRC"
+fetch_release_asset() {
+  local dest="$WORK/$ASSET_NAME"
+  curl -fsSL -o "$dest" "$ASSET_URL" || return 1
+  [[ -n "$SUMS_URL" ]] || { echo "no SHA256SUMS in the release" >&2; return 1; }
+  local sums expected actual
+  sums=$(curl -fsSL "$SUMS_URL") || return 1
+  expected=$(printf '%s\n' "$sums" | awk -v n="$ASSET_NAME" '$2==n || $2=="*"n {print tolower($1)}' | head -n1)
+  actual=$(sha256sum "$dest" | awk '{print tolower($1)}')
+  [[ -n "$expected" && "$expected" == "$actual" ]] || { echo "checksum mismatch for $ASSET_NAME" >&2; rm -f "$dest"; return 1; }
+}
+if [[ -n "$ASSET_URL" ]]; then
+  if (( DRY )); then
+    note "would: Download $ASSET_NAME and verify its checksum"
+  elif ! fetch_release_asset </dev/null >>"$LOG" 2>&1; then
+    warn "The prebuilt release could not be downloaded or verified; building from source instead."
+    ASSET_URL=""; ASSET_NAME=""
+  else
+    ok "Downloaded $ASSET_NAME and verified its checksum"
+  fi
+fi
+if [[ -z "$ASSET_URL" ]]; then
+  step "Fetch Overlook ($REF)" git clone --depth 1 --branch "$REF" "$CLONE_URL" "$SRC"
+fi
 
 # ---------------------------------------------------------------------------------------------
 # Build and install
 # ---------------------------------------------------------------------------------------------
-if (( IS_ARCH )); then
+if (( IS_ARCH )) && [[ -n "$ASSET_URL" ]]; then
+  note "Installing the package needs administrator access."
+  step "Install with pacman" sudo pacman -U --noconfirm "$WORK/$ASSET_NAME"
+  BIN=/usr/bin/overlook
+elif [[ -n "$ASSET_URL" ]]; then
+  P=${PREFIX:-$HOME/.local}
+  step "Install into $P" bash -c '
+    set -e; TAR=$0; P=$1; X=$(mktemp -d)
+    tar -xzf "$TAR" -C "$X"; D=$(find "$X" -mindepth 1 -maxdepth 1 -type d | head -n1)
+    install -Dm755 "$D/overlook" "$P/bin/overlook"
+    install -Dm644 "$D/packaging/ai.lastrefuge.Overlook.desktop" "$P/share/applications/ai.lastrefuge.Overlook.desktop"
+    install -Dm644 "$D/packaging/ai.lastrefuge.Overlook.metainfo.xml" "$P/share/metainfo/ai.lastrefuge.Overlook.metainfo.xml"
+    install -Dm644 "$D/icons/overlook-app-icon.svg" "$P/share/icons/hicolor/scalable/apps/ai.lastrefuge.Overlook.svg"
+    for s in 16 24 32 48 64 128 256 512; do install -Dm644 "$D/icons/overlook-icon-$s.png" "$P/share/icons/hicolor/${s}x${s}/apps/ai.lastrefuge.Overlook.png"; done
+    command -v update-desktop-database >/dev/null 2>&1 && update-desktop-database "$P/share/applications" || true
+    rm -rf "$X"
+  ' "$WORK/$ASSET_NAME" "$P"
+  BIN="$P/bin/overlook"
+  case ":$PATH:" in *":$P/bin:"*) ;; *) warn "$P/bin is not on your PATH. Add it to your shell profile to run \`overlook\` from a terminal." ;; esac
+elif (( IS_ARCH )); then
   PKGDIR="$WORK/pkg"
   if (( ! DRY )); then
     mkdir -p "$PKGDIR"

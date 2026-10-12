@@ -10,6 +10,7 @@ mod widgets;
 
 use crate::assets::icon;
 use crate::google_signin::{self, PendingSignIn, SignInResult};
+use crate::updater::{self, InstallKind, PacmanOutcome, Progress, ReleaseInfo};
 use crate::{credentials, providers};
 use crate::sync::{run_sync, SyncOutcome};
 use crate::theme::{self, ActivePalette, Palette};
@@ -177,6 +178,28 @@ pub struct SignIn {
     cancel: Arc<AtomicBool>,
 }
 
+#[derive(Clone, Debug, PartialEq, Eq)]
+pub enum UpdatePhase {
+    Idle,
+    Checking,
+    Downloading,
+    /// The new version is in place; restart to run it.
+    ReadyToRestart,
+    /// A terminal window is finishing the pacman step.
+    TerminalOpened,
+    Failed(String),
+}
+
+pub struct UpdateState {
+    pub install: InstallKind,
+    pub latest: Option<ReleaseInfo>,
+    pub phase: UpdatePhase,
+    pub progress: Option<Arc<Progress>>,
+    pub last_check: i64,
+    pub last_result: Option<String>,
+    pub dismissed: Option<String>,
+}
+
 pub struct MailWindow {
     focus_handle: FocusHandle,
     list_focus: FocusHandle,
@@ -242,6 +265,7 @@ pub struct MailWindow {
     pub(crate) prefs: Prefs,
     pub(crate) account_prefs: HashMap<AccountId, AccountPrefs>,
     pub(crate) settings: Option<SettingsState>,
+    pub(crate) update: UpdateState,
     /// Generation counter for delayed mark-as-read timers.
     mark_read_generation: u64,
     last_sync_tick: i64,
@@ -308,6 +332,8 @@ impl MailWindow {
         let prefs: Prefs = store.setting::<Prefs>("prefs").ok().flatten().unwrap_or_default();
         let reminders_enabled = prefs.event_reminders;
         overlook_core::tz::set_clock_24h(prefs.clock_24h);
+        let update_last_check = store.setting::<i64>("update.last_check").ok().flatten().unwrap_or(0);
+        let update_dismissed = store.setting::<String>("update.dismissed").ok().flatten();
         let account_prefs: HashMap<AccountId, AccountPrefs> = accounts
             .iter()
             .map(|a| (a.id.clone(), store.setting::<AccountPrefs>(&format!("account_prefs:{}", a.id.0)).ok().flatten().unwrap_or_default()))
@@ -375,6 +401,15 @@ impl MailWindow {
             new_event: None,
             reminders_enabled,
             notified: HashSet::new(),
+            update: UpdateState {
+                install: InstallKind::detect(),
+                latest: None,
+                phase: UpdatePhase::Idle,
+                progress: None,
+                last_check: update_last_check,
+                last_result: None,
+                dismissed: update_dismissed,
+            },
             prefs,
             account_prefs,
             settings: None,
@@ -416,12 +451,26 @@ impl MailWindow {
             this.start_google_sign_in(None, window, cx);
         }
 
+        // First update check shortly after launch, then once a day from the periodic loop.
+        cx.spawn_in(window, async move |this, cx| {
+            cx.background_executor().timer(Duration::from_secs(20)).await;
+            let _ = this.update_in(cx, |this, window, cx| {
+                if this.prefs.check_for_updates && now() - this.update.last_check > 6 * 3_600_000 {
+                    this.check_for_updates(false, window, cx);
+                }
+            });
+        })
+        .detach();
+
         // Periodic synchronization while accounts are reachable, and reminder checks.
         cx.spawn_in(window, async move |this, cx| loop {
             cx.background_executor().timer(Duration::from_secs(15)).await;
             let alive = this.update_in(cx, |this, window, cx| {
                 // Reminders are checked every tick; mail/calendar sync follows the preference.
                 this.check_reminders(window, cx);
+                if this.prefs.check_for_updates && now() - this.update.last_check > 24 * 3_600_000 {
+                    this.check_for_updates(false, window, cx);
+                }
                 let interval = u64::from(this.prefs.sync_interval_secs.max(15));
                 let due = now() - this.last_sync_tick >= (interval as i64) * 1000;
                 if due {
@@ -516,6 +565,141 @@ impl MailWindow {
         let next = self.accounts[0].id.clone();
         window.push_notification(Notification::info(format!("Removed {} from this device.", account.email)), cx);
         self.switch_account(next, window, cx);
+    }
+
+    // ---------------------------------------------------------------- updates
+
+    pub(crate) fn check_for_updates(&mut self, manual: bool, window: &mut Window, cx: &mut Context<Self>) {
+        if self.update.phase == UpdatePhase::Checking || self.update.phase == UpdatePhase::Downloading {
+            return;
+        }
+        self.update.phase = UpdatePhase::Checking;
+        self.update.last_check = now();
+        let _ = self.store.set_setting("update.last_check", &self.update.last_check);
+        cx.notify();
+        cx.spawn_in(window, async move |this, cx| {
+            let result = cx.background_spawn(async move { updater::check_latest() }).await;
+            let _ = this.update_in(cx, |this, window, cx| {
+                this.update.phase = UpdatePhase::Idle;
+                match result {
+                    Ok(release) if updater::is_newer(&release.version, updater::CURRENT_VERSION) => {
+                        this.update.last_result = Some(format!("Overlook {} is available.", release.version));
+                        this.update.latest = Some(release);
+                        if manual {
+                            this.update.dismissed = None;
+                        }
+                    }
+                    Ok(release) => {
+                        this.update.latest = None;
+                        this.update.last_result = Some(format!("You have the latest version ({}).", release.version));
+                        if manual {
+                            window.push_notification(Notification::success(format!("You’re up to date. Overlook {} is the latest version.", updater::CURRENT_VERSION)), cx);
+                        }
+                    }
+                    Err(e) => {
+                        this.update.last_result = Some(format!("Couldn’t check for updates: {e}"));
+                        if manual {
+                            window.push_notification(Notification::warning(format!("Couldn’t check for updates: {e}")), cx);
+                        }
+                    }
+                }
+                cx.notify();
+            });
+        })
+        .detach();
+    }
+
+    pub(crate) fn dismiss_update(&mut self, cx: &mut Context<Self>) {
+        if let Some(r) = &self.update.latest {
+            self.update.dismissed = Some(r.version.clone());
+            let _ = self.store.set_setting("update.dismissed", &r.version);
+        }
+        cx.notify();
+    }
+
+    pub(crate) fn update_banner_visible(&self) -> bool {
+        match &self.update.latest {
+            Some(r) => self.update.dismissed.as_deref() != Some(r.version.as_str()) || self.update.phase != UpdatePhase::Idle,
+            None => false,
+        }
+    }
+
+    /// Downloads, verifies, and applies the latest release for this installation.
+    pub(crate) fn start_update(&mut self, window: &mut Window, cx: &mut Context<Self>) {
+        let Some(release) = self.update.latest.clone() else { return };
+        let install = self.update.install.clone();
+        let asset = match &install {
+            InstallKind::Pacman => release.package().cloned(),
+            InstallKind::Prefix { .. } => release.tarball().cloned(),
+            InstallKind::Development | InstallKind::Unknown(_) => None,
+        };
+        let Some(asset) = asset else {
+            self.update.phase = UpdatePhase::Failed(match &install {
+                InstallKind::Development => "This is a development build: pull the repository and rebuild.".into(),
+                InstallKind::Unknown(p) => format!("Overlook at {} cannot update itself. Run the installer again.", p.display()),
+                _ => "This release has no package for your installation. Run the installer again.".into(),
+            });
+            cx.notify();
+            return;
+        };
+        let progress = Progress::new();
+        self.update.progress = Some(progress.clone());
+        self.update.phase = UpdatePhase::Downloading;
+        cx.notify();
+        let dir = updater::cache_dir();
+        cx.spawn_in(window, async move |this, cx| {
+            // Repaint while the download runs.
+            let ticker = {
+                let this = this.clone();
+                let cx = cx.clone();
+                cx.spawn(async move |cx| loop {
+                    cx.background_executor().timer(Duration::from_millis(250)).await;
+                    if this.update(cx, |this, cx| {
+                        if this.update.phase == UpdatePhase::Downloading {
+                            cx.notify();
+                            true
+                        } else {
+                            false
+                        }
+                    }).unwrap_or(false) == false
+                    {
+                        break;
+                    }
+                })
+            };
+            let result = cx
+                .background_spawn(async move {
+                    let file = updater::download(&asset, &dir, &progress)?;
+                    let expected = updater::expected_sha256(&release, &asset.name)?;
+                    let actual = updater::sha256_file(&file)?;
+                    if expected != actual {
+                        let _ = std::fs::remove_file(&file);
+                        return Err("The download did not match its checksum. Nothing was installed.".to_owned());
+                    }
+                    match &install {
+                        InstallKind::Pacman => updater::apply_pacman_update(&file).map(|o| match o {
+                            PacmanOutcome::Installed => UpdatePhase::ReadyToRestart,
+                            PacmanOutcome::TerminalOpened => UpdatePhase::TerminalOpened,
+                        }),
+                        InstallKind::Prefix { bin, prefix } => updater::apply_prefix_update(&file, bin, prefix).map(|_| UpdatePhase::ReadyToRestart),
+                        _ => Err("unsupported installation".to_owned()),
+                    }
+                })
+                .await;
+            drop(ticker);
+            let _ = this.update_in(cx, |this, window, cx| {
+                this.update.progress = None;
+                this.update.phase = match result {
+                    Ok(phase) => phase,
+                    Err(e) => UpdatePhase::Failed(e),
+                };
+                if this.update.phase == UpdatePhase::ReadyToRestart {
+                    window.push_notification(Notification::success("Update installed. Restart Overlook to finish."), cx);
+                }
+                cx.notify();
+            });
+        })
+        .detach();
     }
 
     // ------------------------------------------------------------ Google sign-in
@@ -1419,25 +1603,57 @@ impl MailWindow {
     fn on_switch_calendar(&mut self, _: &SwitchToCalendar, window: &mut Window, cx: &mut Context<Self>) {
         self.set_module(Module::Calendar, window, cx);
     }
-    fn on_cal_prev(&mut self, _: &CalendarPrevious, _w: &mut Window, cx: &mut Context<Self>) {
+    /// The single-letter calendar shortcuts (T, D, W, M, A, arrows) must not fire while the
+    /// user is typing in the event editor. Propagating lets the keystroke reach the text field.
+    fn typing_in_event_editor(&self, window: &Window, cx: &App) -> bool {
+        let Some(editor) = &self.new_event else { return false };
+        editor.title.read(cx).focus_handle(cx).is_focused(window)
+            || editor.date.read(cx).focus_handle(cx).is_focused(window)
+            || editor.start.read(cx).focus_handle(cx).is_focused(window)
+            || editor.end.read(cx).focus_handle(cx).is_focused(window)
+            || editor.location.read(cx).focus_handle(cx).is_focused(window)
+            || editor.description.read(cx).focus_handle(cx).is_focused(window)
+    }
+    fn on_cal_prev(&mut self, _: &CalendarPrevious, window: &mut Window, cx: &mut Context<Self>) {
+        if self.typing_in_event_editor(window, cx) {
+            return cx.propagate();
+        }
         self.cal_step(-1, cx);
     }
-    fn on_cal_next(&mut self, _: &CalendarNext, _w: &mut Window, cx: &mut Context<Self>) {
+    fn on_cal_next(&mut self, _: &CalendarNext, window: &mut Window, cx: &mut Context<Self>) {
+        if self.typing_in_event_editor(window, cx) {
+            return cx.propagate();
+        }
         self.cal_step(1, cx);
     }
-    fn on_cal_today(&mut self, _: &CalendarToday, _w: &mut Window, cx: &mut Context<Self>) {
+    fn on_cal_today(&mut self, _: &CalendarToday, window: &mut Window, cx: &mut Context<Self>) {
+        if self.typing_in_event_editor(window, cx) {
+            return cx.propagate();
+        }
         self.cal_today(cx);
     }
-    fn on_cal_day(&mut self, _: &CalendarDay, _w: &mut Window, cx: &mut Context<Self>) {
+    fn on_cal_day(&mut self, _: &CalendarDay, window: &mut Window, cx: &mut Context<Self>) {
+        if self.typing_in_event_editor(window, cx) {
+            return cx.propagate();
+        }
         self.set_cal_view(CalView::Day, cx);
     }
-    fn on_cal_week(&mut self, _: &CalendarWeek, _w: &mut Window, cx: &mut Context<Self>) {
+    fn on_cal_week(&mut self, _: &CalendarWeek, window: &mut Window, cx: &mut Context<Self>) {
+        if self.typing_in_event_editor(window, cx) {
+            return cx.propagate();
+        }
         self.set_cal_view(CalView::Week, cx);
     }
-    fn on_cal_agenda(&mut self, _: &CalendarAgenda, _w: &mut Window, cx: &mut Context<Self>) {
+    fn on_cal_agenda(&mut self, _: &CalendarAgenda, window: &mut Window, cx: &mut Context<Self>) {
+        if self.typing_in_event_editor(window, cx) {
+            return cx.propagate();
+        }
         self.set_cal_view(CalView::Agenda, cx);
     }
-    fn on_cal_month(&mut self, _: &CalendarMonth, _w: &mut Window, cx: &mut Context<Self>) {
+    fn on_cal_month(&mut self, _: &CalendarMonth, window: &mut Window, cx: &mut Context<Self>) {
+        if self.typing_in_event_editor(window, cx) {
+            return cx.propagate();
+        }
         self.set_cal_view(CalView::Month, cx);
     }
     fn on_new_event(&mut self, _: &NewEventAction, window: &mut Window, cx: &mut Context<Self>) {
@@ -1709,6 +1925,49 @@ impl MailWindow {
             )
     }
 
+    /// Banner for an available update, its download, and the restart step.
+    fn render_update_banner(&self, cx: &mut Context<Self>) -> Option<impl IntoElement> {
+        if !self.update_banner_visible() {
+            return None;
+        }
+        let p = *cx.palette();
+        let release = self.update.latest.clone()?;
+        let version = release.version.clone();
+        let url = release.html_url.clone();
+        let (text, color): (String, Hsla) = match &self.update.phase {
+            UpdatePhase::Idle | UpdatePhase::Checking => (format!("Overlook {version} is available."), p.accent),
+            UpdatePhase::Downloading => {
+                let pct = self.update.progress.as_ref().and_then(|p| p.fraction()).map(|f| format!(" {:.0}%", f * 100.)).unwrap_or_default();
+                (format!("Downloading Overlook {version}…{pct}"), p.accent)
+            }
+            UpdatePhase::ReadyToRestart => (format!("Overlook {version} is installed. Restart to start using it."), p.success),
+            UpdatePhase::TerminalOpened => ("Finish the update in the terminal window, then restart Overlook.".into(), p.accent),
+            UpdatePhase::Failed(e) => (e.clone(), p.warning),
+        };
+        let phase = self.update.phase.clone();
+        Some(
+            h_flex()
+                .items_center()
+                .gap(px(10.))
+                .px(px(16.))
+                .h(px(40.))
+                .bg(p.chip)
+                .border_b_1()
+                .border_color(p.divider)
+                .text_size(px(13.))
+                .child(icon("arrow-down-to-line").size(px(16.)).text_color(color))
+                .child(div().flex_1().truncate().child(text))
+                .child(Button::new("update-notes").ghost().small().label("What’s new").on_click(move |_, _, cx| cx.open_url(&url)))
+                .when(matches!(phase, UpdatePhase::Idle | UpdatePhase::Failed(_)), |row| {
+                    row.child(Button::new("update-now").primary().small().label(if matches!(phase, UpdatePhase::Failed(_)) { "Try again" } else { "Update now" }).on_click(cx.listener(|this, _, window, cx| this.start_update(window, cx))))
+                        .child(Button::new("update-later").ghost().small().label("Later").on_click(cx.listener(|this, _, _w, cx| this.dismiss_update(cx))))
+                })
+                .when(matches!(phase, UpdatePhase::ReadyToRestart | UpdatePhase::TerminalOpened), |row| {
+                    row.child(Button::new("update-restart").primary().small().label("Restart Overlook").on_click(|_, _, _| updater::restart()))
+                }),
+        )
+    }
+
     /// Banner under the header for a sign-in in progress or an account that needs sign-in.
     fn render_banner(&self, cx: &mut Context<Self>) -> Option<impl IntoElement> {
         let p = *cx.palette();
@@ -1874,6 +2133,7 @@ impl Render for MailWindow {
             .text_size(px(13.))
             .relative()
             .child(self.render_header(cx))
+            .children(self.render_update_banner(cx))
             .children(self.render_banner(cx))
             .child(div().flex_1().min_h_0().child(self.render_body(cx)))
             .child(self.render_status_bar(cx))

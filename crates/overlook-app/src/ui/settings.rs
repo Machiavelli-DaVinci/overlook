@@ -571,6 +571,29 @@ impl MailWindow {
                             .child(div().text_size(px(12.)).text_color(p.muted).child(format!("Version {} · by Last Refuge", env!("CARGO_PKG_VERSION")))),
                     ),
             )
+            .child(section("Updates", None))
+            .child(setting_row(
+                &format!("Overlook {} · {}", crate::updater::CURRENT_VERSION, self.update.install.describe()),
+                self.update.last_result.as_deref().unwrap_or("Not checked yet."),
+                h_flex()
+                    .gap(px(6.))
+                    .child(Button::new("check-updates").small().icon(icon("refresh-cw").size(px(14.))).label("Check for updates").loading(self.update.phase == super::UpdatePhase::Checking).on_click(cx.listener(|this, _, window, cx| this.check_for_updates(true, window, cx))))
+                    .when(self.update.latest.is_some() && matches!(self.update.phase, super::UpdatePhase::Idle | super::UpdatePhase::Failed(_)), |r| {
+                        r.child(Button::new("install-update").primary().small().label("Update now").on_click(cx.listener(|this, _, window, cx| {
+                            this.close_settings(window, cx);
+                            this.start_update(window, cx);
+                        })))
+                    })
+                    .into_any_element(),
+            ))
+            .child(setting_row(
+                "Check for updates automatically",
+                "Once a day, from the project’s GitHub releases. Nothing about you is sent.",
+                Switch::new("pref-updates").checked(self.prefs.check_for_updates).on_click(cx.listener(|this, checked: &bool, _w, cx| {
+                    this.prefs.check_for_updates = *checked;
+                    this.save_prefs(cx);
+                })).into_any_element(),
+            ))
             .child(section("Links", None))
             .child(setting_row("Last Refuge", "", Button::new("about-site").ghost().small().icon(icon("external-link").size(px(14.))).label("lastrefuge.ai").on_click(|_, _, cx| cx.open_url("https://lastrefuge.ai/")).into_any_element()))
             .child(setting_row("Source", "", Button::new("about-repo").ghost().small().icon(icon("external-link").size(px(14.))).label("github.com/last-refuge/overlook").on_click(|_, _, cx| cx.open_url("https://github.com/last-refuge/overlook")).into_any_element()))

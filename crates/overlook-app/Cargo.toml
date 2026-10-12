@@ -24,4 +24,6 @@ tracing-subscriber = { workspace = true }
 directories = { workspace = true }
 oo7 = "0.4"
 notify-rust = "4"
+ureq = { version = "3", features = ["json"] }
+sha2 = "0.10"
 tokio = { version = "1", features = ["rt-multi-thread"] }

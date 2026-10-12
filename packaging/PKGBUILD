@@ -25,13 +25,21 @@ pkgver() {
   cd "$srcdir/overlook"
   local base
   base=$(grep -m1 '^version' Cargo.toml | sed 's/.*"\(.*\)".*/\1/')
-  printf '%s.r%s.%s' "$base" "$(git rev-list --count HEAD 2>/dev/null || echo 0)" "$(git rev-parse --short HEAD 2>/dev/null || echo local)"
+  # A tagged release builds a clean version; anything else records the commit.
+  if git describe --exact-match --tags >/dev/null 2>&1; then
+    printf '%s' "$base"
+  else
+    printf '%s.r%s.%s' "$base" "$(git rev-list --count HEAD 2>/dev/null || echo 0)" "$(git rev-parse --short HEAD 2>/dev/null || echo local)"
+  fi
 }
 
 build() {
   cd "$srcdir/overlook"
   export CARGO_HOME="${CARGO_HOME:-$HOME/.cargo}"
-  cargo build --release --locked -p overlook
+  # A prebuilt release binary (CI) is reused; otherwise compile.
+  if [[ ! -x target/release/overlook ]]; then
+    cargo build --release --locked -p overlook
+  fi
 }
 
 package() {

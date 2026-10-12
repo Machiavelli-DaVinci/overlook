@@ -4,6 +4,7 @@ mod assets;
 mod credentials;
 mod google_signin;
 mod notify;
+mod updater;
 mod providers;
 mod sync;
 mod theme;

@@ -98,8 +98,18 @@ fontconfig, FreeType, and a Vulkan driver. Or by hand:
 make install PREFIX=~/.local
 ```
 
+When a release exists for your machine the installer downloads it, verifies its SHA-256 checksum, and
+installs that instead of compiling; `--source` forces a build.
+
 **Remove it:** `sudo pacman -Rns overlook` on Arch, or `./install.sh --uninstall`. Your mail and settings in
 `~/.local/share/overlook` stay until you delete them.
+
+### Updates
+
+Overlook checks GitHub for a new release once a day (switch it off in Settings → About) and shows a banner
+when there is one. **Update now** downloads the release, verifies its checksum, and installs it in place:
+through a polkit password dialog when Overlook was installed with pacman, or by swapping the binary when it
+lives in your own prefix. Then **Restart Overlook**. Nothing about you is sent during the check.
 
 Overlook starts with a **sample mailbox** so you can see how it works before connecting anything. The sample
 account's connection is a switch in the status bar; flip it to watch offline changes sync.

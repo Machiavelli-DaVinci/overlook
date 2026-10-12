@@ -88,8 +88,12 @@ fn sync_calendar(store: &Store, provider: &dyn CalendarProvider, account: &Accou
                 return;
             }
         };
+        // Local intent wins until it has been replayed: a locally deleted or edited event
+        // that the server still reports must not come back in this download.
+        let protected = store.pending_event_ids(acct).unwrap_or_default();
+        let upserts: Vec<_> = changes.upserts.iter().filter(|e| !protected.contains(&e.id)).cloned().collect();
         let _ = store.delete_events(&changes.deleted);
-        if let Err(e) = store.upsert_events(&changes.upserts) {
+        if let Err(e) = store.upsert_events(&upserts) {
             set_calendar_status(store, acct, &SyncState::SyncFailed(e.to_string()));
             return;
         }
