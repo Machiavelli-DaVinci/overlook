@@ -92,12 +92,18 @@ impl MailWindow {
         };
 
         let body: AnyElement = if rows.is_empty() {
-            let (title, hint): (&str, &str) = match (&self.view, self.search_query.is_empty()) {
-                (_, false) => ("No results", "Try another name or keyword."),
-                (MailboxView::Kind(LabelKind::Inbox), _) => ("Your inbox is clear.", "New mail will appear here."),
-                (MailboxView::Kind(LabelKind::Drafts), _) => ("No drafts", "Messages you start are saved on this device."),
-                (MailboxView::Kind(LabelKind::Outbox), _) => ("Outbox is empty", "Messages waiting to be sent appear here."),
-                _ => ("Nothing here", "There are no messages in this view."),
+            let nothing_local = !self.is_sample(&self.account.id) && self.store.message_count(&self.account.id).unwrap_or(0) == 0;
+            let paused_hint: String = match &self.status.state {
+                SyncState::SyncFailed(reason) | SyncState::Paused(reason) if nothing_local && !self.is_syncing_active() => reason.clone(),
+                _ => "Your inbox will appear here in a moment.".to_owned(),
+            };
+            let (title, hint): (String, String) = match (&self.view, self.search_query.is_empty()) {
+                _ if nothing_local => ("Downloading recent mail…".into(), paused_hint),
+                (_, false) => ("No results".into(), "Try another name or keyword.".into()),
+                (MailboxView::Kind(LabelKind::Inbox), _) => ("Your inbox is clear.".into(), "New mail will appear here.".into()),
+                (MailboxView::Kind(LabelKind::Drafts), _) => ("No drafts".into(), "Messages you start are saved on this device.".into()),
+                (MailboxView::Kind(LabelKind::Outbox), _) => ("Outbox is empty".into(), "Messages waiting to be sent appear here.".into()),
+                _ => ("Nothing here".into(), "There are no messages in this view.".into()),
             };
             v_flex()
                 .items_center()

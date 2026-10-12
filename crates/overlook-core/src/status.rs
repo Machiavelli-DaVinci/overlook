@@ -12,6 +12,9 @@ pub enum SyncState {
     /// No connection to the provider. Downloaded mail is still available.
     Offline,
     Syncing,
+    /// Synchronization is in progress but waiting, for example because the provider asked
+    /// us to slow down. Work resumes automatically.
+    Paused(String),
     UpToDate,
     SignInRequired,
     SyncFailed(String),
@@ -22,6 +25,7 @@ impl SyncState {
         match self {
             SyncState::Offline => "Offline",
             SyncState::Syncing => "Syncing",
+            SyncState::Paused(_) => "Paused",
             SyncState::UpToDate => "Up to date",
             SyncState::SignInRequired => "Sign-in required",
             SyncState::SyncFailed(_) => "Sync failed",
@@ -42,6 +46,7 @@ impl SyncState {
                 }
             }
             SyncState::Syncing => "Syncing your changes…".to_owned(),
+            SyncState::Paused(reason) => reason.clone(),
             SyncState::UpToDate => "Up to date.".to_owned(),
             SyncState::SignInRequired => {
                 "Sign in again to continue syncing. Your local drafts are safe.".to_owned()

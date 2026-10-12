@@ -5,6 +5,8 @@ use super::{MailWindow, Nav};
 use crate::assets::icon;
 use crate::theme::ActivePalette;
 use gpui_kit::component::button::{Button, ButtonVariants};
+use gpui_kit::component::menu::{DropdownMenu, PopupMenuItem};
+use gpui_kit::component::scroll::ScrollableElement;
 use gpui_kit::component::{Sizable, StyledExt};
 use gpui_kit::prelude::*;
 use gpui_kit::*;
@@ -30,6 +32,7 @@ impl MailWindow {
         favorites.extend([
             Nav::view("Sent", "send", MailboxView::Kind(LabelKind::Sent)),
             Nav::view("Archive", "archive", MailboxView::Kind(LabelKind::Archive)),
+            Nav::view("Junk", "shield-alert", MailboxView::Kind(LabelKind::Spam)),
             Nav::view("Trash", "trash", MailboxView::Kind(LabelKind::Trash)),
         ]);
 
@@ -87,12 +90,53 @@ impl MailWindow {
         }
 
         let owner = self.owner();
+        let accounts = self.accounts.clone();
+        let active_id = self.account.id.clone();
+        let active_email = self.account.email.clone();
+        let needs_sign_in = self.active_issue().is_some();
+        let this = cx.entity().downgrade();
         let state_color = match status.state {
             SyncState::UpToDate => p.success,
-            SyncState::Syncing => p.accent,
+            SyncState::Syncing | SyncState::Paused(_) => p.accent,
             SyncState::Offline => p.muted,
             SyncState::SignInRequired | SyncState::SyncFailed(_) => p.warning,
         };
+
+        let favorites_collapsed = self.collapsed_sections.contains("favorites");
+        let labels_collapsed = self.collapsed_sections.contains("labels");
+        let section_header = |key: &'static str, text: &'static str, collapsed: bool, cx: &mut Context<Self>| {
+            div()
+                .id(SharedString::from(format!("section-{key}")))
+                .h_flex()
+                .items_center()
+                .gap(px(5.))
+                .mt(px(14.))
+                .mb(px(4.))
+                .px(px(11.))
+                .py(px(4.))
+                .rounded(px(6.))
+                .cursor_pointer()
+                .text_size(px(11.))
+                .font_weight(FontWeight::MEDIUM)
+                .text_color(p.muted)
+                .hover(|d| d.bg(p.hover))
+                .child(icon(if collapsed { "chevron-right" } else { "chevron-down" }).size(px(12.)).text_color(p.muted))
+                .child(text)
+                .on_click(cx.listener(move |this, _, _window, cx| this.toggle_section(key, cx)))
+        };
+
+        let nav = v_flex()
+            .id("sidebar-nav")
+            .flex_1()
+            .min_h_0()
+            .child(section_header("favorites", "Favorites", favorites_collapsed, cx))
+            .when(!favorites_collapsed, |d| {
+                d.child(v_flex().gap(px(3.)).children(favorites.into_iter().map(|nav| nav_button(self, nav, cx))))
+            })
+            .child(section_header("labels", "Labels", labels_collapsed, cx))
+            .when(!labels_collapsed, |d| d.child(labels_section))
+            .child(div().h(px(12.)))
+            .overflow_y_scrollbar();
 
         v_flex()
             .size_full()
@@ -112,11 +156,7 @@ impl MailWindow {
                     .h(px(38.))
                     .on_click(cx.listener(|this, _, window, cx| this.compose_new(window, cx))),
             )
-            .child(section_label("Favorites", &p))
-            .child(v_flex().gap(px(3.)).children(favorites.into_iter().map(|nav| nav_button(self, nav, cx))))
-            .child(section_label("Labels", &p))
-            .child(labels_section)
-            .child(div().flex_1())
+            .child(nav)
             .child(
                 h_flex()
                     .items_center()
@@ -145,8 +185,44 @@ impl MailWindow {
                             .xsmall()
                             .icon(icon("refresh-cw").size(px(14.)))
                             .tooltip("Sync now")
-                            .loading(self.syncing)
+                            .loading(self.is_syncing_active())
                             .on_click(cx.listener(|this, _, window, cx| this.sync_now(window, cx))),
+                    )
+                    .child(
+                        Button::new("account-menu")
+                            .ghost()
+                            .xsmall()
+                            .icon(icon("chevrons-up-down").size(px(14.)))
+                            .tooltip("Accounts")
+                            .dropdown_menu(move |mut menu, _window, _cx| {
+                                menu = menu.label("Accounts");
+                                for a in &accounts {
+                                    let id = a.id.clone();
+                                    let t = this.clone();
+                                    menu = menu.item(PopupMenuItem::new(format!("{} · {}", a.email, a.provider.label())).checked(a.id == active_id).on_click(
+                                        move |_, window, cx| {
+                                            let _ = t.update(cx, |this, cx| this.switch_account(id.clone(), window, cx));
+                                        },
+                                    ));
+                                }
+                                menu = menu.separator();
+                                let t = this.clone();
+                                menu = menu.item(PopupMenuItem::new("Add Gmail account…").on_click(move |_, window, cx| {
+                                    let _ = t.update(cx, |this, cx| this.start_google_sign_in(None, window, cx));
+                                }));
+                                if needs_sign_in {
+                                    let t = this.clone();
+                                    let email = active_email.clone();
+                                    menu = menu.item(PopupMenuItem::new("Sign in again").on_click(move |_, window, cx| {
+                                        let _ = t.update(cx, |this, cx| this.start_google_sign_in(Some(email.clone()), window, cx));
+                                    }));
+                                }
+                                let t = this.clone();
+                                let id = active_id.clone();
+                                menu.item(PopupMenuItem::new("Remove this account from this device").on_click(move |_, window, cx| {
+                                    let _ = t.update(cx, |this, cx| this.remove_account(id.clone(), window, cx));
+                                }))
+                            }),
                     ),
             )
     }

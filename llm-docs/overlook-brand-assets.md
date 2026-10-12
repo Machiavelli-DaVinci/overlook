@@ -20,12 +20,14 @@ Paths below are relative to `branding/`, unless they start with `../llm-docs/`.
 | `assets/overlook-icon-*.png` | App icons from 16 to 512 pixels |
 | `assets/overlook-lockup-*.png` | Transparent 1600-pixel signature exports |
 | `assets/overlook-alpine-dawn.png` | Original generated hero artwork |
+| `logos/` | Ready-to-upload logos: 120 px OAuth consent-screen tile, 256–1024 px tiles, full-bleed squares, paper variant, 1280×640 social preview (see `logos/README.md`) |
 | `fonts/` | Source Serif 4 and Inter, including licenses and native-use font files |
 | `tokens.json`, `tokens.css` | Light/Dark semantic color specifications |
 | `contrast-check.json` | Measured contrast of key UI pairs |
 | `previews/` | Captured presentation and application previews |
 | `../llm-docs/overlook-art-direction.md` | Exact final image-generation prompt and provenance |
 | `source/build_assets.py` | Rebuild SVG/PNG exports and validate contrast |
+| `source/build_logos.py` | Rebuild the platform logos and social preview in `logos/` |
 | `source/prepare_mail_preview.py`, `source/mail-prototype.html` | Rebuild the branded preview from the preserved prototype |
 | `source/package_brand.py` | Rebuild the portable brand archive, including documentation |
 | `overlook-brand-kit.zip` | Portable copy of `branding/` and `llm-docs/` |

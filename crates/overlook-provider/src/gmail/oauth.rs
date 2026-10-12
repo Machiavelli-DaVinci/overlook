@@ -1,11 +1,169 @@
-//! Gmail API preparation.
+//! OAuth 2.0 for installed applications: PKCE, loopback redirect, token exchange and refresh.
 //!
-//! This module holds the parts of the Gmail integration that can be written and tested
-//! before credentials exist: the OAuth 2.0 authorization request for installed apps (system
-//! browser, PKCE, loopback redirect) and the scope set. Network calls arrive with the Gmail
-//! slice of the foundation milestone; credentials are an explicit external dependency.
+//! The client id comes from the Google Cloud OAuth client the user created; it is read from
+//! `~/.config/overlook/google-oauth-client.json` by the app and never embedded in the binary.
 
+use serde::{Deserialize, Serialize};
 use std::collections::BTreeMap;
+use std::time::Duration;
+
+/// The OAuth client created in Google Cloud ("Desktop app" type).
+#[derive(Clone, Debug, PartialEq, Eq, Serialize, Deserialize)]
+pub struct ClientConfig {
+    pub client_id: String,
+    /// Google issues a "secret" for desktop clients but treats it as non-confidential.
+    pub client_secret: Option<String>,
+}
+
+impl ClientConfig {
+    /// Parses the JSON file downloaded from Google Cloud (`{"installed": {...}}`).
+    pub fn from_google_json(json: &str) -> Result<Self, String> {
+        let value: serde_json::Value = serde_json::from_str(json).map_err(|e| e.to_string())?;
+        let inner = value.get("installed").or_else(|| value.get("web")).unwrap_or(&value);
+        let client_id = inner
+            .get("client_id")
+            .and_then(|v| v.as_str())
+            .filter(|s| !s.is_empty())
+            .ok_or("the file has no client_id")?
+            .to_owned();
+        let client_secret = inner.get("client_secret").and_then(|v| v.as_str()).map(str::to_owned);
+        Ok(Self { client_id, client_secret })
+    }
+}
+
+/// Tokens for one account. Stored in the system keyring, never in ordinary configuration.
+#[derive(Clone, Debug, PartialEq, Eq, Serialize, Deserialize)]
+pub struct OAuthTokens {
+    pub access_token: String,
+    pub refresh_token: Option<String>,
+    /// Unix milliseconds.
+    pub expires_at: i64,
+    pub scope: Option<String>,
+}
+
+impl OAuthTokens {
+    /// Treats the token as expired one minute early to avoid racing the deadline.
+    pub fn is_expired(&self, now_ms: i64) -> bool {
+        now_ms + 60_000 >= self.expires_at
+    }
+}
+
+#[derive(Clone, Debug, PartialEq, Eq)]
+pub struct UserInfo {
+    pub email: String,
+    pub name: Option<String>,
+}
+
+#[derive(Debug, Clone, PartialEq, Eq, thiserror::Error)]
+pub enum AuthError {
+    #[error("could not reach Google: {0}")]
+    Network(String),
+    /// `invalid_grant` and friends: the user must sign in again.
+    #[error("Google rejected the sign-in: {0}")]
+    Denied(String),
+    #[error("unexpected response from Google: {0}")]
+    Protocol(String),
+}
+
+pub const USERINFO_ENDPOINT: &str = "https://openidconnect.googleapis.com/v1/userinfo";
+
+fn agent() -> ureq::Agent {
+    ureq::Agent::config_builder()
+        .http_status_as_error(false)
+        .timeout_global(Some(Duration::from_secs(30)))
+        .build()
+        .into()
+}
+
+fn token_response(mut response: ureq::http::Response<ureq::Body>, previous_refresh: Option<&str>) -> Result<OAuthTokens, AuthError> {
+    let status = response.status().as_u16();
+    let body: serde_json::Value = response
+        .body_mut()
+        .read_json()
+        .map_err(|e| AuthError::Protocol(format!("token response was not JSON: {e}")))?;
+    if status != 200 {
+        let code = body.get("error").and_then(|v| v.as_str()).unwrap_or("unknown_error");
+        let description = body.get("error_description").and_then(|v| v.as_str()).unwrap_or("");
+        let message = if description.is_empty() { code.to_owned() } else { format!("{code}: {description}") };
+        return Err(if matches!(code, "invalid_grant" | "invalid_client" | "unauthorized_client" | "access_denied") {
+            AuthError::Denied(message)
+        } else {
+            AuthError::Protocol(message)
+        });
+    }
+    let access_token = body
+        .get("access_token")
+        .and_then(|v| v.as_str())
+        .ok_or_else(|| AuthError::Protocol("no access_token".into()))?
+        .to_owned();
+    let expires_in = body.get("expires_in").and_then(|v| v.as_i64()).unwrap_or(3600);
+    let refresh_token = body
+        .get("refresh_token")
+        .and_then(|v| v.as_str())
+        .map(str::to_owned)
+        .or_else(|| previous_refresh.map(str::to_owned));
+    Ok(OAuthTokens {
+        access_token,
+        refresh_token,
+        expires_at: overlook_core::time::now() + expires_in * 1000,
+        scope: body.get("scope").and_then(|v| v.as_str()).map(str::to_owned),
+    })
+}
+
+fn post_form(url: &str, body: &str) -> Result<ureq::http::Response<ureq::Body>, AuthError> {
+    agent()
+        .post(url)
+        .header("Content-Type", "application/x-www-form-urlencoded")
+        .send(body.as_bytes())
+        .map_err(|e| AuthError::Network(e.to_string()))
+}
+
+/// Exchanges an authorization code for tokens (blocking; run on a background thread).
+pub fn exchange_code(config: &ClientConfig, code: &str, redirect_uri: &str, verifier: &str) -> Result<OAuthTokens, AuthError> {
+    let mut body = token_request_body(&config.client_id, code, redirect_uri, verifier);
+    if let Some(secret) = &config.client_secret {
+        body.push_str("&client_secret=");
+        body.push_str(&url_encode(secret));
+    }
+    token_response(post_form(TOKEN_ENDPOINT, &body)?, None)
+}
+
+/// Refreshes an access token (blocking).
+pub fn refresh(config: &ClientConfig, refresh_token: &str) -> Result<OAuthTokens, AuthError> {
+    let mut body = [
+        ("client_id", config.client_id.as_str()),
+        ("refresh_token", refresh_token),
+        ("grant_type", "refresh_token"),
+    ]
+    .iter()
+    .map(|(k, v)| format!("{k}={}", url_encode(v)))
+    .collect::<Vec<_>>()
+    .join("&");
+    if let Some(secret) = &config.client_secret {
+        body.push_str("&client_secret=");
+        body.push_str(&url_encode(secret));
+    }
+    token_response(post_form(TOKEN_ENDPOINT, &body)?, Some(refresh_token))
+}
+
+/// Fetches the signed-in user's email and name (blocking).
+pub fn fetch_userinfo(access_token: &str) -> Result<UserInfo, AuthError> {
+    let mut response = agent()
+        .get(USERINFO_ENDPOINT)
+        .header("Authorization", &format!("Bearer {access_token}"))
+        .call()
+        .map_err(|e| AuthError::Network(e.to_string()))?;
+    if response.status().as_u16() != 200 {
+        return Err(AuthError::Protocol(format!("userinfo returned {}", response.status())));
+    }
+    let body: serde_json::Value = response.body_mut().read_json().map_err(|e| AuthError::Protocol(e.to_string()))?;
+    let email = body
+        .get("email")
+        .and_then(|v| v.as_str())
+        .ok_or_else(|| AuthError::Protocol("userinfo had no email".into()))?
+        .to_owned();
+    Ok(UserInfo { email, name: body.get("name").and_then(|v| v.as_str()).map(str::to_owned) })
+}
 
 /// Scopes requested at sign-in. `gmail.modify` covers reading, labels, archive, trash, and
 /// drafts; `gmail.send` covers sending. Both are restricted scopes and require Google's
@@ -28,6 +186,18 @@ pub struct Pkce {
 }
 
 impl Pkce {
+    /// Builds a PKCE pair from fresh randomness.
+    pub fn random() -> Self {
+        let bytes: [u8; 48] = rand::random();
+        Self::from_random(&bytes)
+    }
+
+    /// Random opaque `state` value for the authorization request.
+    pub fn random_state() -> String {
+        let bytes: [u8; 24] = rand::random();
+        base64_url(&bytes)
+    }
+
     /// Builds a PKCE pair from caller-supplied random bytes (32 to 96 bytes).
     pub fn from_random(random: &[u8]) -> Self {
         let verifier = base64_url(random);
@@ -157,7 +327,7 @@ pub fn url_decode(s: &str) -> String {
     String::from_utf8_lossy(&out).into_owned()
 }
 
-fn base64_url(bytes: &[u8]) -> String {
+pub fn base64_url(bytes: &[u8]) -> String {
     const TABLE: &[u8; 64] = b"ABCDEFGHIJKLMNOPQRSTUVWXYZabcdefghijklmnopqrstuvwxyz0123456789-_";
     let mut out = String::with_capacity((bytes.len() + 2) / 3 * 4);
     for chunk in bytes.chunks(3) {
@@ -254,6 +424,17 @@ mod tests {
             digest.iter().map(|b| format!("{b:02x}")).collect::<String>(),
             "ba7816bf8f01cfea414140de5dae2223b00361a396177a9cb410ff61f20015ad"
         );
+    }
+
+    #[test]
+    fn parses_google_client_json() {
+        let json = r#"{"installed":{"client_id":"123-abc.apps.googleusercontent.com","project_id":"overlook","client_secret":"GOCSPX-x","redirect_uris":["http://localhost"]}}"#;
+        let cfg = ClientConfig::from_google_json(json).unwrap();
+        assert_eq!(cfg.client_id, "123-abc.apps.googleusercontent.com");
+        assert_eq!(cfg.client_secret.as_deref(), Some("GOCSPX-x"));
+        assert!(ClientConfig::from_google_json("{}").is_err());
+        assert!(!OAuthTokens { access_token: "a".into(), refresh_token: None, expires_at: 10_000_000, scope: None }.is_expired(1_000_000));
+        assert!(OAuthTokens { access_token: "a".into(), refresh_token: None, expires_at: 1_050_000, scope: None }.is_expired(1_000_000));
     }
 
     #[test]

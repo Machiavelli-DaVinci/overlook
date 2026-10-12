@@ -6,7 +6,7 @@
 //! delivery. Its connection state is controlled by the app (a visible switch) and never
 //! pretends to be a real account: the account is labelled "Sample account".
 
-use crate::{BoxFuture, MailProvider, MailboxSnapshot, ProviderError, SendOutcome, SentReceipt};
+use crate::{BoxFuture, MailProvider, MailboxSnapshot, ProviderError, RemoteChanges, SendContext, SendOutcome, SentReceipt};
 use overlook_core::time::{days_from_civil, Timestamp};
 use overlook_core::*;
 use std::collections::{BTreeSet, HashSet};
@@ -108,7 +108,15 @@ impl MailProvider for SampleProvider {
         })
     }
 
-    fn apply(&self, _account: &Account, op: &PendingOperation, _messages: &[Message]) -> BoxFuture<'_, Result<(), ProviderError>> {
+    fn fetch_changes(&self, _account: &Account, checkpoint: &str) -> BoxFuture<'_, Result<RemoteChanges, ProviderError>> {
+        let checkpoint = checkpoint.to_owned();
+        Box::pin(async move {
+            self.require_online()?;
+            Ok(RemoteChanges { checkpoint: Some(checkpoint), ..Default::default() })
+        })
+    }
+
+    fn apply(&self, _account: &Account, op: &PendingOperation, _messages: &[Message], _labels: &[Label]) -> BoxFuture<'_, Result<(), ProviderError>> {
         let op = op.clone();
         Box::pin(async move {
             self.require_online()?;
@@ -118,10 +126,10 @@ impl MailProvider for SampleProvider {
         })
     }
 
-    fn send(&self, account: &Account, draft: &Draft, sent_label: Option<&LabelId>) -> BoxFuture<'_, Result<SentReceipt, ProviderError>> {
+    fn send(&self, account: &Account, draft: &Draft, context: SendContext) -> BoxFuture<'_, Result<SentReceipt, ProviderError>> {
         let account = account.clone();
         let draft = draft.clone();
-        let sent_label = sent_label.cloned();
+        let sent_label = context.sent_label;
         Box::pin(async move {
             self.require_online()?;
             self.sleep().await;
@@ -319,7 +327,7 @@ pub fn sample_mailbox(account: &Account, now: Timestamp) -> MailboxSnapshot {
            at(2, 7, 12), true, false, &["inbox"], vec![]),
     ];
 
-    MailboxSnapshot { labels, messages, checkpoint: Some("sample-1".into()) }
+    MailboxSnapshot { labels, messages, message_ids: Vec::new(), checkpoint: Some("sample-1".into()) }
 }
 
 #[cfg(test)]
@@ -381,7 +389,7 @@ mod tests {
         let mut draft = Draft::new(AccountId::from("sample"), DraftKind::New, 0);
         draft.to = vec![Address::named("Maya Chen", "maya@northstar.example")];
         p.drop_next_send();
-        assert_eq!(block_on(p.send(&account(), &draft, None)).err(), Some(ProviderError::Uncertain));
+        assert_eq!(block_on(p.send(&account(), &draft, SendContext::default())).err(), Some(ProviderError::Uncertain));
         assert!(matches!(block_on(p.reconcile_send(&account(), &draft)), Ok(SendOutcome::Delivered(_))));
         let other = Draft::new(AccountId::from("sample"), DraftKind::New, 0);
         assert_eq!(block_on(p.reconcile_send(&account(), &other)), Ok(SendOutcome::NotDelivered));

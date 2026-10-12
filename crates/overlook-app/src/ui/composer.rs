@@ -226,7 +226,7 @@ impl MailWindow {
             Ok(_) => {
                 self.composer = None;
                 self.reload(cx);
-                let online = self.provider.is_online();
+                let online = self.connected(&self.account.id);
                 window.push_notification(
                     if online {
                         Notification::info("Sending…")

@@ -4,10 +4,15 @@ version.workspace = true
 edition.workspace = true
 license.workspace = true
 authors.workspace = true
-description = "Mail provider adapters for Overlook: the provider trait, the sample provider, and Gmail OAuth preparation."
+description = "Mail provider adapters for Overlook: the provider trait, the sample provider, and the Gmail API provider."
 
 [dependencies]
 overlook-core = { workspace = true }
 serde = { workspace = true }
 serde_json = { workspace = true }
 thiserror = { workspace = true }
+tracing = { workspace = true }
+ureq = { version = "3", features = ["json"] }
+lettre = { version = "0.11", default-features = false, features = ["builder"] }
+base64 = "0.22"
+rand = "0.10"

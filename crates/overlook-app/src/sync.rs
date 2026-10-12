@@ -1,12 +1,14 @@
 //! Synchronization engine for one account.
 //!
-//! Replays pending operations in sequence order against the provider, records provider
-//! acceptance before anything is called Sent, and keeps uncertain sends distinct from
-//! failures. Runs on a background thread; the window reloads from the store afterwards.
+//! Order of a cycle: probe → download remote changes (merged without clobbering pending
+//! local intent) → replay pending operations in sequence → record the outcome. Provider
+//! acceptance is required before anything is called Sent, and uncertain sends are
+//! reconciled before any retry. Runs on a background thread; the window reloads from the
+//! store afterwards.
 
 use overlook_core::time::now;
 use overlook_core::*;
-use overlook_provider::{MailProvider, ProviderError, SendOutcome};
+use overlook_provider::{MailProvider, ProviderError, SendContext, SendOutcome};
 use overlook_store::Store;
 use std::sync::Arc;
 use tracing::{info, warn};
@@ -14,22 +16,163 @@ use tracing::{info, warn};
 #[derive(Debug, Default, Clone)]
 pub struct SyncOutcome {
     pub state: Option<SyncState>,
+    /// The provider asked us to slow down; the caller should wait longer before retrying.
+    pub rate_limited: bool,
     pub applied: usize,
+    pub downloaded: usize,
     pub sent: Vec<String>,
     pub uncertain: Vec<String>,
     pub failed: Vec<String>,
     pub stopped_offline: bool,
 }
 
-pub async fn run_sync<P: MailProvider>(store: Arc<Store>, provider: P, account: Account) -> SyncOutcome {
+pub const RATE_LIMIT_WORDING: &str = "Waiting for Gmail: it is limiting requests. Downloading continues in a moment.";
+
+/// Messages downloaded per batch before progress is committed to the store.
+const DOWNLOAD_BATCH: usize = 20;
+
+/// Bump when the set of views the first download covers changes; accounts downloaded with
+/// an older version list the new views and queue what is missing, keeping their checkpoint.
+const COVERAGE_VERSION: u32 = 2;
+
+fn coverage_key(account: &AccountId) -> String {
+    format!("download_coverage:{}", account.0)
+}
+
+/// Adds snapshot ids that are not on disk to the backlog (de-duplicated).
+fn enqueue_missing(store: &Store, account: &AccountId, ids: Vec<ProviderId>) {
+    let mut backlog = backlog(store, account);
+    for pid in ids {
+        let local = MessageId(format!("{}:{}", account.0, pid.0));
+        if store.message(&local).ok().flatten().is_none() && !backlog.contains(&pid) {
+            backlog.push(pid);
+        }
+    }
+    save_backlog(store, account, &backlog);
+}
+
+fn state_for(err: &ProviderError) -> SyncState {
+    match err {
+        ProviderError::Offline | ProviderError::Uncertain => SyncState::Offline,
+        ProviderError::SignInRequired => SyncState::SignInRequired,
+        ProviderError::RateLimited(_) => SyncState::Paused(RATE_LIMIT_WORDING.into()),
+        ProviderError::Temporary(m) | ProviderError::Rejected(m) => SyncState::SyncFailed(m.clone()),
+        ProviderError::CheckpointExpired => SyncState::SyncFailed("sync checkpoint expired".into()),
+    }
+}
+
+fn backlog_key(account: &AccountId) -> String {
+    format!("download_backlog:{}", account.0)
+}
+
+pub fn backlog(store: &Store, account: &AccountId) -> Vec<ProviderId> {
+    store.setting::<Vec<String>>(&backlog_key(account)).ok().flatten().unwrap_or_default().into_iter().map(ProviderId).collect()
+}
+
+fn save_backlog(store: &Store, account: &AccountId, ids: &[ProviderId]) {
+    let raw: Vec<&str> = ids.iter().map(|p| p.0.as_str()).collect();
+    let _ = store.set_setting(&backlog_key(account), &raw);
+}
+
+/// Downloads queued message bodies in small batches, committing after each batch so an
+/// interruption (quota, offline, crash) keeps what was fetched.
+fn drain_backlog(store: &Store, provider: &dyn MailProvider, account: &Account, outcome: &mut SyncOutcome) -> Result<(), ProviderError> {
+    let acct = &account.id;
+    let mut ids = backlog(store, acct);
+    if ids.is_empty() {
+        return Ok(());
+    }
+    let labels = store.labels(acct).unwrap_or_default();
+    while !ids.is_empty() {
+        let protected = store.pending_message_ids(acct).unwrap_or_default();
+        let take = ids.len().min(DOWNLOAD_BATCH);
+        let batch: Vec<ProviderId> = ids[..take].to_vec();
+        let messages = match pollster_block(provider.fetch_messages(account, &batch, &labels)) {
+            Ok(m) => m,
+            Err(e) => {
+                save_backlog(store, acct, &ids);
+                return Err(e);
+            }
+        };
+        store.merge_remote_messages(&messages, &protected).map_err(|e| ProviderError::Temporary(e.to_string()))?;
+        outcome.downloaded += messages.len();
+        ids.drain(..take);
+        save_backlog(store, acct, &ids);
+    }
+    Ok(())
+}
+
+/// Downloads remote state. Returns the number of messages written.
+fn download(store: &Store, provider: &dyn MailProvider, account: &Account, outcome: &mut SyncOutcome) -> Result<usize, ProviderError> {
+    let acct = &account.id;
+    let protected = store.pending_message_ids(acct).unwrap_or_default();
+    let checkpoint = store.checkpoint(acct).ok().flatten();
+    let have_messages = store.message_count(acct).unwrap_or(0) > 0 || !backlog(store, acct).is_empty();
+
+    let full = |outcome: &mut SyncOutcome| -> Result<usize, ProviderError> {
+        let snapshot = pollster_block(provider.fetch_snapshot(account))?;
+        store.replace_labels(acct, &snapshot.labels).map_err(|e| ProviderError::Temporary(e.to_string()))?;
+        store.merge_remote_messages(&snapshot.messages, &protected).map_err(|e| ProviderError::Temporary(e.to_string()))?;
+        store.set_checkpoint(acct, snapshot.checkpoint.as_deref()).map_err(|e| ProviderError::Temporary(e.to_string()))?;
+        outcome.downloaded += snapshot.messages.len();
+        // Queue bodies that are not on disk yet; the backlog survives restarts.
+        enqueue_missing(store, acct, snapshot.message_ids);
+        let _ = store.set_setting(&coverage_key(acct), &COVERAGE_VERSION);
+        drain_backlog(store, provider, account, outcome)?;
+        Ok(outcome.downloaded)
+    };
+
+    // An account downloaded before the current view coverage lists the new views and queues
+    // what is missing. The existing checkpoint stays valid, so nothing is skipped.
+    let extend_coverage = |outcome: &mut SyncOutcome| -> Result<(), ProviderError> {
+        let covered = store.setting::<u32>(&coverage_key(acct)).ok().flatten().unwrap_or(1);
+        if covered >= COVERAGE_VERSION {
+            return Ok(());
+        }
+        let snapshot = pollster_block(provider.fetch_snapshot(account))?;
+        store.replace_labels(acct, &snapshot.labels).map_err(|e| ProviderError::Temporary(e.to_string()))?;
+        store.merge_remote_messages(&snapshot.messages, &protected).map_err(|e| ProviderError::Temporary(e.to_string()))?;
+        enqueue_missing(store, acct, snapshot.message_ids);
+        let _ = store.set_setting(&coverage_key(acct), &COVERAGE_VERSION);
+        info!("extended download coverage for {}", account.email);
+        drain_backlog(store, provider, account, outcome)
+    };
+
+    match checkpoint {
+        Some(cp) if have_messages => match pollster_block(provider.fetch_changes(account, &cp)) {
+            Ok(changes) => {
+                if let Some(labels) = &changes.labels {
+                    store.replace_labels(acct, labels).map_err(|e| ProviderError::Temporary(e.to_string()))?;
+                }
+                store.merge_remote_messages(&changes.upserts, &protected).map_err(|e| ProviderError::Temporary(e.to_string()))?;
+                if !changes.deleted.is_empty() {
+                    // Respect remote deletions even if a local change was pending on them.
+                    let _ = store.delete_messages(&changes.deleted);
+                }
+                if let Some(new_cp) = changes.checkpoint.as_deref() {
+                    store.set_checkpoint(acct, Some(new_cp)).map_err(|e| ProviderError::Temporary(e.to_string()))?;
+                }
+                outcome.downloaded += changes.upserts.len();
+                drain_backlog(store, provider, account, outcome)?;
+                extend_coverage(outcome)?;
+                Ok(outcome.downloaded)
+            }
+            Err(ProviderError::CheckpointExpired) => {
+                info!("checkpoint expired for {}; full resynchronization", account.email);
+                full(outcome)
+            }
+            Err(e) => Err(e),
+        },
+        _ => full(outcome),
+    }
+}
+
+pub async fn run_sync(store: Arc<Store>, provider: Arc<dyn MailProvider>, account: Account) -> SyncOutcome {
     let mut outcome = SyncOutcome::default();
     let acct = account.id.clone();
 
     if let Err(err) = provider.probe().await {
-        let state = match err {
-            ProviderError::SignInRequired => SyncState::SignInRequired,
-            _ => SyncState::Offline,
-        };
+        let state = state_for(&err);
         let _ = store.set_sync_state(&acct, &state, None);
         outcome.state = Some(state);
         outcome.stopped_offline = true;
@@ -37,7 +180,18 @@ pub async fn run_sync<P: MailProvider>(store: Arc<Store>, provider: P, account: 
     }
     let _ = store.set_sync_state(&acct, &SyncState::Syncing, None);
 
-    let sent_label = store.label_by_kind(&acct, LabelKind::Sent).ok().flatten().map(|l| l.id);
+    if let Err(err) = download(&store, provider.as_ref(), &account, &mut outcome) {
+        warn!("download paused for {}: {err}", account.email);
+        outcome.rate_limited = matches!(err, ProviderError::RateLimited(_));
+        let state = state_for(&err);
+        let _ = store.set_sync_state(&acct, &state, None);
+        outcome.state = Some(state);
+        outcome.stopped_offline = matches!(err, ProviderError::Offline);
+        return outcome;
+    }
+
+    let labels = store.labels(&acct).unwrap_or_default();
+    let sent_label = labels.iter().find(|l| l.kind == LabelKind::Sent).map(|l| l.id.clone());
     let ops = match store.pending_operations(&acct) {
         Ok(ops) => ops,
         Err(e) => {
@@ -57,29 +211,32 @@ pub async fn run_sync<P: MailProvider>(store: Arc<Store>, provider: P, account: 
         match &op.kind {
             OperationKind::SendDraft { draft_id } => {
                 let Some(draft) = store.draft(draft_id).ok().flatten() else {
-                    // The draft was discarded; nothing to send.
                     let _ = store.set_operation_state(&op.id, OperationState::Applied, None);
                     continue;
                 };
                 let subject = draft.display_subject();
                 let _ = store.set_draft_state(&draft.id, &DraftState::Sending);
-                // An operation that was interrupted earlier must be reconciled first.
+                let context = SendContext {
+                    sent_label: sent_label.clone(),
+                    in_reply_to: draft.in_reply_to.as_ref().and_then(|id| store.message(id).ok().flatten()),
+                    labels: labels.clone(),
+                };
                 let needs_reconcile = op.state == OperationState::Uncertain || draft.state == DraftState::Uncertain;
                 let send_result = if needs_reconcile {
                     match provider.reconcile_send(&account, &draft).await {
                         Ok(SendOutcome::Delivered(provider_id)) => {
-                            let rfc = format!("<{}@overlook.sample>", draft.id);
+                            let rfc = overlook_provider::draft_message_id(&draft);
                             Ok(overlook_provider::SentReceipt {
                                 message: overlook_provider::sample::sent_message(&account, &draft, &provider_id, &rfc, sent_label.as_ref(), now()),
                                 provider_id,
                                 rfc_message_id: Some(rfc),
                             })
                         }
-                        Ok(SendOutcome::NotDelivered) => provider.send(&account, &draft, sent_label.as_ref()).await,
+                        Ok(SendOutcome::NotDelivered) => provider.send(&account, &draft, context).await,
                         Err(e) => Err(e),
                     }
                 } else {
-                    provider.send(&account, &draft, sent_label.as_ref()).await
+                    provider.send(&account, &draft, context).await
                 };
                 match send_result {
                     Ok(receipt) => {
@@ -98,27 +255,7 @@ pub async fn run_sync<P: MailProvider>(store: Arc<Store>, provider: P, account: 
                         let _ = store.set_operation_state(&op.id, OperationState::Uncertain, Some("connection dropped during sending"));
                         let _ = store.set_draft_state(&draft.id, &DraftState::Uncertain);
                         outcome.uncertain.push(subject);
-                        // Do not continue replaying behind an uncertain send; reconcile next cycle.
                         final_state = SyncState::Offline;
-                        break;
-                    }
-                    Err(ProviderError::Offline) => {
-                        let _ = store.set_operation_state(&op.id, OperationState::Pending, None);
-                        let _ = store.set_draft_state(&draft.id, &DraftState::Queued);
-                        final_state = SyncState::Offline;
-                        outcome.stopped_offline = true;
-                        break;
-                    }
-                    Err(ProviderError::SignInRequired) => {
-                        let _ = store.set_operation_state(&op.id, OperationState::Pending, None);
-                        let _ = store.set_draft_state(&draft.id, &DraftState::Queued);
-                        final_state = SyncState::SignInRequired;
-                        break;
-                    }
-                    Err(ProviderError::Temporary(reason)) => {
-                        let _ = store.set_operation_state(&op.id, OperationState::Pending, Some(&reason));
-                        let _ = store.set_draft_state(&draft.id, &DraftState::Queued);
-                        final_state = SyncState::SyncFailed(reason);
                         break;
                     }
                     Err(ProviderError::Rejected(reason)) => {
@@ -126,40 +263,34 @@ pub async fn run_sync<P: MailProvider>(store: Arc<Store>, provider: P, account: 
                         let _ = store.set_draft_state(&draft.id, &DraftState::Failed(reason));
                         outcome.failed.push(subject);
                     }
+                    Err(err) => {
+                        let _ = store.set_operation_state(&op.id, OperationState::Pending, Some(&err.to_string()));
+                        let _ = store.set_draft_state(&draft.id, &DraftState::Queued);
+                        final_state = state_for(&err);
+                        outcome.stopped_offline = matches!(err, ProviderError::Offline);
+                        outcome.rate_limited = matches!(err, ProviderError::RateLimited(_));
+                        break;
+                    }
                 }
             }
             kind => {
-                let messages: Vec<Message> = kind
-                    .message_ids()
-                    .iter()
-                    .filter_map(|id| store.message(id).ok().flatten())
-                    .collect();
-                match provider.apply(&account, &op, &messages).await {
+                let messages: Vec<Message> = kind.message_ids().iter().filter_map(|id| store.message(id).ok().flatten()).collect();
+                match provider.apply(&account, &op, &messages, &labels).await {
                     Ok(()) => {
                         let _ = store.set_operation_state(&op.id, OperationState::Applied, None);
                         outcome.applied += 1;
                     }
-                    Err(ProviderError::Offline) => {
-                        let _ = store.set_operation_state(&op.id, OperationState::Pending, None);
-                        final_state = SyncState::Offline;
-                        outcome.stopped_offline = true;
-                        break;
-                    }
-                    Err(ProviderError::SignInRequired) => {
-                        let _ = store.set_operation_state(&op.id, OperationState::Pending, None);
-                        final_state = SyncState::SignInRequired;
-                        break;
-                    }
-                    Err(ProviderError::Temporary(reason)) | Err(ProviderError::Rejected(reason)) => {
+                    Err(ProviderError::Rejected(reason)) => {
                         let _ = store.set_operation_state(&op.id, OperationState::Failed, Some(&reason));
                         outcome.failed.push(kind.describe());
                         final_state = SyncState::SyncFailed(reason);
                         break;
                     }
-                    Err(ProviderError::Uncertain) => {
-                        // Idempotent operations can simply be retried.
-                        let _ = store.set_operation_state(&op.id, OperationState::Pending, Some("connection dropped"));
-                        final_state = SyncState::Offline;
+                    Err(err) => {
+                        let _ = store.set_operation_state(&op.id, OperationState::Pending, Some(&err.to_string()));
+                        final_state = state_for(&err);
+                        outcome.stopped_offline = matches!(err, ProviderError::Offline);
+                        outcome.rate_limited = matches!(err, ProviderError::RateLimited(_));
                         break;
                     }
                 }
@@ -174,6 +305,26 @@ pub async fn run_sync<P: MailProvider>(store: Arc<Store>, provider: P, account: 
     outcome
 }
 
+/// Minimal executor for provider futures inside the already-blocking download step.
+/// Provider futures do blocking I/O and never return `Pending`.
+fn pollster_block<F: std::future::Future>(f: F) -> F::Output {
+    use std::task::{Context, Poll, RawWaker, RawWakerVTable, Waker};
+    fn noop(_: *const ()) {}
+    fn clone(p: *const ()) -> RawWaker {
+        RawWaker::new(p, &VTABLE)
+    }
+    static VTABLE: RawWakerVTable = RawWakerVTable::new(clone, noop, noop, noop);
+    let waker = unsafe { Waker::from_raw(RawWaker::new(std::ptr::null(), &VTABLE)) };
+    let mut cx = Context::from_waker(&waker);
+    let mut f = Box::pin(f);
+    loop {
+        if let Poll::Ready(v) = f.as_mut().poll(&mut cx) {
+            return v;
+        }
+        std::thread::yield_now();
+    }
+}
+
 #[cfg(test)]
 mod tests {
     use super::*;
@@ -181,20 +332,7 @@ mod tests {
     use std::time::Duration;
 
     fn block_on<F: std::future::Future>(f: F) -> F::Output {
-        use std::task::{Context, Poll, RawWaker, RawWakerVTable, Waker};
-        fn noop(_: *const ()) {}
-        fn clone(p: *const ()) -> RawWaker {
-            RawWaker::new(p, &VTABLE)
-        }
-        static VTABLE: RawWakerVTable = RawWakerVTable::new(clone, noop, noop, noop);
-        let waker = unsafe { Waker::from_raw(RawWaker::new(std::ptr::null(), &VTABLE)) };
-        let mut cx = Context::from_waker(&waker);
-        let mut f = Box::pin(f);
-        loop {
-            if let Poll::Ready(v) = f.as_mut().poll(&mut cx) {
-                return v;
-            }
-        }
+        pollster_block(f)
     }
 
     fn seeded() -> (Arc<Store>, Account, SampleProvider) {
@@ -212,6 +350,7 @@ mod tests {
             store.upsert_label(l).unwrap();
         }
         store.upsert_messages(&snap.messages).unwrap();
+        store.set_checkpoint(&account.id, snap.checkpoint.as_deref()).unwrap();
         (store, account, SampleProvider::new().with_latency(Duration::ZERO))
     }
 
@@ -225,17 +364,41 @@ mod tests {
         draft
     }
 
+    fn arc(p: &SampleProvider) -> Arc<dyn MailProvider> {
+        Arc::new(p.clone())
+    }
+
     #[test]
     fn offline_sync_leaves_everything_queued() {
         let (store, account, provider) = seeded();
         let first = store.messages_for_account(&account.id).unwrap()[0].id.clone();
         store.apply_change(&account.id, overlook_store::LocalChange::SetStarred { message_ids: vec![first], starred: true }).unwrap();
         queued_draft(&store, &account);
-        let outcome = block_on(run_sync(store.clone(), provider, account.clone()));
+        let outcome = block_on(run_sync(store.clone(), arc(&provider), account.clone()));
         assert!(outcome.stopped_offline);
         assert_eq!(store.pending_count(&account.id).unwrap(), 2);
         assert_eq!(store.account_status(&account.id).unwrap().state, SyncState::Offline);
         assert_eq!(store.drafts(&account.id, true).unwrap()[0].state, DraftState::Queued);
+    }
+
+    #[test]
+    fn first_sync_downloads_snapshot_when_store_is_empty() {
+        let store = Arc::new(Store::open_in_memory().unwrap());
+        let account = Account {
+            id: AccountId::from("sample"),
+            provider: ProviderKind::Sample,
+            display_name: "Jason".into(),
+            email: "jason@example.com".into(),
+            created_at: 0,
+        };
+        store.upsert_account(&account).unwrap();
+        let provider = SampleProvider::new().with_latency(Duration::ZERO);
+        provider.set_online(true);
+        let outcome = block_on(run_sync(store.clone(), arc(&provider), account.clone()));
+        assert!(outcome.downloaded > 0);
+        assert!(store.message_count(&account.id).unwrap() > 0);
+        assert_eq!(store.checkpoint(&account.id).unwrap().as_deref(), Some("sample-1"));
+        assert_eq!(store.account_status(&account.id).unwrap().state, SyncState::UpToDate);
     }
 
     #[test]
@@ -246,7 +409,7 @@ mod tests {
         let draft = queued_draft(&store, &account);
         store.apply_change(&account.id, overlook_store::LocalChange::Archive { message_ids: vec![first] }).unwrap();
         provider.set_online(true);
-        let outcome = block_on(run_sync(store.clone(), provider.clone(), account.clone()));
+        let outcome = block_on(run_sync(store.clone(), arc(&provider), account.clone()));
         assert_eq!(outcome.applied, 3);
         assert_eq!(outcome.sent, vec!["Agenda".to_owned()]);
         assert_eq!(store.pending_count(&account.id).unwrap(), 0);
@@ -254,8 +417,7 @@ mod tests {
         let sent = store.conversations(&account.id, &account.email, &overlook_store::MailboxView::Kind(LabelKind::Sent), overlook_store::ListFilter::All).unwrap();
         assert!(sent.iter().any(|c| c.subject == "Agenda"));
         assert_eq!(store.account_status(&account.id).unwrap().state, SyncState::UpToDate);
-        let applied = provider.applied_operations();
-        assert_eq!(applied.len(), 2, "two idempotent operations reached the provider in order");
+        assert_eq!(provider.applied_operations().len(), 2, "two idempotent operations reached the provider in order");
     }
 
     #[test]
@@ -264,14 +426,12 @@ mod tests {
         let draft = queued_draft(&store, &account);
         provider.set_online(true);
         provider.drop_next_send();
-        let outcome = block_on(run_sync(store.clone(), provider.clone(), account.clone()));
+        let outcome = block_on(run_sync(store.clone(), arc(&provider), account.clone()));
         assert_eq!(outcome.uncertain, vec!["Agenda".to_owned()]);
         assert_eq!(store.draft(&draft.id).unwrap().unwrap().state, DraftState::Uncertain);
-        let ops = store.pending_operations(&account.id).unwrap();
-        assert_eq!(ops[0].state, OperationState::Uncertain);
+        assert_eq!(store.pending_operations(&account.id).unwrap()[0].state, OperationState::Uncertain);
 
-        // Next cycle reconciles instead of blindly resending.
-        let outcome = block_on(run_sync(store.clone(), provider.clone(), account.clone()));
+        let outcome = block_on(run_sync(store.clone(), arc(&provider), account.clone()));
         assert_eq!(outcome.sent, vec!["Agenda".to_owned()]);
         assert!(store.draft(&draft.id).unwrap().is_none());
         let sent: Vec<_> = store
@@ -290,7 +450,7 @@ mod tests {
         let draft = queued_draft(&store, &account);
         store.cancel_send(&draft.id).unwrap();
         provider.set_online(true);
-        let outcome = block_on(run_sync(store.clone(), provider, account.clone()));
+        let outcome = block_on(run_sync(store.clone(), arc(&provider), account.clone()));
         assert!(outcome.sent.is_empty());
         assert_eq!(store.drafts(&account.id, false).unwrap().len(), 1);
     }

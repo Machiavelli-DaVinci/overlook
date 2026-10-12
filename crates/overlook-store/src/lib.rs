@@ -142,7 +142,43 @@ impl Store {
         })
     }
 
+    pub fn account_by_email(&self, provider: ProviderKind, email: &str) -> Result<Option<Account>> {
+        Ok(self
+            .accounts()?
+            .into_iter()
+            .find(|a| a.provider == provider && a.email.eq_ignore_ascii_case(email)))
+    }
+
+    /// Removes an account and everything that belongs to it (cascade).
+    pub fn delete_account(&self, account: &AccountId) -> Result<()> {
+        self.with_tx(|tx| {
+            tx.execute("DELETE FROM accounts WHERE id=?1", [&account.0])?;
+            Ok(())
+        })
+    }
+
     // ------------------------------------------------------------------- labels
+
+    /// Replaces the account's label list with the provider's current list. Labels that no
+    /// longer exist are removed (and detached from messages by cascade).
+    pub fn replace_labels(&self, account: &AccountId, labels: &[Label]) -> Result<()> {
+        self.with_tx(|tx| {
+            for label in labels {
+                tx.execute(
+                    "INSERT INTO labels(id, account_id, kind, name, provider_id, color, sort_order) VALUES(?1,?2,?3,?4,?5,?6,?7)
+                     ON CONFLICT(id) DO UPDATE SET kind=excluded.kind, name=excluded.name, provider_id=excluded.provider_id, color=excluded.color, sort_order=excluded.sort_order",
+                    params![label.id.0, label.account_id.0, label.kind.as_key(), label.name, label.provider_id.as_ref().map(|p| &p.0), label.color, label.sort_order],
+                )?;
+            }
+            let keep: Vec<String> = labels.iter().map(|l| l.id.0.clone()).collect();
+            let mut stmt = tx.prepare("SELECT id FROM labels WHERE account_id=?1")?;
+            let existing: Vec<String> = stmt.query_map([&account.0], |r| r.get(0))?.collect::<std::result::Result<_, _>>()?;
+            for id in existing.into_iter().filter(|id| !keep.contains(id)) {
+                tx.execute("DELETE FROM labels WHERE id=?1", [&id])?;
+            }
+            Ok(())
+        })
+    }
 
     pub fn upsert_label(&self, label: &Label) -> Result<()> {
         self.with_conn(|c| {
@@ -184,6 +220,57 @@ impl Store {
             }
             Ok(())
         })
+    }
+
+    /// Merges messages downloaded from the provider into local state.
+    ///
+    /// Messages referenced by pending local operations keep their local flags and labels
+    /// (the pending intent wins until it is replayed). A download without a cached body
+    /// keeps the body already on disk.
+    pub fn merge_remote_messages(&self, messages: &[Message], protected: &BTreeSet<MessageId>) -> Result<()> {
+        self.with_tx(|tx| {
+            for incoming in messages {
+                let mut existing = load_messages(tx, "WHERE m.id=?1", params![incoming.id.0])?.pop();
+                let mut merged = incoming.clone();
+                if let Some(local) = existing.take() {
+                    if !merged.body.is_cached() {
+                        merged.body = local.body;
+                    }
+                    if merged.attachments.is_empty() {
+                        merged.attachments = local.attachments;
+                    } else {
+                        // Keep downloaded attachment files.
+                        for a in &mut merged.attachments {
+                            if let Some(l) = local.attachments.iter().find(|l| l.filename == a.filename && l.size_bytes == a.size_bytes) {
+                                a.local_path = l.local_path.clone();
+                            }
+                        }
+                    }
+                    if protected.contains(&incoming.id) {
+                        merged.is_read = local.is_read;
+                        merged.is_starred = local.is_starred;
+                        merged.label_ids = local.label_ids;
+                    }
+                }
+                upsert_message_tx(tx, &merged)?;
+            }
+            Ok(())
+        })
+    }
+
+    /// Removes messages deleted at the provider.
+    pub fn delete_messages(&self, ids: &[MessageId]) -> Result<usize> {
+        self.with_tx(|tx| {
+            let mut n = 0;
+            for id in ids {
+                n += tx.execute("DELETE FROM messages WHERE id=?1", [&id.0])?;
+            }
+            Ok(n)
+        })
+    }
+
+    pub fn message_count(&self, account: &AccountId) -> Result<usize> {
+        self.with_conn(|c| Ok(c.query_row("SELECT COUNT(*) FROM messages WHERE account_id=?1", [&account.0], |r| r.get::<_, i64>(0))? as usize))
     }
 
     pub fn message(&self, id: &MessageId) -> Result<Option<Message>> {
@@ -1176,6 +1263,44 @@ mod tests {
         assert_eq!(store.setting::<AppearancePreference>("nope").unwrap(), None);
         let recipients = store.known_recipients(&AccountId::from("acct-1"), "ma", 5).unwrap();
         assert_eq!(recipients[0].email, "maya@northstar.example");
+    }
+
+    #[test]
+    fn remote_merge_respects_pending_intent_and_keeps_bodies() {
+        let store = Store::open_in_memory().unwrap();
+        seeded(&store);
+        let acct = AccountId::from("acct-1");
+        // Local change pending: unread message starred by the user.
+        store.apply_change(&acct, LocalChange::SetStarred { message_ids: vec![MessageId::from("m1")], starred: true }).unwrap();
+        let protected = store.pending_message_ids(&acct).unwrap();
+        // Remote says m1 is read, not starred, and only sends headers; m2 was deleted remotely.
+        let mut remote = message("m1", "Launch creative — final review", "", &["label-inbox"]);
+        remote.body = Body::default();
+        remote.is_read = true;
+        remote.is_starred = false;
+        store.merge_remote_messages(&[remote], &protected).unwrap();
+        let m1 = store.message(&MessageId::from("m1")).unwrap().unwrap();
+        assert!(m1.is_starred, "pending local intent wins");
+        assert!(!m1.is_read);
+        assert!(m1.body.is_cached(), "existing body kept when remote sends headers only");
+        assert_eq!(store.delete_messages(&[MessageId::from("m2")]).unwrap(), 1);
+        assert!(store.message(&MessageId::from("m2")).unwrap().is_none());
+
+        // Unprotected merge takes remote flags.
+        let mut remote = message("m1", "Launch creative — final review", "new body", &["label-inbox"]);
+        remote.is_read = true;
+        remote.is_starred = false;
+        store.merge_remote_messages(&[remote], &BTreeSet::new()).unwrap();
+        let m1 = store.message(&MessageId::from("m1")).unwrap().unwrap();
+        assert!(m1.is_read && !m1.is_starred);
+        assert_eq!(m1.body.text.as_deref(), Some("new body"));
+
+        store.replace_labels(&acct, &[label(LabelKind::Inbox, "Inbox")]).unwrap();
+        assert_eq!(store.labels(&acct).unwrap().len(), 1);
+        assert!(store.account_by_email(ProviderKind::Sample, "JASON@example.com").unwrap().is_some());
+        store.delete_account(&acct).unwrap();
+        assert!(store.accounts().unwrap().is_empty());
+        assert_eq!(store.message_count(&acct).unwrap(), 0);
     }
 
     #[test]

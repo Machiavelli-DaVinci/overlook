@@ -1,8 +1,6 @@
 //! Small presentational helpers shared by the mail views.
 
-use crate::assets::icon;
 use crate::theme::Palette;
-use gpui_kit::component::StyledExt;
 use gpui_kit::*;
 use overlook_core::Address;
 
@@ -54,22 +52,6 @@ pub fn kbd(text: impl Into<SharedString>, p: &Palette) -> Div {
         .text_size(px(11.))
         .text_color(p.muted)
         .child(text.into())
-}
-
-/// Section label in the sidebar (“FAVORITES”, “LABELS”).
-pub fn section_label(text: &str, p: &Palette) -> Div {
-    div()
-        .h_flex()
-        .items_center()
-        .gap(px(5.))
-        .px(px(11.))
-        .pt(px(20.))
-        .pb(px(6.))
-        .text_size(px(11.))
-        .font_weight(FontWeight::MEDIUM)
-        .text_color(p.muted)
-        .child(icon("chevron-down").size(px(12.)).text_color(p.muted))
-        .child(text.to_owned())
 }
 
 /// Small colored dot for user labels.

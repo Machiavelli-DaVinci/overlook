@@ -1,6 +1,9 @@
 //! Overlook — a clear view of what matters.
 
 mod assets;
+mod credentials;
+mod google_signin;
+mod providers;
 mod sync;
 mod theme;
 mod ui;
@@ -28,34 +31,37 @@ fn data_dir() -> PathBuf {
         .unwrap_or_else(|| PathBuf::from(".overlook"))
 }
 
-/// Opens the profile database and makes sure a sample account exists so the shell always
-/// has realistic local mail to work with offline.
-fn open_store() -> anyhow::Result<(Arc<Store>, Account)> {
+/// Creates the sample account with the fictional mailbox already downloaded.
+pub fn seed_sample_account(store: &Store) -> anyhow::Result<Account> {
+    let account = Account {
+        id: AccountId::from("sample"),
+        provider: ProviderKind::Sample,
+        display_name: "Jason Alexander".into(),
+        email: "jason@example.com".into(),
+        created_at: now(),
+    };
+    store.upsert_account(&account)?;
+    let snapshot = sample_mailbox(&account, now());
+    for label in &snapshot.labels {
+        store.upsert_label(label)?;
+    }
+    store.upsert_messages(&snapshot.messages)?;
+    store.set_checkpoint(&account.id, snapshot.checkpoint.as_deref())?;
+    store.set_sync_state(&account.id, &SyncState::Offline, None)?;
+    info!("seeded sample account");
+    Ok(account)
+}
+
+/// Opens the profile database and makes sure at least one account exists so the shell
+/// always has local mail to work with offline.
+fn open_store() -> anyhow::Result<(Arc<Store>, Vec<Account>)> {
     let dir = data_dir();
     let store = Store::open(&dir.join("overlook.sqlite"))?;
-    let account = match store.accounts()?.into_iter().next() {
-        Some(a) => a,
-        None => {
-            let account = Account {
-                id: AccountId::from("sample"),
-                provider: ProviderKind::Sample,
-                display_name: "Jason Alexander".into(),
-                email: "jason@example.com".into(),
-                created_at: now(),
-            };
-            store.upsert_account(&account)?;
-            let snapshot = sample_mailbox(&account, now());
-            for label in &snapshot.labels {
-                store.upsert_label(label)?;
-            }
-            store.upsert_messages(&snapshot.messages)?;
-            store.set_checkpoint(&account.id, snapshot.checkpoint.as_deref())?;
-            store.set_sync_state(&account.id, &SyncState::Offline, None)?;
-            info!("seeded sample account in {}", dir.display());
-            account
-        }
-    };
-    Ok((Arc::new(store), account))
+    let mut accounts = store.accounts()?;
+    if accounts.is_empty() {
+        accounts.push(seed_sample_account(&store)?);
+    }
+    Ok((Arc::new(store), accounts))
 }
 
 fn main() {
@@ -63,7 +69,7 @@ fn main() {
         .with_env_filter(tracing_subscriber::EnvFilter::from_default_env().add_directive("overlook=info".parse().unwrap()))
         .init();
 
-    let (store, account) = match open_store() {
+    let (store, accounts) = match open_store() {
         Ok(v) => v,
         Err(e) => {
             eprintln!("Overlook could not open its local database: {e}");
@@ -101,11 +107,17 @@ fn main() {
             window_min_size: Some(size(px(880.), px(560.))),
             ..TitleBar::window_options()
         };
+        let active: AccountId = store
+            .setting::<AccountId>("active_account")
+            .ok()
+            .flatten()
+            .filter(|id| accounts.iter().any(|a| &a.id == id))
+            .unwrap_or_else(|| accounts[0].id.clone());
         let store = store.clone();
-        let account = account.clone();
+        let accounts = accounts.clone();
         let provider = provider.clone();
         gpui_kit::open_window(options, cx, move |window, cx| {
-            cx.new(|cx| ui::MailWindow::new(store, provider, account, preference, window, cx))
+            cx.new(|cx| ui::MailWindow::new(store, provider, accounts, active, preference, window, cx))
         })
         .expect("failed to open the Overlook window");
         cx.activate(true);

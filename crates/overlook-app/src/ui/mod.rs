@@ -7,6 +7,8 @@ mod sidebar;
 mod widgets;
 
 use crate::assets::icon;
+use crate::google_signin::{self, PendingSignIn, SignInResult};
+use crate::{credentials, providers};
 use crate::sync::{run_sync, SyncOutcome};
 use crate::theme::{self, ActivePalette, Palette};
 use crate::SETTING_APPEARANCE;
@@ -25,8 +27,10 @@ use gpui_kit::base::{h_flex, v_flex};
 use overlook_core::time::{format_clock, now};
 use overlook_core::*;
 use overlook_provider::sample::SampleProvider;
+use overlook_provider::MailProvider;
 use overlook_store::{ListFilter, MailboxView, Store};
-use std::collections::{BTreeSet, HashMap};
+use std::collections::{BTreeSet, HashMap, HashSet};
+use std::sync::atomic::{AtomicBool, Ordering};
 use std::path::PathBuf;
 use std::sync::Arc;
 use std::time::Duration;
@@ -104,11 +108,22 @@ pub enum ListRow {
     Draft(Draft),
 }
 
+/// A Google sign-in in progress (the browser has been opened).
+pub struct SignIn {
+    cancel: Arc<AtomicBool>,
+}
+
 pub struct MailWindow {
     focus_handle: FocusHandle,
     list_focus: FocusHandle,
     store: Arc<Store>,
-    provider: SampleProvider,
+    sample: SampleProvider,
+    accounts: Vec<Account>,
+    providers: HashMap<AccountId, Arc<dyn MailProvider>>,
+    /// Why an account has no provider (shown as “Sign-in required”).
+    provider_issues: HashMap<AccountId, String>,
+    signin: Option<SignIn>,
+    /// The account whose mail the window shows.
     account: Account,
     utc_offset: i32,
     outgoing_dir: PathBuf,
@@ -136,6 +151,8 @@ pub struct MailWindow {
     appearance: AppearancePreference,
     density: Density,
     reading_pane: ReadingPane,
+    /// Sidebar sections the user collapsed ("favorites", "labels"); persisted.
+    collapsed_sections: HashSet<String>,
     sidebar_width: f32,
     list_width: f32,
     list_height: f32,
@@ -143,20 +160,38 @@ pub struct MailWindow {
     content_panes_h: Entity<ResizableState>,
     content_panes_v: Entity<ResizableState>,
 
-    syncing: bool,
-    sync_requested: bool,
+    syncing: HashSet<AccountId>,
+    sync_requested: HashSet<AccountId>,
+    /// Earliest time (unix ms) a background sync may start again, per account, after a
+    /// temporary failure or rate limit. Manual Sync now ignores it.
+    next_retry: HashMap<AccountId, i64>,
+    retry_attempts: HashMap<AccountId, u32>,
     _subscriptions: Vec<Subscription>,
 }
 
 impl MailWindow {
     pub fn new(
         store: Arc<Store>,
-        provider: SampleProvider,
-        account: Account,
+        sample: SampleProvider,
+        accounts: Vec<Account>,
+        active: AccountId,
         appearance: AppearancePreference,
         window: &mut Window,
         cx: &mut Context<Self>,
     ) -> Self {
+        let account = accounts.iter().find(|a| a.id == active).cloned().unwrap_or_else(|| accounts[0].clone());
+        let mut providers: HashMap<AccountId, Arc<dyn MailProvider>> = HashMap::new();
+        let mut provider_issues = HashMap::new();
+        for a in &accounts {
+            match providers::provider_for(a, &sample) {
+                Ok(p) => {
+                    providers.insert(a.id.clone(), p);
+                }
+                Err(providers::ProviderIssue::SignInRequired(reason)) => {
+                    provider_issues.insert(a.id.clone(), reason);
+                }
+            }
+        }
         cx.set_global(AppearanceGlobal(appearance));
         let search_input = cx.new(|cx| InputState::new(window, cx).placeholder("Search mail"));
         let mut subs = Vec::new();
@@ -176,6 +211,7 @@ impl MailWindow {
         let density = store.setting::<Density>("density").ok().flatten().unwrap_or_default();
         let reading_pane = store.setting::<ReadingPane>("reading_pane").ok().flatten().unwrap_or_default();
         let sidebar_width = store.setting::<f32>("panes.sidebar").ok().flatten().unwrap_or(232.);
+        let collapsed_sections: HashSet<String> = store.setting::<Vec<String>>("sidebar.collapsed").ok().flatten().unwrap_or_default().into_iter().collect();
         let list_width = store.setting::<f32>("panes.list").ok().flatten().unwrap_or(340.);
         let list_height = store.setting::<f32>("panes.list_height").ok().flatten().unwrap_or(300.);
         let outgoing_dir = crate::data_dir().join("outgoing");
@@ -184,7 +220,11 @@ impl MailWindow {
             focus_handle: cx.focus_handle(),
             list_focus: cx.focus_handle(),
             store,
-            provider,
+            sample,
+            accounts,
+            providers,
+            provider_issues,
+            signin: None,
             account,
             utc_offset: overlook_core::time::local_utc_offset_minutes(),
             outgoing_dir,
@@ -208,19 +248,26 @@ impl MailWindow {
             appearance,
             density,
             reading_pane,
+            collapsed_sections,
             sidebar_width,
             list_width,
             list_height,
             panes: cx.new(|_| ResizableState::default()),
             content_panes_h: cx.new(|_| ResizableState::default()),
             content_panes_v: cx.new(|_| ResizableState::default()),
-            syncing: false,
-            sync_requested: false,
+            syncing: HashSet::new(),
+            sync_requested: HashSet::new(),
+            next_retry: HashMap::new(),
+            retry_attempts: HashMap::new(),
             _subscriptions: subs,
         };
-        // A fresh process has not reached the provider yet: say so until a probe succeeds.
-        if !this.provider.is_online() {
-            let _ = this.store.set_sync_state(&this.account.id, &SyncState::Offline, None);
+        // A fresh process has not reached any provider yet: say so until a probe succeeds.
+        for a in this.accounts.clone() {
+            if this.provider_issues.contains_key(&a.id) {
+                let _ = this.store.set_sync_state(&a.id, &SyncState::SignInRequired, None);
+            } else if !this.connected(&a.id) {
+                let _ = this.store.set_sync_state(&a.id, &SyncState::Offline, None);
+            }
         }
         this.reload(cx);
         if this.selected.is_none() {
@@ -230,20 +277,18 @@ impl MailWindow {
             }
         }
         this.list_focus.focus(window, cx);
-        // Synchronize on startup when the provider is reachable; queued work from a previous
+        // Synchronize on startup for every reachable account; queued work from a previous
         // session is replayed before anything else happens.
-        if this.provider.is_online() {
-            this.sync_now(window, cx);
+        this.sync_all(window, cx);
+        // `OVERLOOK_SIGN_IN=gmail` opens the Google sign-in immediately (first-run helper).
+        if std::env::var("OVERLOOK_SIGN_IN").is_ok_and(|v| v == "gmail") {
+            this.start_google_sign_in(None, window, cx);
         }
 
-        // Periodic synchronization while the account is reachable.
+        // Periodic synchronization while accounts are reachable.
         cx.spawn_in(window, async move |this, cx| loop {
             cx.background_executor().timer(Duration::from_secs(30)).await;
-            let alive = this.update_in(cx, |this, window, cx| {
-                if this.provider.is_online() && !this.syncing {
-                    this.sync_now(window, cx);
-                }
-            });
+            let alive = this.update_in(cx, |this, window, cx| this.sync_all(window, cx));
             if alive.is_err() {
                 break;
             }
@@ -256,6 +301,174 @@ impl MailWindow {
         Address::named(&self.account.display_name, &self.account.email)
     }
 
+    pub(crate) fn is_sample(&self, account: &AccountId) -> bool {
+        self.accounts.iter().any(|a| &a.id == account && a.provider == ProviderKind::Sample)
+    }
+
+    /// Whether a sync attempt is worth starting for the account right now.
+    pub(crate) fn connected(&self, account: &AccountId) -> bool {
+        if self.is_sample(account) {
+            self.sample.is_online()
+        } else {
+            self.providers.contains_key(account)
+        }
+    }
+
+    pub(crate) fn active_issue(&self) -> Option<&String> {
+        self.provider_issues.get(&self.account.id)
+    }
+
+    pub(crate) fn is_syncing_active(&self) -> bool {
+        self.syncing.contains(&self.account.id)
+    }
+
+    // ---------------------------------------------------------------- accounts
+
+    pub(crate) fn switch_account(&mut self, id: AccountId, window: &mut Window, cx: &mut Context<Self>) {
+        let Some(account) = self.accounts.iter().find(|a| a.id == id).cloned() else { return };
+        if self.composer.is_some() {
+            self.close_composer(window, cx);
+        }
+        self.account = account;
+        let _ = self.store.set_setting("active_account", &id);
+        self.view = MailboxView::Kind(LabelKind::Inbox);
+        self.filter = ListFilter::All;
+        self.selected = None;
+        self.outbox_selected = None;
+        self.thread.clear();
+        self.expanded.clear();
+        if !self.search_query.is_empty() {
+            self.search_query.clear();
+            let input = self.search_input.clone();
+            input.update(cx, |s, cx| s.set_value("", window, cx));
+        }
+        self.reload(cx);
+        self.selected = self.conversations.first().map(|c| c.id.clone());
+        self.load_thread();
+        self.list_focus.focus(window, cx);
+        cx.notify();
+    }
+
+    pub(crate) fn remove_account(&mut self, id: AccountId, window: &mut Window, cx: &mut Context<Self>) {
+        if self.composer.is_some() {
+            self.close_composer(window, cx);
+        }
+        let Some(account) = self.accounts.iter().find(|a| a.id == id).cloned() else { return };
+        if account.provider == ProviderKind::Gmail {
+            if let Err(e) = credentials::delete_tokens(&id) {
+                tracing::warn!("could not remove stored tokens: {e}");
+            }
+        }
+        if let Err(e) = self.store.delete_account(&id) {
+            window.push_notification(Notification::error(format!("Couldn’t remove the account: {e}")), cx);
+            return;
+        }
+        self.providers.remove(&id);
+        self.provider_issues.remove(&id);
+        self.syncing.remove(&id);
+        self.accounts = self.store.accounts().unwrap_or_default();
+        if self.accounts.is_empty() {
+            if let Ok(sample) = crate::seed_sample_account(&self.store) {
+                self.providers.insert(sample.id.clone(), Arc::new(self.sample.clone()));
+                self.accounts.push(sample);
+            }
+        }
+        let next = self.accounts[0].id.clone();
+        window.push_notification(Notification::info(format!("Removed {} from this device.", account.email)), cx);
+        self.switch_account(next, window, cx);
+    }
+
+    // ------------------------------------------------------------ Google sign-in
+
+    pub(crate) fn start_google_sign_in(&mut self, hint: Option<String>, window: &mut Window, cx: &mut Context<Self>) {
+        if self.signin.is_some() {
+            window.push_notification(Notification::info("Finish the sign-in that is already open in your browser, or cancel it first."), cx);
+            return;
+        }
+        let config = match google_signin::load_client_config() {
+            Ok(c) => c,
+            Err(e) => {
+                window.push_notification(Notification::error(e), cx);
+                return;
+            }
+        };
+        let pending = match PendingSignIn::start(config, hint) {
+            Ok(p) => p,
+            Err(e) => {
+                window.push_notification(Notification::error(e), cx);
+                return;
+            }
+        };
+        let url = pending.url.clone();
+        self.signin = Some(SignIn { cancel: pending.cancel_handle() });
+        cx.open_url(&url);
+        cx.notify();
+        cx.spawn_in(window, async move |this, cx| {
+            let result = cx.background_spawn(async move { pending.wait() }).await;
+            let _ = this.update_in(cx, |this, window, cx| this.finish_google_sign_in(result, window, cx));
+        })
+        .detach();
+    }
+
+    pub(crate) fn cancel_sign_in(&mut self, cx: &mut Context<Self>) {
+        if let Some(s) = self.signin.take() {
+            s.cancel.store(true, Ordering::SeqCst);
+        }
+        cx.notify();
+    }
+
+    fn finish_google_sign_in(&mut self, result: Result<SignInResult, String>, window: &mut Window, cx: &mut Context<Self>) {
+        let was_cancelled = self.signin.is_none();
+        self.signin = None;
+        let result = match result {
+            Ok(r) => r,
+            Err(e) => {
+                if !was_cancelled {
+                    window.push_notification(Notification::warning(e), cx);
+                }
+                cx.notify();
+                return;
+            }
+        };
+        let email = result.user.email.to_lowercase();
+        let account = match self.store.account_by_email(ProviderKind::Gmail, &email) {
+            Ok(Some(existing)) => existing,
+            _ => {
+                let account = Account {
+                    id: AccountId(format!("gmail:{email}")),
+                    provider: ProviderKind::Gmail,
+                    display_name: result.user.name.clone().filter(|n| !n.trim().is_empty()).unwrap_or_else(|| email.split('@').next().unwrap_or(&email).to_owned()),
+                    email: email.clone(),
+                    created_at: now(),
+                };
+                if let Err(e) = self.store.upsert_account(&account) {
+                    window.push_notification(Notification::error(format!("Couldn’t save the account: {e}")), cx);
+                    return;
+                }
+                account
+            }
+        };
+        if let Err(e) = credentials::save_tokens(&account.id, &result.tokens) {
+            window.push_notification(Notification::error(format!("{e} Overlook cannot keep you signed in without it.")), cx);
+            return;
+        }
+        match providers::gmail_provider(&account, result.tokens) {
+            Ok(p) => {
+                self.providers.insert(account.id.clone(), p);
+                self.provider_issues.remove(&account.id);
+            }
+            Err(e) => {
+                window.push_notification(Notification::error(e), cx);
+                return;
+            }
+        }
+        let _ = self.store.set_sync_state(&account.id, &SyncState::Syncing, None);
+        self.accounts = self.store.accounts().unwrap_or_default();
+        window.push_notification(Notification::success(format!("Signed in as {}. Downloading recent mail…", account.email)), cx);
+        self.switch_account(account.id.clone(), window, cx);
+        self.sync_account(account.id, window, cx);
+    }
+
     fn view_title(&self) -> String {
         match &self.view {
             MailboxView::Kind(kind) => match kind {
@@ -265,7 +478,7 @@ impl MailWindow {
                 LabelKind::Sent => "Sent",
                 LabelKind::Archive => "Archive",
                 LabelKind::Trash => "Trash",
-                LabelKind::Spam => "Spam",
+                LabelKind::Spam => "Junk",
                 LabelKind::Outbox => "Outbox",
                 LabelKind::User => "Label",
             }
@@ -447,7 +660,7 @@ impl MailWindow {
         match self.store.apply_change(&self.account.id, change) {
             Ok(_) => {
                 self.reload(cx);
-                if self.provider.is_online() {
+                if self.connected(&self.account.id) {
                     self.sync_now(window, cx);
                 }
             }
@@ -571,6 +784,15 @@ impl MailWindow {
         cx.notify();
     }
 
+    pub(crate) fn toggle_section(&mut self, key: &str, cx: &mut Context<Self>) {
+        if !self.collapsed_sections.remove(key) {
+            self.collapsed_sections.insert(key.to_owned());
+        }
+        let list: Vec<&String> = self.collapsed_sections.iter().collect();
+        let _ = self.store.set_setting("sidebar.collapsed", &list);
+        cx.notify();
+    }
+
     fn toggle_density(&mut self, _window: &mut Window, cx: &mut Context<Self>) {
         self.density = match self.density {
             Density::Comfortable => Density::Compact,
@@ -587,33 +809,82 @@ impl MailWindow {
     }
 
     fn set_online(&mut self, online: bool, window: &mut Window, cx: &mut Context<Self>) {
-        self.provider.set_online(online);
-        if online {
-            self.sync_now(window, cx);
-        } else {
-            let _ = self.store.set_sync_state(&self.account.id, &SyncState::Offline, None);
-            self.reload(cx);
+        self.sample.set_online(online);
+        let sample_ids: Vec<AccountId> = self.accounts.iter().filter(|a| a.provider == ProviderKind::Sample).map(|a| a.id.clone()).collect();
+        for id in sample_ids {
+            if online {
+                self.sync_account(id, window, cx);
+            } else {
+                let _ = self.store.set_sync_state(&id, &SyncState::Offline, None);
+            }
         }
+        self.reload(cx);
     }
 
     // ------------------------------------------------------------------ sync
 
+    /// Syncs the active account (manual: ignores the retry pause).
     pub(crate) fn sync_now(&mut self, window: &mut Window, cx: &mut Context<Self>) {
-        if self.syncing {
-            self.sync_requested = true;
+        let id = self.account.id.clone();
+        self.next_retry.remove(&id);
+        self.sync_account(id, window, cx);
+    }
+
+    /// Syncs every reachable account that is not in a retry pause. One account never
+    /// blocks another.
+    pub(crate) fn sync_all(&mut self, window: &mut Window, cx: &mut Context<Self>) {
+        let now_ms = now();
+        let ids: Vec<AccountId> = self
+            .accounts
+            .iter()
+            .map(|a| a.id.clone())
+            .filter(|id| self.connected(id) && self.next_retry.get(id).is_none_or(|t| *t <= now_ms))
+            .collect();
+        for id in ids {
+            self.sync_account(id, window, cx);
+        }
+    }
+
+    pub(crate) fn sync_account(&mut self, id: AccountId, window: &mut Window, cx: &mut Context<Self>) {
+        let Some(account) = self.accounts.iter().find(|a| a.id == id).cloned() else { return };
+        let Some(provider) = self.providers.get(&id).cloned() else {
+            let _ = self.store.set_sync_state(&id, &SyncState::SignInRequired, None);
+            self.reload(cx);
+            return;
+        };
+        if self.syncing.contains(&id) {
+            self.sync_requested.insert(id);
             return;
         }
-        self.syncing = true;
-        self.sync_requested = false;
+        self.syncing.insert(id.clone());
+        self.sync_requested.remove(&id);
         let store = self.store.clone();
-        let provider = self.provider.clone();
-        let account = self.account.clone();
+        let first_download = store.message_count(&id).unwrap_or(0) == 0;
         cx.notify();
         cx.spawn_in(window, async move |this, cx| {
-            let outcome: SyncOutcome = cx.background_spawn(run_sync(store, provider, account)).await;
+            let outcome: SyncOutcome = cx.background_spawn(run_sync(store, provider, account.clone())).await;
             let _ = this.update_in(cx, |this, window, cx| {
-                this.syncing = false;
+                this.syncing.remove(&account.id);
+                match &outcome.state {
+                    Some(SyncState::UpToDate) => {
+                        this.retry_attempts.remove(&account.id);
+                        this.next_retry.remove(&account.id);
+                    }
+                    Some(SyncState::SyncFailed(_)) | Some(SyncState::Paused(_)) => {
+                        let attempts = this.retry_attempts.entry(account.id.clone()).or_insert(0);
+                        *attempts += 1;
+                        let base = overlook_provider::backoff_seconds(*attempts).max(if outcome.rate_limited { 60 } else { 15 });
+                        this.next_retry.insert(account.id.clone(), now() + (base as i64) * 1000);
+                    }
+                    _ => {}
+                }
+                if matches!(outcome.state, Some(SyncState::SignInRequired)) {
+                    this.provider_issues.insert(account.id.clone(), "Sign in again to continue syncing. Your local drafts are safe.".into());
+                }
                 this.reload(cx);
+                if first_download && outcome.downloaded > 0 {
+                    window.push_notification(Notification::success(format!("Downloaded {} recent messages for {}.", outcome.downloaded, account.email)), cx);
+                }
                 for subject in &outcome.sent {
                     window.push_notification(Notification::success(format!("Sent: {subject}")), cx);
                 }
@@ -626,9 +897,10 @@ impl MailWindow {
                 for what in &outcome.failed {
                     window.push_notification(Notification::error(format!("Couldn’t sync: {what}")), cx);
                 }
-                let more_pending = this.status.pending_operations > 0;
-                if this.sync_requested || (more_pending && !outcome.stopped_offline && outcome.applied > 0) {
-                    this.sync_now(window, cx);
+                let more_pending = this.store.pending_count(&account.id).unwrap_or(0) > 0;
+                let paused = this.next_retry.get(&account.id).is_some_and(|t| *t > now());
+                if !paused && (this.sync_requested.contains(&account.id) || (more_pending && !outcome.stopped_offline && outcome.applied > 0)) {
+                    this.sync_account(account.id.clone(), window, cx);
                 }
             });
         })
@@ -820,10 +1092,12 @@ impl MailWindow {
     fn render_status_bar(&self, cx: &mut Context<Self>) -> impl IntoElement {
         let p = *cx.palette();
         let status = &self.status;
-        let online = self.provider.is_online();
+        let is_sample = self.is_sample(&self.account.id);
+        let online = self.sample.is_online();
         let (dot, state_text) = match &status.state {
             SyncState::UpToDate => (p.success, "Up to date".to_owned()),
             SyncState::Syncing => (p.accent, "Syncing your changes…".to_owned()),
+            SyncState::Paused(reason) => (p.accent, reason.clone()),
             SyncState::Offline => (p.muted, status.state.sentence(status.pending_operations)),
             SyncState::SignInRequired => (p.warning, status.state.sentence(0)),
             SyncState::SyncFailed(reason) => (p.warning, format!("Sync failed: {reason}")),
@@ -877,14 +1151,16 @@ impl MailWindow {
                     .items_center()
                     .gap(px(10.))
                     .child(format!("{} · {}", self.account.provider.label(), self.account.email))
-                    .child(
-                        Switch::new("connection")
-                            .checked(online)
-                            .label(if online { "Connected" } else { "Disconnected" })
-                            .tooltip("Simulated connection for the sample account")
-                            .on_click(cx.listener(|this, checked: &bool, window, cx| this.set_online(*checked, window, cx))),
-                    )
-                    .child(
+                    .when(is_sample, |row| {
+                        row.child(
+                            Switch::new("connection")
+                                .checked(online)
+                                .label(if online { "Connected" } else { "Disconnected" })
+                                .tooltip("Simulated connection for the sample account")
+                                .on_click(cx.listener(|this, checked: &bool, window, cx| this.set_online(*checked, window, cx))),
+                        )
+                    })
+                    .when(is_sample, |row| row.child(
                         Button::new("dev-menu")
                             .ghost()
                             .xsmall()
@@ -899,13 +1175,48 @@ impl MailWindow {
                                     }))
                                     .item(PopupMenuItem::new("Drop the connection during the next send").on_click(move |_, window, cx| {
                                         let _ = b.update(cx, |this, cx| {
-                                            this.provider.drop_next_send();
+                                            this.sample.drop_next_send();
                                             window.push_notification(Notification::info("The next send will lose its connection after the server accepts it."), cx);
                                         });
                                     }))
                             }),
-                    ),
+                    )),
             )
+    }
+
+    /// Banner under the header for a sign-in in progress or an account that needs sign-in.
+    fn render_banner(&self, cx: &mut Context<Self>) -> Option<impl IntoElement> {
+        let p = *cx.palette();
+        let (icon_name, text, action, color): (&str, String, Option<(&str, bool)>, Hsla) = if self.signin.is_some() {
+            ("globe", "Finish signing in to Google in your browser. Overlook is waiting for the sign-in to complete.".into(), Some(("Cancel", false)), p.accent)
+        } else if let Some(reason) = self.active_issue() {
+            ("key-round", reason.clone(), Some(("Sign in again", true)), p.warning)
+        } else {
+            return None;
+        };
+        let email = self.account.email.clone();
+        Some(
+            h_flex()
+                .items_center()
+                .gap(px(10.))
+                .px(px(16.))
+                .h(px(40.))
+                .bg(p.chip)
+                .border_b_1()
+                .border_color(p.divider)
+                .text_size(px(13.))
+                .child(icon(icon_name).size(px(16.)).text_color(color))
+                .child(div().flex_1().truncate().child(text))
+                .children(action.map(|(label, sign_in)| {
+                    Button::new("banner-action").small().label(label).on_click(cx.listener(move |this, _, window, cx| {
+                        if sign_in {
+                            this.start_google_sign_in(Some(email.clone()), window, cx);
+                        } else {
+                            this.cancel_sign_in(cx);
+                        }
+                    }))
+                })),
+        )
     }
 
     // ------------------------------------------------------------------ body
@@ -985,6 +1296,7 @@ impl Render for MailWindow {
             .font_family("Inter")
             .text_size(px(13.))
             .child(self.render_header(cx))
+            .children(self.render_banner(cx))
             .child(div().flex_1().min_h_0().child(self.render_body(cx)))
             .child(self.render_status_bar(cx))
     }

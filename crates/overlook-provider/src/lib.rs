@@ -28,19 +28,53 @@ pub enum ProviderError {
     /// The provider rejected the operation. It will not succeed on retry without a change.
     #[error("{0}")]
     Rejected(String),
+    /// The provider asked us to slow down (quota or rate limit). Retry after a longer pause.
+    #[error("rate limited: {0}")]
+    RateLimited(String),
     /// The connection dropped after the request was sent but before a response arrived.
     /// For non-idempotent operations (sending), the outcome must be reconciled before any
     /// retry.
     #[error("connection dropped while waiting for a response")]
     Uncertain,
+    /// The saved sync checkpoint is no longer valid; a full resynchronization is required.
+    #[error("sync checkpoint expired")]
+    CheckpointExpired,
 }
 
 /// Snapshot delivered by an initial or full synchronization.
+///
+/// Providers may return messages directly (cheap local sources) or only `message_ids`,
+/// which the sync engine then downloads in small persisted batches with
+/// [`MailProvider::fetch_messages`], so quota limits and interruptions never lose progress.
 #[derive(Debug, Clone, Default)]
 pub struct MailboxSnapshot {
     pub labels: Vec<Label>,
     pub messages: Vec<Message>,
+    /// Provider ids of recent messages still to download, newest first.
+    pub message_ids: Vec<ProviderId>,
     pub checkpoint: Option<String>,
+}
+
+/// Incremental changes since a checkpoint.
+#[derive(Debug, Clone, Default)]
+pub struct RemoteChanges {
+    /// Complete label list when the provider reports label changes (replaces the local list).
+    pub labels: Option<Vec<Label>>,
+    /// New or changed messages. A message without a cached body keeps the local body.
+    pub upserts: Vec<Message>,
+    /// Messages removed at the provider (local ids).
+    pub deleted: Vec<MessageId>,
+    pub checkpoint: Option<String>,
+}
+
+/// Everything a provider needs to submit a draft besides the draft itself.
+#[derive(Debug, Clone, Default)]
+pub struct SendContext {
+    pub sent_label: Option<LabelId>,
+    /// The message being replied to or forwarded, for threading headers.
+    pub in_reply_to: Option<Message>,
+    /// The account's labels, for provider id lookups.
+    pub labels: Vec<Label>,
 }
 
 /// What the provider recorded after accepting a send.
@@ -70,14 +104,28 @@ pub trait MailProvider: Send + Sync {
     /// Downloads labels and recent messages for first use or full resynchronization.
     fn fetch_snapshot(&self, account: &Account) -> BoxFuture<'_, Result<MailboxSnapshot, ProviderError>>;
 
+    /// Downloads changes since `checkpoint`.
+    fn fetch_changes(&self, account: &Account, checkpoint: &str) -> BoxFuture<'_, Result<RemoteChanges, ProviderError>>;
+
+    /// Downloads full messages for provider ids listed by a snapshot. Ids that no longer
+    /// exist are skipped.
+    fn fetch_messages(&self, _account: &Account, _ids: &[ProviderId], _labels: &[Label]) -> BoxFuture<'_, Result<Vec<Message>, ProviderError>> {
+        Box::pin(async { Ok(Vec::new()) })
+    }
+
     /// Applies an idempotent mailbox operation.
-    fn apply(&self, account: &Account, op: &PendingOperation, messages: &[Message]) -> BoxFuture<'_, Result<(), ProviderError>>;
+    fn apply(&self, account: &Account, op: &PendingOperation, messages: &[Message], labels: &[Label]) -> BoxFuture<'_, Result<(), ProviderError>>;
 
     /// Submits a message. Only a returned receipt means "Sent".
-    fn send(&self, account: &Account, draft: &Draft, sent_label: Option<&LabelId>) -> BoxFuture<'_, Result<SentReceipt, ProviderError>>;
+    fn send(&self, account: &Account, draft: &Draft, context: SendContext) -> BoxFuture<'_, Result<SentReceipt, ProviderError>>;
 
-    /// Determines whether an uncertain send was delivered, by Message-ID or draft token.
+    /// Determines whether an uncertain send was delivered, by Message-ID.
     fn reconcile_send(&self, account: &Account, draft: &Draft) -> BoxFuture<'_, Result<SendOutcome, ProviderError>>;
+}
+
+/// Deterministic Message-ID for a draft, so an interrupted send can be reconciled.
+pub fn draft_message_id(draft: &Draft) -> String {
+    format!("<{}@overlook.lastrefuge.ai>", draft.id)
 }
 
 /// Backoff schedule for temporary failures: 2s, 5s, 15s, 60s, then every 5 minutes.

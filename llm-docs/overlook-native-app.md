@@ -1,6 +1,6 @@
 # Overlook Native App: Build, Run, Test
 
-Status as of 12 October 2026: foundation milestone 2 to 4 implemented (see the [foundation plan](foundation-implementation-plan.md)). This is a native Rust + GPUI application with a durable local store and a sample provider. There is no Gmail connection yet.
+Status as of 12 October 2026: foundation milestones 2 to 5 implemented (see the [foundation plan](foundation-implementation-plan.md)). This is a native Rust + GPUI application with a durable local store, a sample provider, and a working Gmail account (sign-in, download, incremental sync, mailbox actions, send).
 
 ## Build and run
 
@@ -22,11 +22,23 @@ OVERLOOK_DATA_DIR=/tmp/overlook-demo cargo run -p overlook
 
 On first launch Overlook seeds a **Sample account** (“Jason Alexander <jason@example.com>”) with the fictional mailbox from the design preview. The account is labelled as a sample everywhere; its connection is simulated and starts **disconnected**.
 
+## Gmail
+
+1. Create a Google Cloud OAuth client of type **Desktop app** with the Gmail API enabled and the scopes `gmail.modify`, `gmail.send`, `openid`, `userinfo.email` on the consent screen (Testing mode with test users is fine for development; restricted-scope verification is needed for public release).
+2. Save the downloaded JSON as `~/.config/overlook/google-oauth-client.json` (owner-only permissions). It is never embedded in the binary or committed.
+3. In Overlook open the account menu (chevron button at the bottom of the sidebar) → **Add Gmail account…**, or launch with `OVERLOOK_SIGN_IN=gmail`. The system browser opens Google's consent screen; Overlook listens on a loopback port with PKCE, exchanges the code, reads the user's email, and stores tokens in the system keyring (Secret Service via `oo7`). Tokens refresh automatically; a revoked grant turns into the **Sign-in required** state with a "Sign in again" action, and local work is kept.
+4. The first sync lists the 150 most recent messages (ids only, cheap), then downloads full bodies in batches of 20, committing after every batch. The backlog is persisted (`settings` key `download_backlog:<account>`), so quota pauses, going offline, or a crash never lose progress. Later syncs use `users.history.list` from the saved checkpoint; an expired checkpoint triggers a full resynchronization that preserves pending local intent.
+5. Mailbox actions map to `batchModify` (UNREAD/STARRED/INBOX/user labels) and `messages.trash`/`untrash`. Send builds RFC 822 with threading headers (lettre) and posts to `messages.send`; a transport failure after the request is **uncertain** and is reconciled with `rfc822msgid:` before any retry.
+
+Gmail meters usage in quota units per user per minute. Overlook spaces requests about 170 ms apart and, when Gmail still answers with a quota error, enters the **Paused** state and backs off (60 s, growing to 5 minutes) instead of hammering the API. In a fresh project the observed budget allowed roughly 40 full-message downloads per minute, so a first download of 150 messages can take a few minutes. Check **APIs & Services → Gmail API → Quotas** in Google Cloud if downloads pause often.
+
 Environment switches for development:
 
 | Variable | Effect |
 |---|---|
 | `OVERLOOK_DATA_DIR` | Profile directory |
+| `OVERLOOK_CONFIG_DIR` | Directory holding `google-oauth-client.json` (default `~/.config/overlook`) |
+| `OVERLOOK_SIGN_IN=gmail` | Start the Google sign-in at launch |
 | `OVERLOOK_SAMPLE_ONLINE=1` | Start the sample connection connected, so queued work syncs at launch |
 | `OVERLOOK_UTC_OFFSET_MINUTES` | Override the local time zone offset used for day groups |
 | `RUST_LOG=overlook=debug` | Tracing output |
@@ -37,7 +49,7 @@ Environment switches for development:
 cargo test --workspace
 ```
 
-32 tests cover: appearance resolution (Follow system is not a third theme), recipient parsing, conversation summaries, reply/forward drafts, HTML sanitization and remote-image blocking, local time formatting, PKCE/OAuth request building, the sample provider, store durability across reopen, atomic change+operation (a failing change leaves no operation), Outbox queue/cancel, send completion, FTS search and coverage, settings, and the sync engine (offline leaves work queued; ordered replay; uncertain send reconciled without duplicates; cancelled send never sent).
+43 tests cover: appearance resolution (Follow system is not a third theme), recipient parsing, conversation summaries, reply/forward drafts, HTML sanitization and remote-image blocking, local time formatting, PKCE/OAuth request building, the sample provider, store durability across reopen, atomic change+operation (a failing change leaves no operation), Outbox queue/cancel, send completion, FTS search and coverage, settings, and the sync engine (offline leaves work queued; ordered replay; uncertain send reconciled without duplicates; cancelled send never sent).
 
 The manual scenario used to validate the shell (keyboard only, with `wtype` on Hyprland):
 
@@ -78,7 +90,7 @@ The sidebar and list panes are resizable; sizes persist in `settings`. The layou
 
 ## Known gaps (tracked for the next sessions)
 
-- No Gmail yet: OAuth request/PKCE helpers exist; the loopback listener, token exchange, Secret Service storage, and the Gmail API client are next.
+- Gmail: no attachment download for received mail yet, no progressive download beyond the newest 150 messages, no `cid:` inline images, and bodies are fetched one request per message (the Gmail batch endpoint would cut request count).
 - Composer is plain text. Rich text, signatures, and HTML output are phase 1 items; `body_html` is already stored separately.
 - Attachment download for received mail is not implemented (cards show “Not downloaded”). Outgoing attachments are copied into the protected `outgoing/` store and persisted with the draft.
 - Multi-select and drag-and-drop are not implemented.
