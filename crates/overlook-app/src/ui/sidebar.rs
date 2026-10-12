@@ -44,9 +44,15 @@ impl MailWindow {
                 v => this.counts.get(v).copied().unwrap_or(0),
             };
             let view = nav.view.clone();
+            let drop_view = nav.view.clone();
+            let droppable = matches!(nav.view, MailboxView::Kind(LabelKind::Inbox) | MailboxView::Kind(LabelKind::Archive) | MailboxView::Kind(LabelKind::Trash) | MailboxView::Kind(LabelKind::Starred) | MailboxView::Label(_));
             let color = nav.color;
             div()
                 .id(SharedString::from(format!("nav-{}", nav.label)))
+                .when(droppable, |d| {
+                    d.drag_over::<super::ConversationDrag>(move |style, _, _, _| style.bg(p.selection).border_1().border_color(p.accent))
+                        .on_drop(cx.listener(move |this, drag: &super::ConversationDrag, window, cx| this.drop_on_view(drag.clone(), drop_view.clone(), window, cx)))
+                })
                 .h_flex()
                 .items_center()
                 .gap(px(10.))

@@ -241,6 +241,11 @@ impl MailWindow {
         let star_id = c.latest_message_id.clone();
         let starred = c.starred;
         let pending = c.pending;
+        let drag = super::ConversationDrag {
+            message_ids: self.store.messages_in_conversation(&self.account.id, &c.id).unwrap_or_default().into_iter().map(|m| m.id).collect(),
+            title: c.subject.clone(),
+            count: c.message_count,
+        };
 
         div()
             .id(SharedString::from(format!("conv-{}", c.id)))
@@ -357,6 +362,10 @@ impl MailWindow {
                         this.set_starred(vec![star_id.clone()], !starred, window, cx);
                     })),
             )
+            .on_drag(drag, |d: &super::ConversationDrag, _pos, _window, cx| {
+                let label = if d.count > 1 { format!("{} · {} messages", d.title, d.count) } else { d.title.clone() };
+                cx.new(|_| super::DragPreview { label })
+            })
             .on_click(cx.listener(move |this, _, window, cx| this.select_conversation(Some(conv_id.clone()), window, cx)))
     }
 

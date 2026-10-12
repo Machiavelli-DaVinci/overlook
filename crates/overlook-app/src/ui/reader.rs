@@ -15,6 +15,7 @@ use gpui_kit::base::{h_flex, v_flex};
 use overlook_core::sanitize::{sanitize_html, text_to_html, RemoteContent};
 use overlook_core::time::{format_full, relative_label};
 use overlook_core::*;
+use overlook_store::MailboxView;
 
 impl MailWindow {
     pub(super) fn render_reader(&self, cx: &mut Context<Self>) -> impl IntoElement {
@@ -61,6 +62,7 @@ impl MailWindow {
 
         let selected_ids: Vec<MessageId> = self.thread.iter().map(|m| m.id.clone()).collect();
         let unread_any = self.thread.iter().any(|m| !m.is_read);
+        let (in_trash, in_inbox) = self.thread_state();
         let toolbar = h_flex()
             .items_center()
             .gap(px(4.))
@@ -68,14 +70,62 @@ impl MailWindow {
             .px(px(16.))
             .border_b_1()
             .border_color(p.divider)
-            .child(toolbar_button("archive", "Archive", "Archive (E)", cx.listener({
+            .when(in_trash, |bar| {
+                bar.child(toolbar_button("inbox", "Restore", "Restore to Inbox (E)", cx.listener({
+                    let ids = selected_ids.clone();
+                    move |this, _, window, cx| this.restore(ids.clone(), window, cx)
+                })))
+            })
+            .when(!in_trash && !in_inbox, |bar| {
+                bar.child(toolbar_button("inbox", "Move to Inbox", "Move to Inbox (E)", cx.listener({
+                    let ids = selected_ids.clone();
+                    move |this, _, window, cx| this.move_to_inbox(ids.clone(), window, cx)
+                })))
+            })
+            .when(!in_trash && in_inbox, |bar| {
+                bar.child(toolbar_button("archive", "Archive", "Archive (E)", cx.listener({
+                    let ids = selected_ids.clone();
+                    move |this, _, window, cx| this.archive(ids.clone(), window, cx)
+                })))
+            })
+            .when(!in_trash, |bar| {
+                bar.child(toolbar_button("trash", "Delete", "Delete (Del)", cx.listener({
+                    let ids = selected_ids.clone();
+                    move |this, _, window, cx| this.trash(ids.clone(), window, cx)
+                })))
+            })
+            .child({
+                let labels: Vec<(LabelId, String)> = self.labels.iter().filter(|l| l.kind == LabelKind::User).map(|l| (l.id.clone(), l.name.clone())).collect();
                 let ids = selected_ids.clone();
-                move |this, _, window, cx| this.archive(ids.clone(), window, cx)
-            })))
-            .child(toolbar_button("trash", "Delete", "Delete (Del)", cx.listener({
-                let ids = selected_ids.clone();
-                move |this, _, window, cx| this.trash(ids.clone(), window, cx)
-            })))
+                let t = cx.entity().downgrade();
+                Button::new("move-to")
+                    .ghost()
+                    .small()
+                    .icon(icon("folder-input").size(px(16.)))
+                    .label("Move to")
+                    .dropdown_menu(move |mut menu, _window, _cx| {
+                        for (label, view) in [("Inbox", MailboxView::Kind(LabelKind::Inbox)), ("Archive", MailboxView::Kind(LabelKind::Archive)), ("Trash", MailboxView::Kind(LabelKind::Trash))] {
+                            let t = t.clone();
+                            let ids = ids.clone();
+                            menu = menu.item(PopupMenuItem::new(label).on_click(move |_, window, cx| {
+                                let drag = super::ConversationDrag { message_ids: ids.clone(), title: String::new(), count: 0 };
+                                let _ = t.update(cx, |this, cx| this.drop_on_view(drag, view.clone(), window, cx));
+                            }));
+                        }
+                        if !labels.is_empty() {
+                            menu = menu.separator().label("Labels");
+                        }
+                        for (id, name) in &labels {
+                            let t = t.clone();
+                            let ids = ids.clone();
+                            let id = id.clone();
+                            menu = menu.item(PopupMenuItem::new(name.clone()).on_click(move |_, window, cx| {
+                                let _ = t.update(cx, |this, cx| this.move_to_label(ids.clone(), id.clone(), window, cx));
+                            }));
+                        }
+                        menu
+                    })
+            })
             .child(toolbar_button(
                 if unread_any { "mail-open" } else { "mail" },
                 if unread_any { "Mark as read" } else { "Mark as unread" },

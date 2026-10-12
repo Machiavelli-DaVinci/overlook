@@ -129,6 +129,39 @@ pub enum AfterDownload {
     SaveTo(PathBuf),
 }
 
+/// A conversation being dragged from the list onto the sidebar.
+#[derive(Clone, Debug)]
+pub struct ConversationDrag {
+    pub message_ids: Vec<MessageId>,
+    pub title: String,
+    pub count: usize,
+}
+
+/// The small card that follows the pointer during a drag.
+pub struct DragPreview {
+    pub label: String,
+}
+
+impl Render for DragPreview {
+    fn render(&mut self, _window: &mut Window, cx: &mut Context<Self>) -> impl IntoElement {
+        let p = *cx.palette();
+        h_flex()
+            .items_center()
+            .gap(px(8.))
+            .px(px(12.))
+            .py(px(7.))
+            .rounded(px(8.))
+            .bg(p.surface)
+            .border_1()
+            .border_color(p.accent)
+            .shadow_md()
+            .text_size(px(13.))
+            .text_color(p.foreground)
+            .child(icon("mail").size(px(14.)).text_color(p.accent))
+            .child(self.label.clone())
+    }
+}
+
 pub enum ListRow {
     Group(SharedString, usize),
     Conversation(ConversationSummary),
@@ -878,14 +911,43 @@ impl MailWindow {
         self.thread.iter().map(|m| m.id.clone()).collect()
     }
 
+    /// Shows a toast with an Undo button that runs `undo` on this window.
+    fn toast_with_undo(&self, text: impl Into<SharedString>, undo: impl Fn(&mut Self, &mut Window, &mut Context<Self>) + 'static, window: &mut Window, cx: &mut Context<Self>) {
+        let this = cx.entity().downgrade();
+        let undo = std::rc::Rc::new(undo);
+        window.push_notification(
+            Notification::info(text)
+                .action(move |_note, _window, cx| {
+                    let this = this.clone();
+                    let undo = undo.clone();
+                    let note = cx.entity();
+                    Button::new("undo").xsmall().label("Undo").on_click(move |_, window, cx| {
+                        let _ = this.update(cx, |t, cx| undo(t, window, cx));
+                        note.update(cx, |n, cx| n.dismiss(window, cx));
+                    })
+                })
+                .autohide(true),
+            cx,
+        );
+    }
+
+    /// Whether every message is in Trash / has the Inbox label, for toolbar wording.
+    pub(crate) fn thread_state(&self) -> (bool, bool) {
+        let trash = self.labels.iter().find(|l| l.kind == LabelKind::Trash).map(|l| l.id.clone());
+        let inbox = self.labels.iter().find(|l| l.kind == LabelKind::Inbox).map(|l| l.id.clone());
+        let in_trash = !self.thread.is_empty() && trash.as_ref().is_some_and(|t| self.thread.iter().all(|m| m.has_label(t)));
+        let in_inbox = inbox.as_ref().is_some_and(|i| self.thread.iter().any(|m| m.has_label(i)));
+        (in_trash, in_inbox)
+    }
+
     pub(crate) fn archive(&mut self, ids: Vec<MessageId>, window: &mut Window, cx: &mut Context<Self>) {
         if ids.is_empty() {
             return;
         }
         let next = self.neighbour_after_removal();
-        self.apply_local(overlook_store::LocalChange::Archive { message_ids: ids }, window, cx);
+        self.apply_local(overlook_store::LocalChange::Archive { message_ids: ids.clone() }, window, cx);
         self.select_after_removal(next, window, cx);
-        window.push_notification(Notification::info("Archived"), cx);
+        self.toast_with_undo("Archived", move |this, window, cx| this.move_to_inbox(ids.clone(), window, cx), window, cx);
     }
 
     pub(crate) fn trash(&mut self, ids: Vec<MessageId>, window: &mut Window, cx: &mut Context<Self>) {
@@ -893,9 +955,75 @@ impl MailWindow {
             return;
         }
         let next = self.neighbour_after_removal();
-        self.apply_local(overlook_store::LocalChange::Trash { message_ids: ids }, window, cx);
+        self.apply_local(overlook_store::LocalChange::Trash { message_ids: ids.clone() }, window, cx);
         self.select_after_removal(next, window, cx);
-        window.push_notification(Notification::info("Moved to Trash"), cx);
+        self.toast_with_undo("Moved to Trash", move |this, window, cx| this.restore(ids.clone(), window, cx), window, cx);
+    }
+
+    /// Puts archived (or trashed) messages back in the Inbox.
+    pub(crate) fn move_to_inbox(&mut self, ids: Vec<MessageId>, window: &mut Window, cx: &mut Context<Self>) {
+        if ids.is_empty() {
+            return;
+        }
+        let trash = self.labels.iter().find(|l| l.kind == LabelKind::Trash).map(|l| l.id.clone());
+        let trashed: Vec<MessageId> = ids.iter().filter(|id| self.store.message(id).ok().flatten().is_some_and(|m| trash.as_ref().is_some_and(|t| m.has_label(t)))).cloned().collect();
+        let others: Vec<MessageId> = ids.iter().filter(|id| !trashed.contains(id)).cloned().collect();
+        let next = self.neighbour_after_removal();
+        if !trashed.is_empty() {
+            self.apply_local(overlook_store::LocalChange::Untrash { message_ids: trashed }, window, cx);
+        }
+        if let (Some(inbox), false) = (self.labels.iter().find(|l| l.kind == LabelKind::Inbox).map(|l| l.id.clone()), others.is_empty()) {
+            self.apply_local(overlook_store::LocalChange::AddLabel { message_ids: others, label_id: inbox }, window, cx);
+        }
+        self.select_after_removal(next, window, cx);
+        self.toast_with_undo("Moved to Inbox", move |this, window, cx| this.archive(ids.clone(), window, cx), window, cx);
+    }
+
+    /// Restores trashed messages to the Inbox.
+    pub(crate) fn restore(&mut self, ids: Vec<MessageId>, window: &mut Window, cx: &mut Context<Self>) {
+        if ids.is_empty() {
+            return;
+        }
+        let next = self.neighbour_after_removal();
+        self.apply_local(overlook_store::LocalChange::Untrash { message_ids: ids.clone() }, window, cx);
+        self.select_after_removal(next, window, cx);
+        self.toast_with_undo("Restored to Inbox", move |this, window, cx| this.trash(ids.clone(), window, cx), window, cx);
+    }
+
+    /// Applies a user label and, like moving to a folder, takes the messages out of the Inbox.
+    pub(crate) fn move_to_label(&mut self, ids: Vec<MessageId>, label_id: LabelId, window: &mut Window, cx: &mut Context<Self>) {
+        if ids.is_empty() {
+            return;
+        }
+        let name = self.labels.iter().find(|l| l.id == label_id).map(|l| l.name.clone()).unwrap_or_default();
+        let inbox = self.labels.iter().find(|l| l.kind == LabelKind::Inbox).map(|l| l.id.clone());
+        let was_in_inbox: Vec<MessageId> = ids.iter().filter(|id| self.store.message(id).ok().flatten().is_some_and(|m| inbox.as_ref().is_some_and(|i| m.has_label(i)))).cloned().collect();
+        let next = self.neighbour_after_removal();
+        self.apply_local(overlook_store::LocalChange::AddLabel { message_ids: ids.clone(), label_id: label_id.clone() }, window, cx);
+        if !was_in_inbox.is_empty() {
+            self.apply_local(overlook_store::LocalChange::Archive { message_ids: was_in_inbox.clone() }, window, cx);
+        }
+        self.select_after_removal(next, window, cx);
+        let label_for_undo = label_id.clone();
+        self.toast_with_undo(format!("Moved to {name}"), move |this, window, cx| {
+            this.apply_local(overlook_store::LocalChange::RemoveLabel { message_ids: ids.clone(), label_id: label_for_undo.clone() }, window, cx);
+            if !was_in_inbox.is_empty() {
+                this.move_to_inbox(was_in_inbox.clone(), window, cx);
+            }
+        }, window, cx);
+    }
+
+    /// Handles a conversation dropped onto a sidebar destination.
+    pub(crate) fn drop_on_view(&mut self, drag: ConversationDrag, view: MailboxView, window: &mut Window, cx: &mut Context<Self>) {
+        let ids = drag.message_ids;
+        match view {
+            MailboxView::Kind(LabelKind::Inbox) => self.move_to_inbox(ids, window, cx),
+            MailboxView::Kind(LabelKind::Archive) => self.archive(ids, window, cx),
+            MailboxView::Kind(LabelKind::Trash) => self.trash(ids, window, cx),
+            MailboxView::Kind(LabelKind::Starred) => self.set_starred(vec![ids.last().cloned().unwrap_or_else(|| ids[0].clone())], true, window, cx),
+            MailboxView::Label(label_id) => self.move_to_label(ids, label_id, window, cx),
+            _ => window.push_notification(Notification::info("Messages can be dropped on Inbox, Archive, Trash, Starred, or a label."), cx),
+        }
     }
 
     fn neighbour_after_removal(&self) -> Option<ConversationId> {
@@ -1159,7 +1287,12 @@ impl MailWindow {
     }
     fn on_archive(&mut self, _: &ArchiveSelected, window: &mut Window, cx: &mut Context<Self>) {
         let ids = self.selected_message_ids();
-        self.archive(ids, window, cx);
+        let (in_trash, in_inbox) = self.thread_state();
+        if in_trash || !in_inbox {
+            self.move_to_inbox(ids, window, cx);
+        } else {
+            self.archive(ids, window, cx);
+        }
     }
     fn on_trash(&mut self, _: &TrashSelected, window: &mut Window, cx: &mut Context<Self>) {
         let ids = self.selected_message_ids();
