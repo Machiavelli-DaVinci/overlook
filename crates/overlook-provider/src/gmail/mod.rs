@@ -7,6 +7,7 @@
 //! - `provider`: the `MailProvider` implementation.
 
 pub mod api;
+pub mod calendar;
 pub mod mapping;
 pub mod mime;
 pub mod oauth;
@@ -14,4 +15,5 @@ pub mod provider;
 
 pub use api::GmailClient;
 pub use oauth::{AuthorizationRequest, ClientConfig, OAuthTokens, Pkce, UserInfo};
+pub use calendar::GoogleCalendarProvider;
 pub use provider::GmailProvider;

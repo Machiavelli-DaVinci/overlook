@@ -447,6 +447,129 @@ impl Store {
         Ok(out)
     }
 
+    // ---------------------------------------------------------------- calendars
+
+    /// Replaces the account's calendars with the provider's list, keeping the user's
+    /// visibility choices for calendars that still exist.
+    pub fn replace_calendars(&self, account: &AccountId, calendars: &[Calendar]) -> Result<()> {
+        self.with_tx(|tx| {
+            let mut stmt = tx.prepare("SELECT id, visible FROM calendars WHERE account_id=?1")?;
+            let existing: HashMap<String, bool> = stmt
+                .query_map([&account.0], |r| Ok((r.get::<_, String>(0)?, r.get::<_, bool>(1)?)))?
+                .collect::<std::result::Result<_, _>>()?;
+            drop(stmt);
+            for c in calendars {
+                let visible = existing.get(&c.id.0).copied().unwrap_or(c.visible);
+                tx.execute(
+                    "INSERT INTO calendars(id, account_id, provider_id, name, color, is_primary, can_edit, visible, sort_order) VALUES(?1,?2,?3,?4,?5,?6,?7,?8,?9)
+                     ON CONFLICT(id) DO UPDATE SET provider_id=excluded.provider_id, name=excluded.name, color=excluded.color, is_primary=excluded.is_primary,
+                       can_edit=excluded.can_edit, visible=excluded.visible, sort_order=excluded.sort_order",
+                    params![c.id.0, c.account_id.0, c.provider_id.as_ref().map(|p| &p.0), c.name, c.color, c.is_primary, c.can_edit, visible, c.sort_order],
+                )?;
+            }
+            let keep: Vec<&str> = calendars.iter().map(|c| c.id.0.as_str()).collect();
+            for id in existing.keys().filter(|id| !keep.contains(&id.as_str())) {
+                tx.execute("DELETE FROM calendars WHERE id=?1", [id])?;
+            }
+            Ok(())
+        })
+    }
+
+    pub fn calendars(&self, account: &AccountId) -> Result<Vec<Calendar>> {
+        self.with_conn(|c| {
+            let mut stmt = c.prepare("SELECT id, account_id, provider_id, name, color, is_primary, can_edit, visible, sort_order FROM calendars WHERE account_id=?1 ORDER BY is_primary DESC, sort_order, name")?;
+            let rows = stmt.query_map([&account.0], |r| {
+                Ok(Calendar {
+                    id: CalendarId(r.get(0)?),
+                    account_id: AccountId(r.get(1)?),
+                    provider_id: r.get::<_, Option<String>>(2)?.map(ProviderId),
+                    name: r.get(3)?,
+                    color: r.get(4)?,
+                    is_primary: r.get(5)?,
+                    can_edit: r.get(6)?,
+                    visible: r.get(7)?,
+                    sort_order: r.get(8)?,
+                })
+            })?;
+            Ok(rows.collect::<std::result::Result<Vec<_>, _>>()?)
+        })
+    }
+
+    pub fn set_calendar_visible(&self, id: &CalendarId, visible: bool) -> Result<()> {
+        self.with_conn(|c| {
+            c.execute("UPDATE calendars SET visible=?2 WHERE id=?1", params![id.0, visible])?;
+            Ok(())
+        })
+    }
+
+    pub fn upsert_events(&self, events: &[Event]) -> Result<()> {
+        self.with_tx(|tx| {
+            for e in events {
+                upsert_event_tx(tx, e)?;
+            }
+            Ok(())
+        })
+    }
+
+    pub fn delete_events(&self, ids: &[EventId]) -> Result<usize> {
+        self.with_tx(|tx| {
+            let mut n = 0;
+            for id in ids {
+                n += tx.execute("DELETE FROM events WHERE id=?1", [&id.0])?;
+            }
+            Ok(n)
+        })
+    }
+
+    pub fn event(&self, id: &EventId) -> Result<Option<Event>> {
+        self.with_conn(|c| Ok(load_events(c, "WHERE e.id=?1", params![id.0])?.pop()))
+    }
+
+    /// Events of visible calendars overlapping `[from, to)`, cancelled ones excluded, with
+    /// `pending` set for events referenced by queued operations.
+    pub fn events_between(&self, account: &AccountId, from: Timestamp, to: Timestamp) -> Result<Vec<Event>> {
+        let pending: HashSet<EventId> = self
+            .pending_operations(account)?
+            .iter()
+            .filter_map(|op| op.kind.event_id().cloned())
+            .collect();
+        self.with_conn(|c| {
+            let mut events = load_events(
+                c,
+                "JOIN calendars cal ON cal.id = e.calendar_id WHERE e.account_id=?1 AND cal.visible=1 AND e.start < ?3 AND e.end > ?2 AND e.status != 'cancelled'",
+                params![account.0, from, to],
+            )?;
+            for e in &mut events {
+                e.pending = pending.contains(&e.id);
+            }
+            events.sort_by_key(|e| (e.start, e.end));
+            Ok(events)
+        })
+    }
+
+    /// Writes a local event change and its pending operation atomically.
+    pub fn apply_event_change(&self, account: &AccountId, event: &Event, kind: OperationKind) -> Result<PendingOperation> {
+        let ts = now();
+        self.with_tx(|tx| {
+            upsert_event_tx(tx, event)?;
+            insert_operation_tx(tx, account, kind, ts)
+        })
+    }
+
+    /// Removes an event locally and queues its deletion.
+    pub fn delete_event_locally(&self, account: &AccountId, event: &Event) -> Result<PendingOperation> {
+        let ts = now();
+        self.with_tx(|tx| {
+            tx.execute("DELETE FROM events WHERE id=?1", [&event.id.0])?;
+            insert_operation_tx(
+                tx,
+                account,
+                OperationKind::DeleteEvent { event_id: event.id.clone(), calendar_id: event.calendar_id.clone(), provider_id: event.provider_id.clone() },
+                ts,
+            )
+        })
+    }
+
     // -------------------------------------------------------------- attachments
 
     pub fn set_attachment_local_path(&self, id: &AttachmentId, path: Option<&str>) -> Result<()> {
@@ -833,6 +956,99 @@ fn upsert_message_tx(tx: &Connection, m: &Message) -> Result<()> {
         )?;
     }
     Ok(())
+}
+
+fn upsert_event_tx(tx: &Connection, e: &Event) -> Result<()> {
+    tx.execute(
+        "INSERT INTO events(id, account_id, calendar_id, provider_id, ical_uid, summary, description, location, start, end, all_day, status,
+            organizer_json, attendees_json, html_link, conference_url, recurring_event_id, updated, event_type)
+         VALUES(?1,?2,?3,?4,?5,?6,?7,?8,?9,?10,?11,?12,?13,?14,?15,?16,?17,?18,?19)
+         ON CONFLICT(id) DO UPDATE SET calendar_id=excluded.calendar_id, provider_id=excluded.provider_id, ical_uid=excluded.ical_uid,
+            summary=excluded.summary, description=excluded.description, location=excluded.location, start=excluded.start, end=excluded.end,
+            all_day=excluded.all_day, status=excluded.status, organizer_json=excluded.organizer_json, attendees_json=excluded.attendees_json,
+            html_link=excluded.html_link, conference_url=excluded.conference_url, recurring_event_id=excluded.recurring_event_id, updated=excluded.updated,
+            event_type=excluded.event_type",
+        params![
+            e.id.0,
+            e.account_id.0,
+            e.calendar_id.0,
+            e.provider_id.as_ref().map(|p| &p.0),
+            e.ical_uid,
+            e.summary,
+            e.description,
+            e.location,
+            e.start,
+            e.end,
+            e.all_day,
+            serde_json::to_string(&e.status)?.trim_matches('"').to_owned(),
+            e.organizer.as_ref().map(serde_json::to_string).transpose()?,
+            serde_json::to_string(&e.attendees)?,
+            e.html_link,
+            e.conference_url,
+            e.recurring_event_id,
+            e.updated,
+            e.event_type,
+        ],
+    )?;
+    Ok(())
+}
+
+fn load_events(c: &Connection, clause: &str, args: impl rusqlite::Params) -> Result<Vec<Event>> {
+    let sql = format!(
+        "SELECT e.id, e.account_id, e.calendar_id, e.provider_id, e.ical_uid, e.summary, e.description, e.location, e.start, e.end, e.all_day, e.status,
+                e.organizer_json, e.attendees_json, e.html_link, e.conference_url, e.recurring_event_id, e.updated, e.event_type FROM events e {clause}"
+    );
+    let mut stmt = c.prepare(&sql)?;
+    let rows = stmt.query_map(args, |r| {
+        Ok((
+            r.get::<_, String>(0)?,
+            r.get::<_, String>(1)?,
+            r.get::<_, String>(2)?,
+            r.get::<_, Option<String>>(3)?,
+            r.get::<_, Option<String>>(4)?,
+            r.get::<_, String>(5)?,
+            r.get::<_, Option<String>>(6)?,
+            r.get::<_, Option<String>>(7)?,
+            r.get::<_, i64>(8)?,
+            r.get::<_, i64>(9)?,
+            r.get::<_, bool>(10)?,
+            r.get::<_, String>(11)?,
+            r.get::<_, Option<String>>(12)?,
+            r.get::<_, String>(13)?,
+            r.get::<_, Option<String>>(14)?,
+            r.get::<_, Option<String>>(15)?,
+            r.get::<_, Option<String>>(16)?,
+            r.get::<_, i64>(17)?,
+            r.get::<_, Option<String>>(18)?,
+        ))
+    })?;
+    let mut out = Vec::new();
+    for row in rows {
+        let (id, account, calendar, provider, ical, summary, description, location, start, end, all_day, status, organizer, attendees, link, conf, recurring, updated, event_type) = row?;
+        out.push(Event {
+            id: EventId(id),
+            account_id: AccountId(account),
+            calendar_id: CalendarId(calendar),
+            provider_id: provider.map(ProviderId),
+            ical_uid: ical,
+            summary,
+            description,
+            location,
+            start,
+            end,
+            all_day,
+            status: serde_json::from_str(&format!("\"{status}\"")).unwrap_or_default(),
+            organizer: organizer.as_deref().map(serde_json::from_str).transpose()?,
+            attendees: serde_json::from_str(&attendees)?,
+            html_link: link,
+            conference_url: conf,
+            recurring_event_id: recurring,
+            updated,
+            event_type,
+            pending: false,
+        });
+    }
+    Ok(out)
 }
 
 fn search_text(m: &Message) -> String {
@@ -1428,6 +1644,67 @@ mod tests {
         let other = store.conversations(&acct, "jason@example.com", &MailboxView::Kind(LabelKind::Inbox), ListFilter::All, Some(FocusTab::Other)).unwrap();
         assert_eq!(other.len(), 2);
         assert_eq!(store.view_count(&acct, "jason@example.com", &MailboxView::Kind(LabelKind::Inbox), Some(FocusTab::Focused)).unwrap(), 1);
+    }
+
+    #[test]
+    fn calendar_round_trip_and_pending_flags() {
+        let store = Store::open_in_memory().unwrap();
+        seeded(&store);
+        let acct = AccountId::from("acct-1");
+        let cal = Calendar {
+            id: CalendarId::from("acct-1:cal:primary"),
+            account_id: acct.clone(),
+            provider_id: Some(ProviderId::from("primary")),
+            name: "Jason".into(),
+            color: Some("#9fe1e7".into()),
+            is_primary: true,
+            can_edit: true,
+            visible: true,
+            sort_order: 0,
+        };
+        store.replace_calendars(&acct, &[cal.clone()]).unwrap();
+        store.set_calendar_visible(&cal.id, false).unwrap();
+        let mut hidden = cal.clone();
+        hidden.name = "Jason Alexander".into();
+        store.replace_calendars(&acct, &[hidden]).unwrap();
+        assert!(!store.calendars(&acct).unwrap()[0].visible, "visibility survives provider refresh");
+        store.set_calendar_visible(&cal.id, true).unwrap();
+        let event = Event {
+            id: EventId::from("acct-1:cal:primary:e1"),
+            account_id: acct.clone(),
+            calendar_id: cal.id.clone(),
+            provider_id: Some(ProviderId::from("e1")),
+            ical_uid: Some("e1@google.com".into()),
+            summary: "Design review".into(),
+            description: None,
+            location: Some("Room 4".into()),
+            start: 1_000_000,
+            end: 1_000_000 + 3_600_000,
+            all_day: false,
+            status: EventStatus::Confirmed,
+            organizer: Some(Address::named("Maya Chen", "maya@northstar.example")),
+            attendees: vec![Attendee { email: "jason@example.com".into(), name: None, response: ResponseStatus::NeedsAction, is_self: true, is_organizer: false, optional: false }],
+            html_link: None,
+            conference_url: None,
+            recurring_event_id: None,
+            updated: 0,
+            event_type: None,
+            pending: false,
+        };
+        store.upsert_events(&[event.clone()]).unwrap();
+        let found = store.events_between(&acct, 0, 2_000_000).unwrap();
+        assert_eq!(found.len(), 1);
+        assert!(found[0].is_invitation());
+        assert!(store.events_between(&acct, 5_000_000, 6_000_000).unwrap().is_empty());
+        let mut accepted = event.clone();
+        accepted.attendees[0].response = ResponseStatus::Accepted;
+        store.apply_event_change(&acct, &accepted, OperationKind::RespondToEvent { event_id: event.id.clone(), response: ResponseStatus::Accepted }).unwrap();
+        let found = store.events_between(&acct, 0, 2_000_000).unwrap();
+        assert_eq!(found[0].my_response(), Some(ResponseStatus::Accepted));
+        assert!(found[0].pending);
+        store.delete_event_locally(&acct, &event).unwrap();
+        assert!(store.event(&event.id).unwrap().is_none());
+        assert_eq!(store.pending_count(&acct).unwrap(), 2);
     }
 
     #[test]

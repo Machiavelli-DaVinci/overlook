@@ -12,3 +12,4 @@ serde_json = { workspace = true }
 thiserror = { workspace = true }
 uuid = { workspace = true }
 ammonia = { workspace = true }
+jiff = { workspace = true }

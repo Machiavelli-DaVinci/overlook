@@ -37,15 +37,20 @@ Do not assume this session's running processes, scratch profiles, or tool handle
 
 Working end to end against the user's real account: sign-in through the system browser with PKCE and a loopback listener, tokens in the GNOME keyring via `oo7`, 150 recent messages downloaded in persisted batches of 20, incremental sync through the history API, read/star/archive/trash/label through `batchModify`, send through `messages.send` with threading headers and Message-ID reconciliation. Multi-account window with an account menu (switch, add Gmail, sign in again, remove). Gmail quota is tight in a fresh project; the engine spaces requests and enters a **Paused** state with backoff when throttled. Read `llm-docs/overlook-native-app.md` → Gmail. The OAuth client file lives at `~/.config/overlook/google-oauth-client.json` and is not in the repository. **Never send mail from the user's account without an explicit request.**
 
+## Daily-use features (added later on 12 October 2026, at the user's request)
+
+Focused Inbox (local classification with per-sender rules), attachment download/open/save, and Google Calendar (week/day/agenda, invitations with Accept/Tentative/Decline, new event, delete, incremental sync) are implemented and validated against the user's real account: 1,189 event instances downloaded, working-location entries shown in the day header. Calendar was deferred in the product plan; the user explicitly moved it up. See `overlook-native-app.md`.
+
 ## What does not exist yet
 
-- Received-attachment download, inline `cid:` images, progressive download of older history, Gmail batch requests.
+- Inline `cid:` images, progressive download of older mail history, Gmail batch requests.
+- Calendar: editing existing events (only create/delete/respond), reminders and notifications, month view, invitations surfaced inside the mail reader, multiple-calendar colors from Google's palette beyond the background color.
 - Rich-text composition, signatures, HTML output. Received-attachment download. Multi-select, drag-and-drop, undo.
 - A proper table layout in the HTML view; GNOME/KDE/fractional-scaling checks; screen-reader checks; Flatpak build.
 
 ## Recommended next milestone
 
-1. **Daily-use feedback on Gmail** (the user is now reading real mail in Overlook): rendering issues, missing actions, sync correctness. Attachment download is the most visible gap.
+1. **Daily-use feedback** on mail, Focused Inbox, attachments, and calendar (the user is now living in Overlook): rendering issues, missing actions, sync correctness. Event editing and invitation handling inside mail are the most likely next asks.
 2. **HTML fidelity decision.** Run the plan's corpus (newsletters, receipts, tables, inline images, long threads, malformed messages) through the sanitizer + native view. Decide between improving the native renderer (table layout, inline images via `cid:` from the attachment store), or an out-of-process renderer. Record the decision in the foundation plan.
 3. **Deliberate send test** from the user's own address when they ask for it, watching the Sent copy, threading, and the Outbox states.
 4. Keep the previews fresh with `scripts/capture-window.sh`, repackage the brand kit after documentation changes, and extend tests for every reliability gate touched.

@@ -24,6 +24,14 @@ pub enum OperationKind {
     Untrash { message_ids: Vec<MessageId> },
     /// Submit a queued draft. The draft row holds the content.
     SendDraft { draft_id: DraftId },
+    /// Answer an invitation.
+    RespondToEvent { event_id: EventId, response: crate::calendar::ResponseStatus },
+    /// Create an event that exists locally.
+    CreateEvent { event_id: EventId },
+    /// Push local edits of an event.
+    UpdateEvent { event_id: EventId },
+    /// Delete an event (provider id kept so the row can already be gone locally).
+    DeleteEvent { event_id: EventId, calendar_id: CalendarId, provider_id: Option<ProviderId> },
 }
 
 impl OperationKind {
@@ -43,6 +51,24 @@ impl OperationKind {
             OperationKind::Trash { message_ids } => format!("Delete {}", n(message_ids)),
             OperationKind::Untrash { message_ids } => format!("Restore {}", n(message_ids)),
             OperationKind::SendDraft { .. } => "Send message".to_owned(),
+            OperationKind::RespondToEvent { response, .. } => format!("Respond to invitation ({})", response.label()),
+            OperationKind::CreateEvent { .. } => "Create event".to_owned(),
+            OperationKind::UpdateEvent { .. } => "Update event".to_owned(),
+            OperationKind::DeleteEvent { .. } => "Delete event".to_owned(),
+        }
+    }
+
+    pub fn is_calendar(&self) -> bool {
+        matches!(
+            self,
+            OperationKind::RespondToEvent { .. } | OperationKind::CreateEvent { .. } | OperationKind::UpdateEvent { .. } | OperationKind::DeleteEvent { .. }
+        )
+    }
+
+    pub fn event_id(&self) -> Option<&EventId> {
+        match self {
+            OperationKind::RespondToEvent { event_id, .. } | OperationKind::CreateEvent { event_id } | OperationKind::UpdateEvent { event_id } | OperationKind::DeleteEvent { event_id, .. } => Some(event_id),
+            _ => None,
         }
     }
 
@@ -56,7 +82,11 @@ impl OperationKind {
             | OperationKind::Archive { message_ids }
             | OperationKind::Trash { message_ids }
             | OperationKind::Untrash { message_ids } => message_ids,
-            OperationKind::SendDraft { .. } => &[],
+            OperationKind::SendDraft { .. }
+            | OperationKind::RespondToEvent { .. }
+            | OperationKind::CreateEvent { .. }
+            | OperationKind::UpdateEvent { .. }
+            | OperationKind::DeleteEvent { .. } => &[],
         }
     }
 

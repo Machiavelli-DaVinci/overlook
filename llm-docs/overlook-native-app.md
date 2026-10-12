@@ -1,6 +1,6 @@
 # Overlook Native App: Build, Run, Test
 
-Status as of 12 October 2026: foundation milestones 2 to 5 implemented (see the [foundation plan](foundation-implementation-plan.md)). This is a native Rust + GPUI application with a durable local store, a sample provider, and a working Gmail account (sign-in, download, incremental sync, mailbox actions, send).
+Status as of 12 October 2026: foundation milestones 2 to 5 implemented (see the [foundation plan](foundation-implementation-plan.md)), plus the three daily-use features the user asked for: Focused Inbox, attachments, and Google Calendar. This is a native Rust + GPUI application with a durable local store, a sample provider, and working Gmail accounts (sign-in, download, incremental sync, mailbox actions, send).
 
 ## Build and run
 
@@ -22,6 +22,18 @@ OVERLOOK_DATA_DIR=/tmp/overlook-demo cargo run -p overlook
 
 On first launch Overlook seeds a **Sample account** (“Jason Alexander <jason@example.com>”) with the fictional mailbox from the design preview. The account is labelled as a sample everywhere; its connection is simulated and starts **disconnected**.
 
+## Focused Inbox
+
+A local view, not a Gmail feature. `overlook_core::focus::classify_focus` puts a conversation in Focused when the user said so (per-message override or per-sender rule), when the sender is someone the user has written to, or when Gmail marks the mail personal or important; promotions, social, forums, and updates go to Other, as do obvious automated senders when Gmail gives no hint. The Inbox shows Focused/Other tabs with a filter menu; the reader toolbar offers Move to Other/Focused with an "always from this sender" rule. Toggle in the layout menu. Schema v2 stores category, importance, and overrides.
+
+## Attachments
+
+Cards in the reader download on click (Gmail attachments endpoint), open with the system handler, and offer Save as… through a file dialog. Files live under `<data dir>/attachments/<account>/<message>/`. Outgoing attachments are copied into `<data dir>/outgoing/` and sent as MIME parts.
+
+## Calendar
+
+Google Calendar on the same OAuth client, with the `calendar.events` and `calendar.readonly` scopes (added 12 Oct 2026; existing accounts must sign in again, and the calendar banner says so while mail keeps working). Calendars and events live in schema v3/v4 tables; the first download covers 60 days back and a year ahead per visible calendar with `singleEvents=true`, then incremental changes through Google sync tokens (a 410 restarts the window). Week, Day, and Agenda views; event details with Join, Open in Google Calendar, guests and their responses; Accept/Tentative/Decline for invitations (PATCH of the attendee list, `sendUpdates=all`); New event with a client-generated base32hex id so retries never duplicate; delete for events you own. Working-location entries show in the day header, not as events. All calendar writes go through the pending-operation queue and the shared sync engine; calendar failures never block mail.
+
 ## Gmail
 
 1. Create a Google Cloud OAuth client of type **Desktop app** with the Gmail API enabled and the scopes `gmail.modify`, `gmail.send`, `openid`, `userinfo.email` on the consent screen (Testing mode with test users is fine for development; restricted-scope verification is needed for public release).
@@ -39,6 +51,8 @@ Environment switches for development:
 | `OVERLOOK_DATA_DIR` | Profile directory |
 | `OVERLOOK_CONFIG_DIR` | Directory holding `google-oauth-client.json` (default `~/.config/overlook`) |
 | `OVERLOOK_SIGN_IN=gmail` | Start the Google sign-in at launch |
+
+Keyboard additions: `Ctrl 1` Mail, `Ctrl 2` Calendar, `Ctrl Shift A` new event; in the calendar `←`/`→` move by period, `T` today, `D`/`W`/`A` views.
 | `OVERLOOK_SAMPLE_ONLINE=1` | Start the sample connection connected, so queued work syncs at launch |
 | `OVERLOOK_UTC_OFFSET_MINUTES` | Override the local time zone offset used for day groups |
 | `RUST_LOG=overlook=debug` | Tracing output |
@@ -49,7 +63,7 @@ Environment switches for development:
 cargo test --workspace
 ```
 
-43 tests cover: appearance resolution (Follow system is not a third theme), recipient parsing, conversation summaries, reply/forward drafts, HTML sanitization and remote-image blocking, local time formatting, PKCE/OAuth request building, the sample provider, store durability across reopen, atomic change+operation (a failing change leaves no operation), Outbox queue/cancel, send completion, FTS search and coverage, settings, and the sync engine (offline leaves work queued; ordered replay; uncertain send reconciled without duplicates; cancelled send never sent).
+52 tests cover: appearance resolution (Follow system is not a third theme), recipient parsing, conversation summaries, reply/forward drafts, HTML sanitization and remote-image blocking, local time formatting, PKCE/OAuth request building, the sample provider, store durability across reopen, atomic change+operation (a failing change leaves no operation), Outbox queue/cancel, send completion, FTS search and coverage, settings, and the sync engine (offline leaves work queued; ordered replay; uncertain send reconciled without duplicates; cancelled send never sent).
 
 The manual scenario used to validate the shell (keyboard only, with `wtype` on Hyprland):
 

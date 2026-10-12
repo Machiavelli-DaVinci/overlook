@@ -1,5 +1,6 @@
 //! The main mail window: header, sidebar, message list, reader, composer, status bar.
 
+mod calendar;
 mod composer;
 mod list;
 mod reader;
@@ -12,6 +13,7 @@ use crate::{credentials, providers};
 use crate::sync::{run_sync, SyncOutcome};
 use crate::theme::{self, ActivePalette, Palette};
 use crate::SETTING_APPEARANCE;
+pub use calendar::{CalView, Module, NewEvent};
 pub use composer::Composer;
 use gpui_kit::component::button::{Button, ButtonVariants};
 use gpui_kit::component::input::{Input, InputEvent, InputState};
@@ -27,7 +29,6 @@ use gpui_kit::base::{h_flex, v_flex};
 use overlook_core::time::{format_clock, now};
 use overlook_core::*;
 use overlook_provider::sample::SampleProvider;
-use overlook_provider::MailProvider;
 use overlook_store::{ListFilter, MailboxView, Store};
 use std::collections::{BTreeSet, HashMap, HashSet};
 use std::sync::atomic::{AtomicBool, Ordering};
@@ -48,6 +49,15 @@ actions!(
         Forward,
         NextConversation,
         PrevConversation,
+        SwitchToMail,
+        SwitchToCalendar,
+        CalendarPrevious,
+        CalendarNext,
+        CalendarToday,
+        CalendarDay,
+        CalendarWeek,
+        CalendarAgenda,
+        NewEventAction,
         ArchiveSelected,
         TrashSelected,
         ToggleStar,
@@ -59,6 +69,7 @@ actions!(
 
 const WINDOW_CONTEXT: &str = "MailWindow";
 const LIST_CONTEXT: &str = "MessageList";
+const CALENDAR_CONTEXT: &str = "CalendarView";
 
 /// Stored appearance preference, readable from window-level observers.
 pub struct AppearanceGlobal(pub AppearancePreference);
@@ -76,6 +87,15 @@ pub fn init(cx: &mut App) {
         KeyBinding::new("ctrl-f", Forward, Some(WINDOW_CONTEXT)),
         KeyBinding::new("ctrl-u", ToggleRead, Some(WINDOW_CONTEXT)),
         KeyBinding::new("f5", SyncNow, Some(WINDOW_CONTEXT)),
+        KeyBinding::new("ctrl-1", SwitchToMail, Some(WINDOW_CONTEXT)),
+        KeyBinding::new("ctrl-2", SwitchToCalendar, Some(WINDOW_CONTEXT)),
+        KeyBinding::new("ctrl-shift-a", NewEventAction, Some(WINDOW_CONTEXT)),
+        KeyBinding::new("left", CalendarPrevious, Some(CALENDAR_CONTEXT)),
+        KeyBinding::new("right", CalendarNext, Some(CALENDAR_CONTEXT)),
+        KeyBinding::new("t", CalendarToday, Some(CALENDAR_CONTEXT)),
+        KeyBinding::new("d", CalendarDay, Some(CALENDAR_CONTEXT)),
+        KeyBinding::new("w", CalendarWeek, Some(CALENDAR_CONTEXT)),
+        KeyBinding::new("a", CalendarAgenda, Some(CALENDAR_CONTEXT)),
         KeyBinding::new("j", NextConversation, Some(LIST_CONTEXT)),
         KeyBinding::new("down", NextConversation, Some(LIST_CONTEXT)),
         KeyBinding::new("k", PrevConversation, Some(LIST_CONTEXT)),
@@ -124,7 +144,7 @@ pub struct MailWindow {
     store: Arc<Store>,
     sample: SampleProvider,
     accounts: Vec<Account>,
-    providers: HashMap<AccountId, Arc<dyn MailProvider>>,
+    providers: HashMap<AccountId, providers::AccountProviders>,
     /// Why an account has no provider (shown as “Sign-in required”).
     provider_issues: HashMap<AccountId, String>,
     signin: Option<SignIn>,
@@ -164,6 +184,19 @@ pub struct MailWindow {
     /// Attachments being fetched right now.
     downloading: HashSet<AttachmentId>,
     attachments_dir: PathBuf,
+
+    // Calendar module state.
+    pub(crate) module: Module,
+    pub(crate) cal_view: CalView,
+    pub(crate) cal_anchor: i64,
+    pub(crate) cal_events: Vec<Event>,
+    pub(crate) calendars: Vec<Calendar>,
+    pub(crate) cal_selected: Option<EventId>,
+    pub(crate) cal_status: SyncState,
+    pub(crate) cal_scroll: ScrollHandle,
+    pub(crate) cal_scrolled_for: std::cell::Cell<Option<(CalView, i64)>>,
+    pub(crate) cal_focus: FocusHandle,
+    pub(crate) new_event: Option<NewEvent>,
     sidebar_width: f32,
     list_width: f32,
     list_height: f32,
@@ -191,10 +224,10 @@ impl MailWindow {
         cx: &mut Context<Self>,
     ) -> Self {
         let account = accounts.iter().find(|a| a.id == active).cloned().unwrap_or_else(|| accounts[0].clone());
-        let mut providers: HashMap<AccountId, Arc<dyn MailProvider>> = HashMap::new();
+        let mut providers: HashMap<AccountId, providers::AccountProviders> = HashMap::new();
         let mut provider_issues = HashMap::new();
         for a in &accounts {
-            match providers::provider_for(a, &sample) {
+            match providers::providers_for(a, &sample) {
                 Ok(p) => {
                     providers.insert(a.id.clone(), p);
                 }
@@ -266,6 +299,17 @@ impl MailWindow {
             inbox_tab: FocusTab::Focused,
             downloading: HashSet::new(),
             attachments_dir,
+            module: Module::Mail,
+            cal_view: CalView::Week,
+            cal_anchor: overlook_core::tz::day_start(now()),
+            cal_events: Vec::new(),
+            calendars: Vec::new(),
+            cal_selected: None,
+            cal_status: SyncState::Offline,
+            cal_scroll: ScrollHandle::new(),
+            cal_scrolled_for: std::cell::Cell::new(None),
+            cal_focus: cx.focus_handle(),
+            new_event: None,
             sidebar_width,
             list_width,
             list_height,
@@ -386,7 +430,7 @@ impl MailWindow {
         self.accounts = self.store.accounts().unwrap_or_default();
         if self.accounts.is_empty() {
             if let Ok(sample) = crate::seed_sample_account(&self.store) {
-                self.providers.insert(sample.id.clone(), Arc::new(self.sample.clone()));
+                self.providers.insert(sample.id.clone(), providers::AccountProviders { mail: Arc::new(self.sample.clone()), calendar: None });
                 self.accounts.push(sample);
             }
         }
@@ -454,7 +498,11 @@ impl MailWindow {
                 let account = Account {
                     id: AccountId(format!("gmail:{email}")),
                     provider: ProviderKind::Gmail,
-                    display_name: result.user.name.clone().filter(|n| !n.trim().is_empty()).unwrap_or_else(|| email.split('@').next().unwrap_or(&email).to_owned()),
+                    display_name: result.user.name.clone().filter(|n| !n.trim().is_empty()).unwrap_or_else(|| {
+                        let local = email.split('@').next().unwrap_or(&email);
+                        let mut chars = local.chars();
+                        chars.next().map(|c| c.to_uppercase().collect::<String>() + chars.as_str()).unwrap_or_else(|| local.to_owned())
+                    }),
                     email: email.clone(),
                     created_at: now(),
                 };
@@ -469,7 +517,7 @@ impl MailWindow {
             window.push_notification(Notification::error(format!("{e} Overlook cannot keep you signed in without it.")), cx);
             return;
         }
-        match providers::gmail_provider(&account, result.tokens) {
+        match providers::gmail_providers(&account, result.tokens) {
             Ok(p) => {
                 self.providers.insert(account.id.clone(), p);
                 self.provider_issues.remove(&account.id);
@@ -538,6 +586,7 @@ impl MailWindow {
             }
         }
         self.load_thread();
+        self.reload_calendar();
         cx.notify();
     }
 
@@ -677,7 +726,7 @@ impl MailWindow {
             return;
         }
         let Some(message) = self.store.message(&attachment.message_id).ok().flatten() else { return };
-        let Some(provider) = self.providers.get(&self.account.id).cloned() else {
+        let Some(provider) = self.providers.get(&self.account.id).map(|p| p.mail.clone()) else {
             window.push_notification(Notification::warning("Sign in again to download attachments."), cx);
             return;
         };
@@ -993,7 +1042,7 @@ impl MailWindow {
 
     pub(crate) fn sync_account(&mut self, id: AccountId, window: &mut Window, cx: &mut Context<Self>) {
         let Some(account) = self.accounts.iter().find(|a| a.id == id).cloned() else { return };
-        let Some(provider) = self.providers.get(&id).cloned() else {
+        let Some(bundle) = self.providers.get(&id).cloned() else {
             let _ = self.store.set_sync_state(&id, &SyncState::SignInRequired, None);
             self.reload(cx);
             return;
@@ -1008,7 +1057,7 @@ impl MailWindow {
         let first_download = store.message_count(&id).unwrap_or(0) == 0;
         cx.notify();
         cx.spawn_in(window, async move |this, cx| {
-            let outcome: SyncOutcome = cx.background_spawn(run_sync(store, provider, account.clone())).await;
+            let outcome: SyncOutcome = cx.background_spawn(run_sync(store, bundle.mail, bundle.calendar, account.clone())).await;
             let _ = this.update_in(cx, |this, window, cx| {
                 this.syncing.remove(&account.id);
                 match &outcome.state {
@@ -1127,6 +1176,34 @@ impl MailWindow {
     fn on_sync_now(&mut self, _: &SyncNow, window: &mut Window, cx: &mut Context<Self>) {
         self.sync_now(window, cx);
     }
+    fn on_switch_mail(&mut self, _: &SwitchToMail, window: &mut Window, cx: &mut Context<Self>) {
+        self.set_module(Module::Mail, window, cx);
+    }
+    fn on_switch_calendar(&mut self, _: &SwitchToCalendar, window: &mut Window, cx: &mut Context<Self>) {
+        self.set_module(Module::Calendar, window, cx);
+    }
+    fn on_cal_prev(&mut self, _: &CalendarPrevious, _w: &mut Window, cx: &mut Context<Self>) {
+        self.cal_step(-1, cx);
+    }
+    fn on_cal_next(&mut self, _: &CalendarNext, _w: &mut Window, cx: &mut Context<Self>) {
+        self.cal_step(1, cx);
+    }
+    fn on_cal_today(&mut self, _: &CalendarToday, _w: &mut Window, cx: &mut Context<Self>) {
+        self.cal_today(cx);
+    }
+    fn on_cal_day(&mut self, _: &CalendarDay, _w: &mut Window, cx: &mut Context<Self>) {
+        self.set_cal_view(CalView::Day, cx);
+    }
+    fn on_cal_week(&mut self, _: &CalendarWeek, _w: &mut Window, cx: &mut Context<Self>) {
+        self.set_cal_view(CalView::Week, cx);
+    }
+    fn on_cal_agenda(&mut self, _: &CalendarAgenda, _w: &mut Window, cx: &mut Context<Self>) {
+        self.set_cal_view(CalView::Agenda, cx);
+    }
+    fn on_new_event(&mut self, _: &NewEventAction, window: &mut Window, cx: &mut Context<Self>) {
+        self.set_module(Module::Calendar, window, cx);
+        self.start_new_event(window, cx);
+    }
 
     // ---------------------------------------------------------------- header
 
@@ -1165,6 +1242,36 @@ impl MailWindow {
                             .flex_none()
                             .child(img("overlook/icon-128.png").size(px(30.)).rounded(px(8.)))
                             .child(svg().path("overlook/wordmark.svg").h(px(23.)).w(px(64.)).text_color(p.foreground)),
+                    )
+                    .child(
+                        h_flex()
+                            .items_center()
+                            .gap(px(2.))
+                            .p(px(3.))
+                            .rounded(px(8.))
+                            .bg(p.sidebar)
+                            .border_1()
+                            .border_color(p.divider)
+                            .child(
+                                Button::new("module-mail")
+                                    .ghost()
+                                    .small()
+                                    .icon(icon("mail").size(px(15.)))
+                                    .label("Mail")
+                                    .tooltip("Mail (Ctrl 1)")
+                                    .toggled(self.module == Module::Mail)
+                                    .on_click(cx.listener(|this, _, window, cx| this.set_module(Module::Mail, window, cx))),
+                            )
+                            .child(
+                                Button::new("module-calendar")
+                                    .ghost()
+                                    .small()
+                                    .icon(icon("calendar").size(px(15.)))
+                                    .label("Calendar")
+                                    .tooltip("Calendar (Ctrl 2)")
+                                    .toggled(self.module == Module::Calendar)
+                                    .on_click(cx.listener(|this, _, window, cx| this.set_module(Module::Calendar, window, cx))),
+                            ),
                     )
                     .child(
                         div()
@@ -1374,7 +1481,14 @@ impl MailWindow {
 
     // ------------------------------------------------------------------ body
 
-    fn render_body(&self, cx: &mut Context<Self>) -> impl IntoElement {
+    fn render_body(&self, cx: &mut Context<Self>) -> AnyElement {
+        if self.module == Module::Calendar {
+            return h_resizable("main-calendar")
+                .with_state(&self.panes)
+                .child(resizable_panel().size(px(self.sidebar_width)).size_range(px(180.)..px(360.)).child(self.render_calendar_sidebar(cx).into_any_element()))
+                .child(resizable_panel().child(self.render_calendar_main(cx).into_any_element()))
+                .into_any_element();
+        }
         let sidebar = self.render_sidebar(cx).into_any_element();
         let list = self.render_list(cx).into_any_element();
         let reader = self.render_reader(cx).into_any_element();
@@ -1412,6 +1526,7 @@ impl MailWindow {
                     let _ = this.store.set_setting("panes.sidebar", &this.sidebar_width);
                 }
             }))
+            .into_any_element()
     }
 }
 
@@ -1443,6 +1558,15 @@ impl Render for MailWindow {
             .on_action(cx.listener(Self::on_toggle_read))
             .on_action(cx.listener(Self::on_open_selected))
             .on_action(cx.listener(Self::on_sync_now))
+            .on_action(cx.listener(Self::on_switch_mail))
+            .on_action(cx.listener(Self::on_switch_calendar))
+            .on_action(cx.listener(Self::on_cal_prev))
+            .on_action(cx.listener(Self::on_cal_next))
+            .on_action(cx.listener(Self::on_cal_today))
+            .on_action(cx.listener(Self::on_cal_day))
+            .on_action(cx.listener(Self::on_cal_week))
+            .on_action(cx.listener(Self::on_cal_agenda))
+            .on_action(cx.listener(Self::on_new_event))
             .size_full()
             .bg(p.background)
             .text_color(p.foreground)

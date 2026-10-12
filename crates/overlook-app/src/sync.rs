@@ -8,7 +8,7 @@
 
 use overlook_core::time::now;
 use overlook_core::*;
-use overlook_provider::{MailProvider, ProviderError, SendContext, SendOutcome};
+use overlook_provider::{CalendarProvider, MailProvider, ProviderError, SendContext, SendOutcome};
 use overlook_store::Store;
 use std::sync::Arc;
 use tracing::{info, warn};
@@ -16,6 +16,7 @@ use tracing::{info, warn};
 #[derive(Debug, Default, Clone)]
 pub struct SyncOutcome {
     pub state: Option<SyncState>,
+    pub calendar_changes: usize,
     /// The provider asked us to slow down; the caller should wait longer before retrying.
     pub rate_limited: bool,
     pub applied: usize,
@@ -24,6 +25,81 @@ pub struct SyncOutcome {
     pub uncertain: Vec<String>,
     pub failed: Vec<String>,
     pub stopped_offline: bool,
+}
+
+pub const CALENDAR_SIGNIN_WORDING: &str = "Sign in again to connect your calendar. Mail keeps working meanwhile.";
+
+pub fn calendar_status_key(account: &AccountId) -> String {
+    format!("cal_status:{}", account.0)
+}
+
+pub fn calendar_status(store: &Store, account: &AccountId) -> SyncState {
+    store.setting::<SyncState>(&calendar_status_key(account)).ok().flatten().unwrap_or(SyncState::Offline)
+}
+
+fn set_calendar_status(store: &Store, account: &AccountId, state: &SyncState) {
+    let _ = store.set_setting(&calendar_status_key(account), state);
+}
+
+fn calendar_token_key(calendar: &CalendarId) -> String {
+    format!("cal_sync:{}", calendar.0)
+}
+
+/// Downloads calendars and events. Errors are recorded in the calendar status only; they
+/// never block mail.
+fn sync_calendar(store: &Store, provider: &dyn CalendarProvider, account: &Account, outcome: &mut SyncOutcome) {
+    let acct = &account.id;
+    if !provider.has_calendar_access() {
+        set_calendar_status(store, acct, &SyncState::SignInRequired);
+        return;
+    }
+    set_calendar_status(store, acct, &SyncState::Syncing);
+    let calendars = match pollster_block(provider.list_calendars(account)) {
+        Ok(c) => c,
+        Err(e) => {
+            set_calendar_status(store, acct, &state_for(&e));
+            return;
+        }
+    };
+    if let Err(e) = store.replace_calendars(acct, &calendars) {
+        set_calendar_status(store, acct, &SyncState::SyncFailed(e.to_string()));
+        return;
+    }
+    // Bumped when the event mapping gains fields: existing sync tokens are dropped once so
+    // the window is downloaded again with the new fields.
+    const CALENDAR_COVERAGE: u32 = 2;
+    let coverage_key = format!("cal_coverage:{}", acct.0);
+    let refresh = store.setting::<u32>(&coverage_key).ok().flatten().unwrap_or(1) < CALENDAR_COVERAGE;
+    let calendars = store.calendars(acct).unwrap_or_default();
+    for calendar in calendars.iter().filter(|c| c.visible) {
+        let key = calendar_token_key(&calendar.id);
+        let token = if refresh { None } else { store.setting::<String>(&key).ok().flatten() };
+        let changes = match pollster_block(provider.fetch_events(account, calendar, token.as_deref())) {
+            Ok(c) => c,
+            Err(ProviderError::CheckpointExpired) => match pollster_block(provider.fetch_events(account, calendar, None)) {
+                Ok(c) => c,
+                Err(e) => {
+                    set_calendar_status(store, acct, &state_for(&e));
+                    return;
+                }
+            },
+            Err(e) => {
+                set_calendar_status(store, acct, &state_for(&e));
+                return;
+            }
+        };
+        let _ = store.delete_events(&changes.deleted);
+        if let Err(e) = store.upsert_events(&changes.upserts) {
+            set_calendar_status(store, acct, &SyncState::SyncFailed(e.to_string()));
+            return;
+        }
+        outcome.calendar_changes += changes.upserts.len() + changes.deleted.len();
+        if let Some(t) = changes.next_sync_token {
+            let _ = store.set_setting(&key, &t);
+        }
+    }
+    let _ = store.set_setting(&coverage_key, &CALENDAR_COVERAGE);
+    set_calendar_status(store, acct, &SyncState::UpToDate);
 }
 
 pub const RATE_LIMIT_WORDING: &str = "Waiting for Gmail: it is limiting requests. Downloading continues in a moment.";
@@ -170,7 +246,7 @@ fn download(store: &Store, provider: &dyn MailProvider, account: &Account, outco
     }
 }
 
-pub async fn run_sync(store: Arc<Store>, provider: Arc<dyn MailProvider>, account: Account) -> SyncOutcome {
+pub async fn run_sync(store: Arc<Store>, provider: Arc<dyn MailProvider>, calendar: Option<Arc<dyn CalendarProvider>>, account: Account) -> SyncOutcome {
     let mut outcome = SyncOutcome::default();
     let acct = account.id.clone();
 
@@ -193,8 +269,13 @@ pub async fn run_sync(store: Arc<Store>, provider: Arc<dyn MailProvider>, accoun
         return outcome;
     }
 
+    if let Some(cal) = &calendar {
+        sync_calendar(&store, cal.as_ref(), &account, &mut outcome);
+    }
+
     let labels = store.labels(&acct).unwrap_or_default();
     let sent_label = labels.iter().find(|l| l.kind == LabelKind::Sent).map(|l| l.id.clone());
+    let calendars = store.calendars(&acct).unwrap_or_default();
     let ops = match store.pending_operations(&acct) {
         Ok(ops) => ops,
         Err(e) => {
@@ -269,6 +350,51 @@ pub async fn run_sync(store: Arc<Store>, provider: Arc<dyn MailProvider>, accoun
                     Err(err) => {
                         let _ = store.set_operation_state(&op.id, OperationState::Pending, Some(&err.to_string()));
                         let _ = store.set_draft_state(&draft.id, &DraftState::Queued);
+                        final_state = state_for(&err);
+                        outcome.stopped_offline = matches!(err, ProviderError::Offline);
+                        outcome.rate_limited = matches!(err, ProviderError::RateLimited(_));
+                        break;
+                    }
+                }
+            }
+            kind if kind.is_calendar() => {
+                let Some(cal) = calendar.as_ref().filter(|c| c.has_calendar_access()) else {
+                    let _ = store.set_operation_state(&op.id, OperationState::Pending, Some("calendar access needed"));
+                    set_calendar_status(&store, &acct, &SyncState::SignInRequired);
+                    continue;
+                };
+                let event = kind.event_id().and_then(|id| store.event(id).ok().flatten());
+                let find_calendar = |id: &CalendarId| calendars.iter().find(|c| &c.id == id).cloned();
+                let result: Result<(), ProviderError> = match kind {
+                    OperationKind::RespondToEvent { response, .. } => match event.as_ref().and_then(|e| find_calendar(&e.calendar_id).map(|c| (e, c))) {
+                        Some((e, c)) => cal.respond(&account, &c, e, *response).await,
+                        None => Ok(()),
+                    },
+                    OperationKind::CreateEvent { .. } => match event.as_ref().and_then(|e| find_calendar(&e.calendar_id).map(|c| (e, c))) {
+                        Some((e, c)) => cal.create_event(&account, &c, e).await.and_then(|created| store.upsert_events(&[created]).map_err(|e| ProviderError::Temporary(e.to_string()))),
+                        None => Ok(()),
+                    },
+                    OperationKind::UpdateEvent { .. } => match event.as_ref().and_then(|e| find_calendar(&e.calendar_id).map(|c| (e, c))) {
+                        Some((e, c)) => cal.update_event(&account, &c, e).await.and_then(|updated| store.upsert_events(&[updated]).map_err(|e| ProviderError::Temporary(e.to_string()))),
+                        None => Ok(()),
+                    },
+                    OperationKind::DeleteEvent { calendar_id, provider_id, .. } => match (find_calendar(calendar_id), provider_id) {
+                        (Some(c), Some(pid)) => cal.delete_event(&account, &c, pid).await,
+                        _ => Ok(()),
+                    },
+                    _ => Ok(()),
+                };
+                match result {
+                    Ok(()) => {
+                        let _ = store.set_operation_state(&op.id, OperationState::Applied, None);
+                        outcome.applied += 1;
+                    }
+                    Err(ProviderError::Rejected(reason)) => {
+                        let _ = store.set_operation_state(&op.id, OperationState::Failed, Some(&reason));
+                        outcome.failed.push(kind.describe());
+                    }
+                    Err(err) => {
+                        let _ = store.set_operation_state(&op.id, OperationState::Pending, Some(&err.to_string()));
                         final_state = state_for(&err);
                         outcome.stopped_offline = matches!(err, ProviderError::Offline);
                         outcome.rate_limited = matches!(err, ProviderError::RateLimited(_));
@@ -377,7 +503,7 @@ mod tests {
         let first = store.messages_for_account(&account.id).unwrap()[0].id.clone();
         store.apply_change(&account.id, overlook_store::LocalChange::SetStarred { message_ids: vec![first], starred: true }).unwrap();
         queued_draft(&store, &account);
-        let outcome = block_on(run_sync(store.clone(), arc(&provider), account.clone()));
+        let outcome = block_on(run_sync(store.clone(), arc(&provider), None, account.clone()));
         assert!(outcome.stopped_offline);
         assert_eq!(store.pending_count(&account.id).unwrap(), 2);
         assert_eq!(store.account_status(&account.id).unwrap().state, SyncState::Offline);
@@ -397,7 +523,7 @@ mod tests {
         store.upsert_account(&account).unwrap();
         let provider = SampleProvider::new().with_latency(Duration::ZERO);
         provider.set_online(true);
-        let outcome = block_on(run_sync(store.clone(), arc(&provider), account.clone()));
+        let outcome = block_on(run_sync(store.clone(), arc(&provider), None, account.clone()));
         assert!(outcome.downloaded > 0);
         assert!(store.message_count(&account.id).unwrap() > 0);
         assert_eq!(store.checkpoint(&account.id).unwrap().as_deref(), Some("sample-1"));
@@ -412,7 +538,7 @@ mod tests {
         let draft = queued_draft(&store, &account);
         store.apply_change(&account.id, overlook_store::LocalChange::Archive { message_ids: vec![first] }).unwrap();
         provider.set_online(true);
-        let outcome = block_on(run_sync(store.clone(), arc(&provider), account.clone()));
+        let outcome = block_on(run_sync(store.clone(), arc(&provider), None, account.clone()));
         assert_eq!(outcome.applied, 3);
         assert_eq!(outcome.sent, vec!["Agenda".to_owned()]);
         assert_eq!(store.pending_count(&account.id).unwrap(), 0);
@@ -429,12 +555,12 @@ mod tests {
         let draft = queued_draft(&store, &account);
         provider.set_online(true);
         provider.drop_next_send();
-        let outcome = block_on(run_sync(store.clone(), arc(&provider), account.clone()));
+        let outcome = block_on(run_sync(store.clone(), arc(&provider), None, account.clone()));
         assert_eq!(outcome.uncertain, vec!["Agenda".to_owned()]);
         assert_eq!(store.draft(&draft.id).unwrap().unwrap().state, DraftState::Uncertain);
         assert_eq!(store.pending_operations(&account.id).unwrap()[0].state, OperationState::Uncertain);
 
-        let outcome = block_on(run_sync(store.clone(), arc(&provider), account.clone()));
+        let outcome = block_on(run_sync(store.clone(), arc(&provider), None, account.clone()));
         assert_eq!(outcome.sent, vec!["Agenda".to_owned()]);
         assert!(store.draft(&draft.id).unwrap().is_none());
         let sent: Vec<_> = store
@@ -453,7 +579,7 @@ mod tests {
         let draft = queued_draft(&store, &account);
         store.cancel_send(&draft.id).unwrap();
         provider.set_online(true);
-        let outcome = block_on(run_sync(store.clone(), arc(&provider), account.clone()));
+        let outcome = block_on(run_sync(store.clone(), arc(&provider), None, account.clone()));
         assert!(outcome.sent.is_empty());
         assert_eq!(store.drafts(&account.id, false).unwrap().len(), 1);
     }

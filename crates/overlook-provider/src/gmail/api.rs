@@ -10,6 +10,8 @@ pub const API_BASE: &str = "https://gmail.googleapis.com/gmail/v1/users/me";
 #[derive(Debug, Clone, PartialEq, Eq)]
 pub enum ApiError {
     NotFound,
+    /// 410: the sync token or resource is gone; start over.
+    Gone,
     Unauthorized,
     RateLimited(String),
     Server(String),
@@ -24,7 +26,8 @@ impl From<ApiError> for ProviderError {
             ApiError::Unauthorized => ProviderError::SignInRequired,
             ApiError::RateLimited(m) => ProviderError::RateLimited(m),
             ApiError::Server(m) => ProviderError::Temporary(m),
-            ApiError::NotFound => ProviderError::Rejected("not found at Gmail".into()),
+            ApiError::NotFound => ProviderError::Rejected("not found at Google".into()),
+            ApiError::Gone => ProviderError::CheckpointExpired,
             ApiError::Client(code, m) => ProviderError::Rejected(format!("Gmail returned {code}: {m}")),
         }
     }
@@ -102,21 +105,61 @@ impl GmailClient {
     }
 
     pub fn get(&self, path: &str, query: &[(&str, &str)]) -> Result<serde_json::Value, ApiError> {
+        self.get_url(&Self::url(path, query))
+    }
+
+    pub fn post(&self, path: &str, body: &serde_json::Value) -> Result<serde_json::Value, ApiError> {
+        self.post_url(&Self::url(path, &[]), body)
+    }
+
+    /// Whether the stored grant covers calendar access.
+    pub fn has_scope(&self, marker: &str) -> bool {
+        self.tokens().scope.as_deref().is_some_and(|s| s.contains(marker))
+    }
+
+    pub fn query_string(query: &[(&str, &str)]) -> String {
+        if query.is_empty() {
+            return String::new();
+        }
+        format!("?{}", query.iter().map(|(k, v)| format!("{k}={}", url_encode(v))).collect::<Vec<_>>().join("&"))
+    }
+
+    pub fn get_url(&self, url: &str) -> Result<serde_json::Value, ApiError> {
         self.with_retry(|token| {
             self.agent
-                .get(&Self::url(path, query))
+                .get(url)
                 .header("Authorization", &format!("Bearer {token}"))
                 .call()
                 .map_err(|e| ApiError::Transport(e.to_string()))
         })
     }
 
-    pub fn post(&self, path: &str, body: &serde_json::Value) -> Result<serde_json::Value, ApiError> {
+    pub fn post_url(&self, url: &str, body: &serde_json::Value) -> Result<serde_json::Value, ApiError> {
         self.with_retry(|token| {
             self.agent
-                .post(&Self::url(path, &[]))
+                .post(url)
                 .header("Authorization", &format!("Bearer {token}"))
                 .send_json(body)
+                .map_err(|e| ApiError::Transport(e.to_string()))
+        })
+    }
+
+    pub fn patch_url(&self, url: &str, body: &serde_json::Value) -> Result<serde_json::Value, ApiError> {
+        self.with_retry(|token| {
+            self.agent
+                .patch(url)
+                .header("Authorization", &format!("Bearer {token}"))
+                .send_json(body)
+                .map_err(|e| ApiError::Transport(e.to_string()))
+        })
+    }
+
+    pub fn delete_url(&self, url: &str) -> Result<serde_json::Value, ApiError> {
+        self.with_retry(|token| {
+            self.agent
+                .delete(url)
+                .header("Authorization", &format!("Bearer {token}"))
+                .call()
                 .map_err(|e| ApiError::Transport(e.to_string()))
         })
     }
@@ -145,11 +188,15 @@ impl GmailClient {
                 }
                 401 => return Err(ApiError::Unauthorized),
                 404 => return Err(ApiError::NotFound),
+                410 => return Err(ApiError::Gone),
                 403 | 429 => {
                     let message = api_message(&text);
                     let lower = message.to_ascii_lowercase();
                     if status == 429 || lower.contains("ratelimit") || lower.contains("quota") || lower.contains("rate limit") {
                         return Err(ApiError::RateLimited(message));
+                    }
+                    if lower.contains("insufficient") && lower.contains("scope") {
+                        return Err(ApiError::Unauthorized);
                     }
                     return Err(ApiError::Client(status, message));
                 }

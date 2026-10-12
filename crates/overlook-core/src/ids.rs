@@ -77,6 +77,14 @@ id_type!(
     /// Local identifier of a pending operation.
     OperationId
 );
+id_type!(
+    /// Local identifier of a calendar.
+    CalendarId
+);
+id_type!(
+    /// Local identifier of a calendar event (an expanded instance for recurring events).
+    EventId
+);
 
 /// An identifier assigned by the remote provider. Kept distinct from local ids on purpose.
 #[derive(Clone, Debug, PartialEq, Eq, Hash, Serialize, Deserialize)]

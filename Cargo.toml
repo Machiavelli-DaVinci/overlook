@@ -25,6 +25,7 @@ anyhow = "1"
 uuid = { version = "1", features = ["v4"] }
 rusqlite = { version = "0.40", features = ["bundled", "serde_json"] }
 ammonia = "4"
+jiff = "0.2"
 tracing = "0.1"
 tracing-subscriber = { version = "0.3", features = ["env-filter"] }
 directories = "6"

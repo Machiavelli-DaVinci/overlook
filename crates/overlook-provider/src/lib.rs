@@ -5,8 +5,11 @@
 //! touch the store directly, which keeps "what we asked for" and "what the server has"
 //! separate.
 
+pub mod calendar;
 pub mod gmail;
 pub mod sample;
+
+pub use calendar::{CalendarProvider, EventChanges};
 
 use overlook_core::*;
 use std::future::Future;

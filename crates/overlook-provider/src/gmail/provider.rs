@@ -292,6 +292,8 @@ impl MailProvider for GmailProvider {
                     }
                 }
                 OperationKind::SendDraft { .. } => return Err(ProviderError::Rejected("sends go through send()".into())),
+                kind if kind.is_calendar() => return Err(ProviderError::Rejected("calendar operations go through the calendar provider".into())),
+                _ => {}
             }
             Ok(())
         })

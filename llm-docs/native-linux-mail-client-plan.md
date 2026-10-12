@@ -134,6 +134,6 @@ POP3 offers a simpler retrieval model with fewer synchronized mailbox capabiliti
 - **Usability:** complete reading, replying, searching, filing, and attachment workflows entirely by keyboard; verify scaling and screen-reader behavior.
 - **Theming:** visually verify every core screen and interaction state in Light and Dark on Omarchy/Hyprland, GNOME, and KDE. Check text and focus contrast, HTML email readability, system preference fallback, persisted overrides, and switching with an open draft. Theme changes must preserve draft content and outgoing message formatting.
 
-Keep calendar, contact synchronization, tasks, Exchange-specific features, PST import, and advanced rules outside these three phases. Basic recipient autocomplete from previous correspondents belongs in phase 1.
+Keep contact synchronization, tasks, Exchange-specific features, PST import, and advanced rules outside these three phases. Basic recipient autocomplete from previous correspondents belongs in phase 1. **Scope change, 12 October 2026:** the user moved calendaring (Google Calendar read, respond, create, delete) and Focused Inbox into phase 1 for daily use; see the native app guide.
 
 The first milestone should be **a polished native inbox, reader, and composer prototype with a small working Gmail connection**. That gives us something concrete to judge for beauty, familiarity, responsiveness, and feasibility before committing months to the full synchronization engine.

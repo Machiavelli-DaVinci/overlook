@@ -2,7 +2,7 @@
 
 use rusqlite::Connection;
 
-const MIGRATIONS: &[&str] = &[V1, V2];
+const MIGRATIONS: &[&str] = &[V1, V2, V3, V4];
 
 pub fn migrate(conn: &Connection) -> rusqlite::Result<()> {
     let current: i64 = conn.query_row("PRAGMA user_version", [], |r| r.get(0))?;
@@ -166,5 +166,49 @@ CREATE TABLE focus_rules (
     focused INTEGER NOT NULL,
     PRIMARY KEY (account_id, email)
 );
+COMMIT;
+"#;
+
+const V3: &str = r#"
+BEGIN;
+CREATE TABLE calendars (
+    id TEXT PRIMARY KEY,
+    account_id TEXT NOT NULL REFERENCES accounts(id) ON DELETE CASCADE,
+    provider_id TEXT,
+    name TEXT NOT NULL,
+    color TEXT,
+    is_primary INTEGER NOT NULL DEFAULT 0,
+    can_edit INTEGER NOT NULL DEFAULT 0,
+    visible INTEGER NOT NULL DEFAULT 1,
+    sort_order INTEGER NOT NULL DEFAULT 0
+);
+CREATE TABLE events (
+    id TEXT PRIMARY KEY,
+    account_id TEXT NOT NULL REFERENCES accounts(id) ON DELETE CASCADE,
+    calendar_id TEXT NOT NULL REFERENCES calendars(id) ON DELETE CASCADE,
+    provider_id TEXT,
+    ical_uid TEXT,
+    summary TEXT NOT NULL,
+    description TEXT,
+    location TEXT,
+    start INTEGER NOT NULL,
+    end INTEGER NOT NULL,
+    all_day INTEGER NOT NULL DEFAULT 0,
+    status TEXT NOT NULL,
+    organizer_json TEXT,
+    attendees_json TEXT NOT NULL,
+    html_link TEXT,
+    conference_url TEXT,
+    recurring_event_id TEXT,
+    updated INTEGER NOT NULL
+);
+CREATE INDEX events_range ON events(account_id, start, end);
+CREATE UNIQUE INDEX events_provider ON events(calendar_id, provider_id) WHERE provider_id IS NOT NULL;
+COMMIT;
+"#;
+
+const V4: &str = r#"
+BEGIN;
+ALTER TABLE events ADD COLUMN event_type TEXT;
 COMMIT;
 "#;
