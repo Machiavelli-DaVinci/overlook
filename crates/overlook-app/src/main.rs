@@ -77,6 +77,16 @@ fn open_store() -> anyhow::Result<(Arc<Store>, Vec<Account>)> {
 }
 
 fn main() {
+    // Plain command-line conveniences; anything else starts the app.
+    let args: Vec<String> = std::env::args().skip(1).collect();
+    if args.iter().any(|a| a == "--version" || a == "-V") {
+        println!("overlook {}", env!("CARGO_PKG_VERSION"));
+        return;
+    }
+    if args.iter().any(|a| a == "--help" || a == "-h") {
+        println!("Overlook {} — a clear view of what matters.\n\nUsage: overlook [--version] [--help]\n\nEnvironment:\n  OVERLOOK_DATA_DIR      profile directory (default ~/.local/share/overlook)\n  OVERLOOK_CONFIG_DIR    directory holding google-oauth-client.json (default ~/.config/overlook)\n  OVERLOOK_SIGN_IN=gmail start the Google sign-in at launch\n  RUST_LOG=overlook=debug tracing output", env!("CARGO_PKG_VERSION"));
+        return;
+    }
     tracing_subscriber::fmt()
         .with_env_filter(tracing_subscriber::EnvFilter::from_default_env().add_directive("overlook=info".parse().unwrap()))
         .init();
