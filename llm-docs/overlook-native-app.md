@@ -34,6 +34,18 @@ Cards in the reader download on click (Gmail attachments endpoint), open with th
 
 Google Calendar on the same OAuth client, with the `calendar.events` and `calendar.readonly` scopes (added 12 Oct 2026; existing accounts must sign in again, and the calendar banner says so while mail keeps working). Calendars and events live in schema v3/v4 tables; the first download covers 60 days back and a year ahead per visible calendar with `singleEvents=true`, then incremental changes through Google sync tokens (a 410 restarts the window). Week, Day, and Agenda views; event details with Join, Open in Google Calendar, guests and their responses; Accept/Tentative/Decline for invitations (PATCH of the attendee list, `sendUpdates=all`); New event with a client-generated base32hex id so retries never duplicate; delete for events you own. Working-location entries show in the day header, not as events. Month view shows up to three events per day with "+N more"; a day number opens Day view. Events you own can be edited (title, date, times, all-day, location, description) and deleted. Reminders: Google's popup offsets per event or the calendar default, falling back to 10 minutes when Google reports none; due reminders raise a desktop notification (freedesktop, via `notify-rust`) and an in-app toast, checked every 30 s, once per event and offset per session; toggle "Event reminders" in the layout menu. Event-specific Google colors (`colorId`) override the calendar color. Mail messages carrying a `text/calendar` part show an invitation card in the reader with the event's time and location, Accept/Tentative/Decline wired to the same response path, and "Show in calendar"; cancellations are labelled. All calendar writes go through the pending-operation queue and the shared sync engine; calendar failures never block mail.
 
+## Settings
+
+`Ctrl ,` or the gear in the header opens a Settings dialog (an overlay with a page list). Every control writes immediately and is applied without restart. Preferences live in `overlook_core::prefs` (`Prefs` per profile under the `prefs` setting, `AccountPrefs` per account under `account_prefs:<id>`).
+
+- **Accounts**: account list, add Gmail, your name (the sender name on outgoing mail), status with Sign in again / Sync now, **signature** (plain text) with "include in new messages" and "include in replies and forwards" toggles, remove account from this device.
+- **General**: theme, density, reading pane, start-up module (Mail / Calendar / last used), 12/24-hour clock, week start, new-mail notifications (off / Focused only / all), event reminders, sync interval (30 s to 15 min).
+- **Mail**: Focused Inbox, sender pictures, preview text, mark as read (when selected / after 3 s / never), remote images (block / always show), default reply (reply / reply all), quote original in replies, attachment save folder, Inbox messages to download (100 / 300 / 1,000; changing it re-lists the mailboxes and queues what is missing).
+- **Calendar**: working hours (shaded outside in Day/Week), default event length, default reminder, show declined events, event reminders.
+- **About**: version, links, data locations, keyboard reference.
+
+Signatures are appended with a blank line when composing, and above the quoted original in replies. Not yet: multiple signatures per account, automatic replies (needs the `gmail.settings.basic` scope), rules and sweep, and rich-text signatures.
+
 ## Gmail
 
 1. Create a Google Cloud OAuth client of type **Desktop app** with the Gmail API enabled and the scopes `gmail.modify`, `gmail.send`, `openid`, `userinfo.email` on the consent screen (Testing mode with test users is fine for development; restricted-scope verification is needed for public release).
@@ -63,7 +75,7 @@ Keyboard additions: `Ctrl 1` Mail, `Ctrl 2` Calendar, `Ctrl Shift A` new event; 
 cargo test --workspace
 ```
 
-55 tests cover: appearance resolution (Follow system is not a third theme), recipient parsing, conversation summaries, reply/forward drafts, HTML sanitization and remote-image blocking, local time formatting, PKCE/OAuth request building, the sample provider, store durability across reopen, atomic change+operation (a failing change leaves no operation), Outbox queue/cancel, send completion, FTS search and coverage, settings, and the sync engine (offline leaves work queued; ordered replay; uncertain send reconciled without duplicates; cancelled send never sent).
+57 tests cover: appearance resolution (Follow system is not a third theme), recipient parsing, conversation summaries, reply/forward drafts, HTML sanitization and remote-image blocking, local time formatting, PKCE/OAuth request building, the sample provider, store durability across reopen, atomic change+operation (a failing change leaves no operation), Outbox queue/cancel, send completion, FTS search and coverage, settings, and the sync engine (offline leaves work queued; ordered replay; uncertain send reconciled without duplicates; cancelled send never sent).
 
 The manual scenario used to validate the shell (keyboard only, with `wtype` on Hyprland):
 

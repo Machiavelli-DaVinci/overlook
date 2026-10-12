@@ -3,6 +3,7 @@
 mod calendar;
 mod composer;
 mod list;
+mod settings;
 mod reader;
 mod sidebar;
 mod widgets;
@@ -15,6 +16,7 @@ use crate::theme::{self, ActivePalette, Palette};
 use crate::SETTING_APPEARANCE;
 pub use calendar::{CalView, Module, NewEvent};
 pub use composer::Composer;
+pub use settings::{SettingsPage, SettingsState};
 use gpui_kit::component::button::{Button, ButtonVariants};
 use gpui_kit::component::input::{Input, InputEvent, InputState};
 use gpui_kit::component::menu::{DropdownMenu, PopupMenuItem};
@@ -59,6 +61,7 @@ actions!(
         CalendarAgenda,
         CalendarMonth,
         NewEventAction,
+        OpenSettings,
         ArchiveSelected,
         TrashSelected,
         ToggleStar,
@@ -91,6 +94,7 @@ pub fn init(cx: &mut App) {
         KeyBinding::new("ctrl-1", SwitchToMail, Some(WINDOW_CONTEXT)),
         KeyBinding::new("ctrl-2", SwitchToCalendar, Some(WINDOW_CONTEXT)),
         KeyBinding::new("ctrl-shift-a", NewEventAction, Some(WINDOW_CONTEXT)),
+        KeyBinding::new("ctrl-,", OpenSettings, Some(WINDOW_CONTEXT)),
         KeyBinding::new("left", CalendarPrevious, Some(CALENDAR_CONTEXT)),
         KeyBinding::new("right", CalendarNext, Some(CALENDAR_CONTEXT)),
         KeyBinding::new("t", CalendarToday, Some(CALENDAR_CONTEXT)),
@@ -235,6 +239,12 @@ pub struct MailWindow {
     pub(crate) reminders_enabled: bool,
     /// Reminders already shown this session: (event, minutes before).
     pub(crate) notified: HashSet<(EventId, i32)>,
+    pub(crate) prefs: Prefs,
+    pub(crate) account_prefs: HashMap<AccountId, AccountPrefs>,
+    pub(crate) settings: Option<SettingsState>,
+    /// Generation counter for delayed mark-as-read timers.
+    mark_read_generation: u64,
+    last_sync_tick: i64,
     sidebar_width: f32,
     list_width: f32,
     list_height: f32,
@@ -295,7 +305,21 @@ impl MailWindow {
         let sidebar_width = store.setting::<f32>("panes.sidebar").ok().flatten().unwrap_or(232.);
         let collapsed_sections: HashSet<String> = store.setting::<Vec<String>>("sidebar.collapsed").ok().flatten().unwrap_or_default().into_iter().collect();
         let focused_enabled = store.setting::<bool>("focused_inbox").ok().flatten().unwrap_or(true);
-        let reminders_enabled = store.setting::<bool>("reminders").ok().flatten().unwrap_or(true);
+        let prefs: Prefs = store.setting::<Prefs>("prefs").ok().flatten().unwrap_or_default();
+        let reminders_enabled = prefs.event_reminders;
+        overlook_core::tz::set_clock_24h(prefs.clock_24h);
+        let account_prefs: HashMap<AccountId, AccountPrefs> = accounts
+            .iter()
+            .map(|a| (a.id.clone(), store.setting::<AccountPrefs>(&format!("account_prefs:{}", a.id.0)).ok().flatten().unwrap_or_default()))
+            .collect();
+        let startup_module = match prefs.startup_module {
+            StartupModule::Mail => Module::Mail,
+            StartupModule::Calendar => Module::Calendar,
+            StartupModule::LastUsed => match store.setting::<String>("last_module").ok().flatten().as_deref() {
+                Some("calendar") => Module::Calendar,
+                _ => Module::Mail,
+            },
+        };
         let attachments_dir = crate::data_dir().join("attachments");
         let list_width = store.setting::<f32>("panes.list").ok().flatten().unwrap_or(340.);
         let list_height = store.setting::<f32>("panes.list_height").ok().flatten().unwrap_or(300.);
@@ -338,7 +362,7 @@ impl MailWindow {
             inbox_tab: FocusTab::Focused,
             downloading: HashSet::new(),
             attachments_dir,
-            module: Module::Mail,
+            module: startup_module,
             cal_view: CalView::Week,
             cal_anchor: overlook_core::tz::day_start(now()),
             cal_events: Vec::new(),
@@ -351,6 +375,11 @@ impl MailWindow {
             new_event: None,
             reminders_enabled,
             notified: HashSet::new(),
+            prefs,
+            account_prefs,
+            settings: None,
+            mark_read_generation: 0,
+            last_sync_tick: now(),
             sidebar_width,
             list_width,
             list_height,
@@ -389,10 +418,16 @@ impl MailWindow {
 
         // Periodic synchronization while accounts are reachable, and reminder checks.
         cx.spawn_in(window, async move |this, cx| loop {
-            cx.background_executor().timer(Duration::from_secs(30)).await;
+            cx.background_executor().timer(Duration::from_secs(15)).await;
             let alive = this.update_in(cx, |this, window, cx| {
-                this.sync_all(window, cx);
+                // Reminders are checked every tick; mail/calendar sync follows the preference.
                 this.check_reminders(window, cx);
+                let interval = u64::from(this.prefs.sync_interval_secs.max(15));
+                let due = now() - this.last_sync_tick >= (interval as i64) * 1000;
+                if due {
+                    this.last_sync_tick = now();
+                    this.sync_all(window, cx);
+                }
             });
             if alive.is_err() {
                 break;
@@ -742,8 +777,13 @@ impl MailWindow {
     }
 
     pub(crate) fn save_attachment(&mut self, attachment: Attachment, window: &mut Window, cx: &mut Context<Self>) {
-        let downloads = directories::UserDirs::new()
-            .and_then(|u| u.download_dir().map(|p| p.to_path_buf()))
+        let downloads = self
+            .prefs
+            .attachments_dir
+            .as_deref()
+            .map(|d| PathBuf::from(shellexpand_home(d)))
+            .filter(|d| d.is_dir())
+            .or_else(|| directories::UserDirs::new().and_then(|u| u.download_dir().map(|p| p.to_path_buf())))
             .unwrap_or_else(|| PathBuf::from("."));
         let receiver = cx.prompt_for_new_path(&downloads, Some(&attachment.filename));
         cx.spawn_in(window, async move |this, cx| {
@@ -864,7 +904,25 @@ impl MailWindow {
         // Reading marks the conversation read: a local change with its pending operation.
         let unread: Vec<MessageId> = self.thread.iter().filter(|m| !m.is_read).map(|m| m.id.clone()).collect();
         if !unread.is_empty() {
-            self.apply_local(overlook_store::LocalChange::SetRead { message_ids: unread, read: true }, window, cx);
+            match self.prefs.mark_as_read {
+                MarkAsRead::WhenSelected => self.apply_local(overlook_store::LocalChange::SetRead { message_ids: unread, read: true }, window, cx),
+                MarkAsRead::AfterDelay => {
+                    self.mark_read_generation += 1;
+                    let generation = self.mark_read_generation;
+                    let selected = self.selected.clone();
+                    let delay = u64::from(self.prefs.mark_as_read_delay_secs.max(1));
+                    cx.spawn_in(window, async move |this, cx| {
+                        cx.background_executor().timer(Duration::from_secs(delay)).await;
+                        let _ = this.update_in(cx, |this, window, cx| {
+                            if this.mark_read_generation == generation && this.selected == selected {
+                                this.apply_local(overlook_store::LocalChange::SetRead { message_ids: unread.clone(), read: true }, window, cx);
+                            }
+                        });
+                    })
+                    .detach();
+                }
+                MarkAsRead::Never => {}
+            }
         }
         self.list_focus.focus(window, cx);
         cx.notify();
@@ -1056,14 +1114,26 @@ impl MailWindow {
     // --------------------------------------------------------------- compose
 
     pub(crate) fn compose_new(&mut self, window: &mut Window, cx: &mut Context<Self>) {
-        let draft = Draft::new(self.account.id.clone(), DraftKind::New, now());
+        let mut draft = Draft::new(self.account.id.clone(), DraftKind::New, now());
+        draft.body_text = self.account_prefs_for(&self.account.id).signature_block(false);
         self.outbox_selected = None;
         self.open_composer(draft, window, cx);
     }
 
+    /// Reply or reply-all according to the "default reply" preference.
+    pub(crate) fn reply_default(&mut self, window: &mut Window, cx: &mut Context<Self>) {
+        let kind = if self.prefs.reply_all_by_default { DraftKind::ReplyAll } else { DraftKind::Reply };
+        self.reply(kind, window, cx);
+    }
+
     pub(crate) fn reply(&mut self, kind: DraftKind, window: &mut Window, cx: &mut Context<Self>) {
         let Some(source) = self.thread.iter().max_by_key(|m| m.date).cloned() else { return };
-        let draft = Draft::in_response_to(self.account.id.clone(), kind, &source, &self.owner(), now());
+        let mut draft = Draft::in_response_to_with(self.account.id.clone(), kind, &source, &self.owner(), now(), self.prefs.quote_on_reply);
+        let signature = self.account_prefs_for(&self.account.id).signature_block(true);
+        if !signature.is_empty() {
+            // Signature sits above the quoted original, Outlook style.
+            draft.body_text = format!("{signature}{}", draft.body_text);
+        }
         if let Err(e) = self.store.save_draft(&draft) {
             window.push_notification(Notification::error(format!("Couldn’t start the draft: {e}")), cx);
             return;
@@ -1254,7 +1324,9 @@ impl MailWindow {
         });
     }
     fn on_escape(&mut self, _: &Escape, window: &mut Window, cx: &mut Context<Self>) {
-        if self.composer.is_some() {
+        if self.settings.is_some() {
+            self.close_settings(window, cx);
+        } else if self.composer.is_some() {
             self.close_composer(window, cx);
         } else if !self.search_query.is_empty() {
             let input = self.search_input.clone();
@@ -1271,7 +1343,28 @@ impl MailWindow {
         }
     }
     fn on_reply(&mut self, _: &Reply, window: &mut Window, cx: &mut Context<Self>) {
-        self.reply(DraftKind::Reply, window, cx);
+        self.reply_default(window, cx);
+    }
+    fn on_open_settings(&mut self, _: &OpenSettings, window: &mut Window, cx: &mut Context<Self>) {
+        if self.settings.is_some() {
+            self.close_settings(window, cx);
+        } else {
+            self.open_settings(SettingsPage::General, window, cx);
+        }
+    }
+
+    /// Rebuilds Gmail providers so a new download size applies, and re-lists the mailboxes.
+    pub(crate) fn rebuild_providers_for_download_size(&mut self, window: &mut Window, cx: &mut Context<Self>) {
+        crate::set_inbox_limit(self.prefs.inbox_messages as usize);
+        let accounts = self.accounts.clone();
+        for a in accounts.iter().filter(|a| a.provider == ProviderKind::Gmail) {
+            if let Ok(bundle) = providers::providers_for(a, &self.sample) {
+                self.providers.insert(a.id.clone(), bundle);
+            }
+            // Drop the coverage marker so the next sync lists the mailboxes again.
+            let _ = self.store.set_setting(&format!("download_coverage:{}", a.id.0), &0u32);
+        }
+        self.sync_all(window, cx);
     }
     fn on_reply_all(&mut self, _: &ReplyAll, window: &mut Window, cx: &mut Context<Self>) {
         self.reply(DraftKind::ReplyAll, window, cx);
@@ -1508,6 +1601,13 @@ impl MailWindow {
                                     }))
                             }),
                     )
+                    .child(
+                        Button::new("open-settings")
+                            .ghost()
+                            .icon(icon("settings").size(px(17.)))
+                            .tooltip("Settings (Ctrl ,)")
+                            .on_click(cx.listener(|this, _, window, cx| this.open_settings(SettingsPage::General, window, cx))),
+                    )
                     .child(owner_avatar(&owner, 29., &p).ml(px(6.)).mr(px(8.))),
             )
     }
@@ -1695,6 +1795,16 @@ impl MailWindow {
     }
 }
 
+/// Expands a leading `~` to the home directory.
+fn shellexpand_home(path: &str) -> String {
+    if let Some(rest) = path.strip_prefix("~/") {
+        if let Some(home) = std::env::var_os("HOME") {
+            return format!("{}/{rest}", home.to_string_lossy());
+        }
+    }
+    path.to_owned()
+}
+
 /// The app icon drawn from vectors: midnight rounded tile, ivory horizon mark, amber beacon.
 /// Crisp at any scale, unlike a downscaled bitmap.
 fn brand_tile(size: f32) -> impl IntoElement {
@@ -1756,14 +1866,17 @@ impl Render for MailWindow {
             .on_action(cx.listener(Self::on_cal_agenda))
             .on_action(cx.listener(Self::on_cal_month))
             .on_action(cx.listener(Self::on_new_event))
+            .on_action(cx.listener(Self::on_open_settings))
             .size_full()
             .bg(p.background)
             .text_color(p.foreground)
             .font_family("Inter")
             .text_size(px(13.))
+            .relative()
             .child(self.render_header(cx))
             .children(self.render_banner(cx))
             .child(div().flex_1().min_h_0().child(self.render_body(cx)))
             .child(self.render_status_bar(cx))
+            .when(self.settings.is_some(), |d| d.child(self.render_settings(cx)))
     }
 }

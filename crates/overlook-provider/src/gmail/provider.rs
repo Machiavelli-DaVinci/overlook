@@ -29,11 +29,19 @@ pub const INITIAL_VIEWS: &[(&str, usize)] = &[
 pub struct GmailProvider {
     client: Arc<GmailClient>,
     initial_messages: usize,
+    inbox_limit: usize,
 }
 
 impl GmailProvider {
     pub fn new(client: Arc<GmailClient>) -> Self {
-        Self { client, initial_messages: INITIAL_MESSAGES }
+        Self { client, initial_messages: INITIAL_MESSAGES, inbox_limit: 100 }
+    }
+
+    /// Newest Inbox messages to list on first download; other views scale with it.
+    pub fn with_inbox_limit(mut self, inbox_limit: usize) -> Self {
+        self.inbox_limit = inbox_limit.max(20);
+        self.initial_messages = self.initial_messages.max(inbox_limit * 2);
+        self
     }
 
     pub fn client(&self) -> &Arc<GmailClient> {
@@ -94,8 +102,10 @@ impl GmailProvider {
     fn list_initial_ids(&self) -> Result<Vec<String>, ApiError> {
         let mut seen = BTreeSet::new();
         let mut ids = Vec::new();
+        let scale = self.inbox_limit as f32 / 100.;
         for (search, limit) in INITIAL_VIEWS {
-            for id in self.list_ids(search, *limit)? {
+            let limit = ((*limit as f32) * scale).round().max(10.) as usize;
+            for id in self.list_ids(search, limit)? {
                 if seen.insert(id.clone()) {
                     ids.push(id);
                 }
@@ -169,7 +179,7 @@ impl MailProvider for GmailProvider {
             let checkpoint = profile.get("historyId").and_then(|h| h.as_str().map(str::to_owned).or_else(|| h.as_u64().map(|n| n.to_string())));
             let labels = self.labels(&account)?;
             let mut ids = self.list_initial_ids()?;
-            ids.truncate(self.initial_messages.max(ids.len().min(260)));
+            ids.truncate(self.initial_messages.max(ids.len().min(self.inbox_limit * 3)));
             info!("gmail: {} recent messages queued for download", ids.len());
             Ok(MailboxSnapshot {
                 labels,

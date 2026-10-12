@@ -41,6 +41,10 @@ Working end to end against the user's real account: sign-in through the system b
 
 Focused Inbox (local classification with per-sender rules), attachment download/open/save, and Google Calendar (week/day/month/agenda, invitations with Accept/Tentative/Decline in the calendar and inside the mail reader, new/edit/delete event, reminders with desktop notifications, event colors, incremental sync) are implemented and validated against the user's real account: 1,189 event instances downloaded, working-location entries shown in the day header. Calendar was deferred in the product plan; the user explicitly moved it up. See `overlook-native-app.md`.
 
+## Settings (added later on 12 October 2026)
+
+A Settings dialog (`Ctrl ,`) with Accounts (signatures, sender name, status, remove), General, Mail, Calendar, and About pages; see `overlook-native-app.md` → Settings. Preferences are typed in `overlook_core::prefs` and every control changes real behaviour. Not built: multiple signatures, automatic replies, rules/sweep.
+
 ## What does not exist yet
 
 - Inline `cid:` images, progressive download of older mail history, Gmail batch requests.

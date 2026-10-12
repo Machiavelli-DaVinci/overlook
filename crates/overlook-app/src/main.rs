@@ -21,6 +21,17 @@ use std::sync::Arc;
 use tracing::info;
 
 pub const APP_ID: &str = "ai.lastrefuge.Overlook";
+
+static INBOX_LIMIT: std::sync::atomic::AtomicUsize = std::sync::atomic::AtomicUsize::new(100);
+
+/// Inbox download size from preferences; set at start-up and whenever it changes.
+pub fn store_prefs_inbox_limit() -> usize {
+    INBOX_LIMIT.load(std::sync::atomic::Ordering::Relaxed)
+}
+
+pub fn set_inbox_limit(limit: usize) {
+    INBOX_LIMIT.store(limit, std::sync::atomic::Ordering::Relaxed);
+}
 pub const SETTING_APPEARANCE: &str = "appearance";
 
 fn data_dir() -> PathBuf {
@@ -92,6 +103,10 @@ fn main() {
             tracing::warn!("bundled fonts could not be loaded: {e}");
         }
 
+        if let Ok(Some(prefs)) = store.setting::<overlook_core::Prefs>("prefs") {
+            set_inbox_limit(prefs.inbox_messages as usize);
+            overlook_core::tz::set_clock_24h(prefs.clock_24h);
+        }
         let preference: AppearancePreference = store
             .setting(SETTING_APPEARANCE)
             .ok()

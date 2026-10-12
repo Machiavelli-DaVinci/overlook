@@ -543,6 +543,19 @@ impl Draft {
         owner: &Address,
         now: Timestamp,
     ) -> Self {
+        Self::in_response_to_with(account_id, kind, source, owner, now, true)
+    }
+
+    /// Like [`Draft::in_response_to`]; `quote` controls whether replies carry the quoted
+    /// original (forwards always include it).
+    pub fn in_response_to_with(
+        account_id: AccountId,
+        kind: DraftKind,
+        source: &Message,
+        owner: &Address,
+        now: Timestamp,
+        quote: bool,
+    ) -> Self {
         let mut draft = Self::new(account_id, kind, now);
         draft.conversation_id = Some(source.conversation_id.clone());
         draft.in_reply_to = Some(source.id.clone());
@@ -569,11 +582,15 @@ impl Draft {
                         }
                     }
                 }
-                draft.body_text = format!(
-                    "\n\n{}\n{}",
-                    quote_header(source),
-                    quote_text(source.body.text.as_deref().unwrap_or(&source.snippet))
-                );
+                draft.body_text = if quote {
+                    format!(
+                        "\n\n{}\n{}",
+                        quote_header(source),
+                        quote_text(source.body.text.as_deref().unwrap_or(&source.snippet))
+                    )
+                } else {
+                    "\n\n".to_owned()
+                };
             }
             DraftKind::Forward => {
                 draft.subject = format!("Fwd: {base_subject}");

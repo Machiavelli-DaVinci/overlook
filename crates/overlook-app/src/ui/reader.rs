@@ -266,7 +266,7 @@ impl MailWindow {
                             .cursor_text()
                             .child(icon("corner-up-left").size(px(16.)).text_color(p.muted))
                             .child(format!("Reply to {who}…"))
-                            .on_click(cx.listener(|this, _, window, cx| this.reply(DraftKind::Reply, window, cx))),
+                            .on_click(cx.listener(|this, _, window, cx| this.reply_default(window, cx))),
                     )
                     .child(
                         h_flex()
@@ -353,7 +353,7 @@ impl MailWindow {
         let p = *cx.palette();
         let who = if m.is_outgoing { Address::named("You", &self.account.email) } else { m.from.clone() };
         let owner = self.owner();
-        let allow_remote = self.remote_allowed.contains(&m.id);
+        let allow_remote = self.remote_allowed.contains(&m.id) || self.prefs.remote_images == RemoteImages::Allow;
         let policy = if allow_remote { RemoteContent::Allowed } else { RemoteContent::Blocked };
         let html = match (&m.body.html, &m.body.text) {
             (Some(h), _) => h.clone(),

@@ -83,8 +83,11 @@ pub const WEEKDAYS: [&str; 7] = [
     "Saturday",
 ];
 
-/// Formats a clock time as `10:42 AM`.
+/// Formats a clock time as `10:42 AM` (or `10:42` in 24-hour mode).
 pub fn format_clock(t: CivilTime) -> String {
+    if crate::tz::clock_24h() {
+        return format!("{:02}:{:02}", t.hour, t.minute);
+    }
     let (h12, suffix) = match t.hour {
         0 => (12, "AM"),
         1..=11 => (t.hour, "AM"),

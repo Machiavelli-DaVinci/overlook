@@ -276,7 +276,7 @@ impl MailWindow {
                         .bg(p.accent),
                 )
             })
-            .when(!compact, |d| d.child(avatar(&who, 30., &p).mt(px(1.))))
+            .when(!compact && self.prefs.show_avatars, |d| d.child(avatar(&who, 30., &p).mt(px(1.))))
             .child(
                 v_flex()
                     .flex_1()
@@ -323,7 +323,7 @@ impl MailWindow {
                             .text_color(p.foreground)
                             .child(c.subject.clone()),
                     )
-                    .when(!compact, |d| {
+                    .when(!compact && self.prefs.show_previews, |d| {
                         d.child(
                             div()
                                 .truncate()

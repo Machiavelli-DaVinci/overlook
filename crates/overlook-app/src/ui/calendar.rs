@@ -70,11 +70,11 @@ impl MailWindow {
         match self.cal_view {
             CalView::Day => (self.cal_anchor, tz::add_days(self.cal_anchor, 1)),
             CalView::Week => {
-                let start = tz::week_start(self.cal_anchor, true);
+                let start = tz::week_start(self.cal_anchor, self.prefs.week_starts_monday);
                 (start, tz::add_days(start, 7))
             }
             CalView::Month => {
-                let start = tz::week_start(tz::month_start(self.cal_anchor), true);
+                let start = tz::week_start(tz::month_start(self.cal_anchor), self.prefs.week_starts_monday);
                 (start, tz::add_days(start, 42))
             }
             CalView::Agenda => (self.cal_anchor, tz::add_days(self.cal_anchor, AGENDA_DAYS)),
@@ -85,6 +85,9 @@ impl MailWindow {
         self.calendars = self.store.calendars(&self.account.id).unwrap_or_default();
         let (from, to) = self.cal_range();
         self.cal_events = self.store.events_between(&self.account.id, from, to).unwrap_or_default();
+        if !self.prefs.show_declined_events {
+            self.cal_events.retain(|e| e.my_response() != Some(ResponseStatus::Declined));
+        }
         self.cal_status = crate::sync::calendar_status(&self.store, &self.account.id);
         if let Some(sel) = &self.cal_selected {
             if self.store.event(sel).ok().flatten().is_none() {
@@ -98,6 +101,7 @@ impl MailWindow {
             return;
         }
         self.module = module;
+        let _ = self.store.set_setting("last_module", &if module == Module::Calendar { "calendar" } else { "mail" });
         match module {
             Module::Calendar => {
                 self.reload_calendar();
@@ -180,7 +184,8 @@ impl MailWindow {
                 }
                 // Google reports no default for some calendars; 10 minutes is Google's own
                 // default and close to Outlook's 15, and reminders can be switched off.
-                let defaults: Vec<i32> = calendars.iter().find(|c| c.id == event.calendar_id).map(|c| c.default_reminders.clone()).filter(|d| !d.is_empty()).unwrap_or_else(|| vec![10]);
+                let fallback = self.prefs.default_reminder_minutes as i32;
+                let defaults: Vec<i32> = calendars.iter().find(|c| c.id == event.calendar_id).map(|c| c.default_reminders.clone()).filter(|d| !d.is_empty()).unwrap_or_else(|| if fallback > 0 { vec![fallback] } else { Vec::new() });
                 let offsets: Vec<i32> = event.effective_reminders(&defaults).to_vec();
                 for minutes in offsets {
                     let fire_at = event.start - i64::from(minutes) * 60_000;
@@ -271,8 +276,10 @@ impl MailWindow {
         };
         let end_hour = {
             let z = tz::zoned(now());
-            let h = (z.hour() as i32 + 2).min(23);
-            format!("{}:00 {}", if h % 12 == 0 { 12 } else { h % 12 }, if h < 12 { "AM" } else { "PM" })
+            let start_minutes = ((z.hour() as i32 + 1).min(23)) * 60;
+            let end_minutes = (start_minutes + self.prefs.default_event_minutes as i32).min(23 * 60 + 59);
+            let (h, m) = (end_minutes / 60, end_minutes % 60);
+            format!("{}:{:02} {}", if h % 12 == 0 { 12 } else { h % 12 }, m, if h < 12 { "AM" } else { "PM" })
         };
         let title = cx.new(|cx| InputState::new(window, cx).placeholder("Add a title"));
         let date = cx.new(|cx| InputState::new(window, cx).placeholder("YYYY-MM-DD").default_value(date_text));
@@ -673,6 +680,13 @@ impl MailWindow {
             let timed: Vec<&Event> = self.cal_events.iter().filter(|e| !e.all_day && e.end - e.start < 86_400_000 && e.overlaps(d, next)).collect();
             let lanes = assign_lanes(&timed);
             let mut col = div().flex_1().min_w_0().relative().h(px(24. * HOUR_PX)).border_l_1().border_color(p.divider);
+            let (ws, we) = (self.prefs.work_start_hour.min(24) as f32, self.prefs.work_end_hour.min(24) as f32);
+            if ws > 0. {
+                col = col.child(div().absolute().top_0().left_0().right_0().h(px(ws * HOUR_PX)).bg(p.background));
+            }
+            if we < 24. {
+                col = col.child(div().absolute().top(px(we * HOUR_PX)).left_0().right_0().h(px((24. - we) * HOUR_PX)).bg(p.background));
+            }
             for h in 0..24 {
                 col = col.child(div().absolute().top(px(h as f32 * HOUR_PX)).left_0().right_0().h(px(1.)).bg(p.divider));
             }
@@ -794,7 +808,8 @@ impl MailWindow {
         let p = *cx.palette();
         let today = tz::day_start(now());
         let month = tz::local_date(self.cal_anchor).month();
-        let header = h_flex().border_b_1().border_color(p.divider).children(["Mon", "Tue", "Wed", "Thu", "Fri", "Sat", "Sun"].iter().map(|d| {
+        let names: [&str; 7] = if self.prefs.week_starts_monday { ["Mon", "Tue", "Wed", "Thu", "Fri", "Sat", "Sun"] } else { ["Sun", "Mon", "Tue", "Wed", "Thu", "Fri", "Sat"] };
+        let header = h_flex().border_b_1().border_color(p.divider).children(names.iter().map(|d| {
             div().flex_1().py(px(6.)).text_size(px(11.)).font_weight(FontWeight::MEDIUM).text_color(p.muted).child(div().px(px(8.)).child(d.to_uppercase()))
         }));
         let mut rows = v_flex().flex_1().min_h_0();
@@ -964,7 +979,8 @@ impl MailWindow {
         let id = e.id.clone();
         let can_edit = calendar.is_some_and(|c| e.editable_by(&self.account.email, c));
         let can_delete = can_edit;
-        let defaults: Vec<i32> = calendar.map(|c| c.default_reminders.clone()).filter(|d| !d.is_empty()).unwrap_or_else(|| vec![10]);
+        let fallback = self.prefs.default_reminder_minutes as i32;
+        let defaults: Vec<i32> = calendar.map(|c| c.default_reminders.clone()).filter(|d| !d.is_empty()).unwrap_or_else(|| if fallback > 0 { vec![fallback] } else { Vec::new() });
         let reminders: Vec<i32> = e.effective_reminders(&defaults).to_vec();
         let reminder_text = if reminders.is_empty() || e.all_day {
             None

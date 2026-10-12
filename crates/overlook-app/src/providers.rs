@@ -33,8 +33,9 @@ pub fn gmail_providers(account: &Account, tokens: OAuthTokens) -> Result<Account
             }
         }),
     ));
+    let inbox_limit = crate::store_prefs_inbox_limit();
     Ok(AccountProviders {
-        mail: Arc::new(GmailProvider::new(client.clone())),
+        mail: Arc::new(GmailProvider::new(client.clone()).with_inbox_limit(inbox_limit)),
         calendar: Some(Arc::new(GoogleCalendarProvider::new(client))),
     })
 }

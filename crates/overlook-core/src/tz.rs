@@ -73,9 +73,23 @@ pub fn minutes_into_day(ts: Timestamp) -> i32 {
     i32::from(z.hour()) * 60 + i32::from(z.minute())
 }
 
+static CLOCK_24H: std::sync::atomic::AtomicBool = std::sync::atomic::AtomicBool::new(false);
+
+/// Switches every clock rendering between 12-hour and 24-hour.
+pub fn set_clock_24h(enabled: bool) {
+    CLOCK_24H.store(enabled, std::sync::atomic::Ordering::Relaxed);
+}
+
+pub fn clock_24h() -> bool {
+    CLOCK_24H.load(std::sync::atomic::Ordering::Relaxed)
+}
+
 pub fn format_clock(ts: Timestamp) -> String {
     let z = zoned(ts);
     let (h, m) = (z.hour(), z.minute());
+    if clock_24h() {
+        return format!("{h:02}:{m:02}");
+    }
     let (h12, suffix) = match h {
         0 => (12, "AM"),
         1..=11 => (h, "AM"),
