@@ -132,6 +132,8 @@ impl Nav {
 pub enum AfterDownload {
     Open,
     SaveTo(PathBuf),
+    /// An inline image: the reader picks it up on the next render.
+    Inline,
 }
 
 /// A conversation being dragged from the list onto the sidebar.
@@ -233,6 +235,10 @@ pub struct MailWindow {
     thread: Vec<Message>,
     expanded: BTreeSet<MessageId>,
     remote_allowed: BTreeSet<MessageId>,
+    /// Messages whose quoted history is expanded.
+    pub(crate) quotes_shown: BTreeSet<MessageId>,
+    /// Inline images already encoded as `data:` URLs, by attachment.
+    pub(crate) inline_images: std::cell::RefCell<HashMap<AttachmentId, Option<String>>>,
 
     composer: Option<Composer>,
     appearance: AppearancePreference,
@@ -379,6 +385,8 @@ impl MailWindow {
             thread: Vec::new(),
             expanded: BTreeSet::new(),
             remote_allowed: BTreeSet::new(),
+            quotes_shown: BTreeSet::new(),
+            inline_images: std::cell::RefCell::new(HashMap::new()),
             composer: None,
             appearance,
             density,
@@ -871,6 +879,22 @@ impl MailWindow {
         };
     }
 
+    /// Downloads the inline images of the open conversation that are not cached yet.
+    fn fetch_inline_images(&mut self, window: &mut Window, cx: &mut Context<Self>) {
+        const INLINE_LIMIT: u64 = 4 * 1024 * 1024;
+        let wanted: Vec<Attachment> = self
+            .thread
+            .iter()
+            .filter(|m| m.body.html.as_deref().is_some_and(|h| h.contains("cid:")))
+            .flat_map(|m| m.attachments.iter().cloned())
+            .filter(|a| a.is_inline_image() && a.size_bytes <= INLINE_LIMIT && a.provider_id.is_some())
+            .filter(|a| !a.local_path.as_deref().map(PathBuf::from).is_some_and(|p| p.exists()))
+            .collect();
+        for att in wanted {
+            self.download_attachment(att, AfterDownload::Inline, window, cx);
+        }
+    }
+
     fn search_results(&self) -> Vec<ConversationSummary> {
         let acct = &self.account.id;
         let hits = self.store.search(acct, &self.search_query).unwrap_or_default();
@@ -1023,6 +1047,7 @@ impl MailWindow {
                         match after {
                             AfterDownload::Open => cx.open_with_system(&path),
                             AfterDownload::SaveTo(target) => this.finish_save(&path, &target, window, cx),
+                            AfterDownload::Inline => {}
                         }
                     }
                     Err(e) => window.push_notification(Notification::error(format!("Couldn’t download {}: {e}", attachment.filename)), cx),
@@ -1085,6 +1110,7 @@ impl MailWindow {
         self.expanded.clear();
         self.selected = id;
         self.load_thread();
+        self.fetch_inline_images(window, cx);
         // Reading marks the conversation read: a local change with its pending operation.
         let unread: Vec<MessageId> = self.thread.iter().filter(|m| !m.is_read).map(|m| m.id.clone()).collect();
         if !unread.is_empty() {

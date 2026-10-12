@@ -249,6 +249,16 @@ fn download(store: &Store, provider: &dyn MailProvider, account: &Account, outco
                     }
                     let _ = store.set_setting(&invite_key, &true);
                 }
+                // One-time: re-fetch messages with cid: images stored before Content-ID was kept.
+                let inline_key = format!("inline_cids_parsed:{}", acct.0);
+                if store.setting::<bool>(&inline_key).ok().flatten() != Some(true) {
+                    let ids = store.messages_needing_inline_parse(acct).unwrap_or_default();
+                    if !ids.is_empty() {
+                        enqueue(store, acct, ids, false);
+                        drain_backlog(store, provider, account, outcome)?;
+                    }
+                    let _ = store.set_setting(&inline_key, &true);
+                }
                 Ok(outcome.downloaded)
             }
             Err(ProviderError::CheckpointExpired) => {

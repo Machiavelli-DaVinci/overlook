@@ -163,6 +163,17 @@ pub fn message_from_json(account: &Account, v: &Value, labels: &HashMap<String, 
     })
 }
 
+/// A MIME header of one part of the payload.
+fn part_header(part: &Value, name: &str) -> Option<String> {
+    part.get("headers")?
+        .as_array()?
+        .iter()
+        .find(|h| h.get("name").and_then(|n| n.as_str()).is_some_and(|n| n.eq_ignore_ascii_case(name)))
+        .and_then(|h| h.get("value"))
+        .and_then(|v| v.as_str())
+        .map(str::to_owned)
+}
+
 fn collect_parts(part: &Value, text: &mut Option<String>, html: &mut Option<String>, calendar: &mut Option<String>, attachments: &mut Vec<Attachment>, message_id: &MessageId) {
     let mime = part.get("mimeType").and_then(|m| m.as_str()).unwrap_or("");
     let filename = part.get("filename").and_then(|f| f.as_str()).unwrap_or("");
@@ -172,17 +183,25 @@ fn collect_parts(part: &Value, text: &mut Option<String>, html: &mut Option<Stri
             *calendar = Some(String::from_utf8_lossy(&base64url_decode(data)).into_owned());
         }
     }
-    if !filename.is_empty() {
+    let attachment_id = body.and_then(|b| b.get("attachmentId")).and_then(|a| a.as_str());
+    let content_id = part_header(part, "Content-ID").map(|v| v.trim().trim_start_matches('<').trim_end_matches('>').to_owned()).filter(|v| !v.is_empty());
+    if !filename.is_empty() || (content_id.is_some() && attachment_id.is_some()) {
         let size = body.and_then(|b| b.get("size")).and_then(|s| s.as_u64()).unwrap_or(0);
-        let attachment_id = body.and_then(|b| b.get("attachmentId")).and_then(|a| a.as_str());
+        let filename = if filename.is_empty() {
+            let ext = mime.split('/').nth(1).map(|e| e.split(';').next().unwrap_or(e)).unwrap_or("bin");
+            format!("inline-{}.{}", attachments.len() + 1, ext)
+        } else {
+            filename.to_owned()
+        };
         attachments.push(Attachment {
             id: AttachmentId(format!("{}:att-{}", message_id.0, attachments.len())),
             message_id: message_id.clone(),
-            filename: filename.to_owned(),
+            filename,
             mime_type: mime.to_owned(),
             size_bytes: size,
             local_path: None,
             provider_id: attachment_id.map(|a| ProviderId(a.to_owned())),
+            content_id,
         });
     } else if let Some(data) = body.and_then(|b| b.get("data")).and_then(|d| d.as_str()) {
         let decoded = String::from_utf8_lossy(&base64url_decode(data)).into_owned();
@@ -364,6 +383,26 @@ mod tests {
         assert_eq!(gmail_id(&account().id, m.id.as_str()).as_deref(), Some("18f1"));
         let promo = serde_json::json!({"id": "p1", "threadId": "p1", "labelIds": ["INBOX", "CATEGORY_PROMOTIONS"]});
         assert_eq!(message_from_json(&account(), &promo, &HashMap::new()).unwrap().category.as_deref(), Some("promotions"));
+    }
+
+    #[test]
+    fn inline_images_keep_their_content_id() {
+        let part = serde_json::json!({
+            "mimeType": "multipart/related",
+            "parts": [
+                {"mimeType": "text/html", "body": {"data": base64url_encode(b"<img src=\"cid:logo@x\">")}},
+                {"mimeType": "image/png", "filename": "", "headers": [{"name": "Content-ID", "value": "<logo@x>"}, {"name": "Content-Disposition", "value": "inline"}], "body": {"attachmentId": "ATT9", "size": 512}}
+            ]
+        });
+        let mut text = None;
+        let mut html = None;
+        let mut cal = None;
+        let mut atts = Vec::new();
+        collect_parts(&part, &mut text, &mut html, &mut cal, &mut atts, &MessageId("m1".into()));
+        assert_eq!(atts.len(), 1);
+        assert_eq!(atts[0].content_id.as_deref(), Some("logo@x"));
+        assert_eq!(atts[0].filename, "inline-1.png");
+        assert!(atts[0].is_inline_image());
     }
 
     #[test]

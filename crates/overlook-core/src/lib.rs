@@ -14,6 +14,7 @@ pub mod ids;
 pub mod model;
 pub mod ops;
 pub mod prefs;
+pub mod prepass;
 pub mod sanitize;
 pub mod status;
 pub mod time;

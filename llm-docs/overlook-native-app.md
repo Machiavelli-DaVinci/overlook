@@ -57,6 +57,37 @@ Google Calendar on the same OAuth client, with the `calendar.events` and `calend
 
 Signatures are appended with a blank line when composing, and above the quoted original in replies. Not yet: multiple signatures per account, automatic replies (needs the `gmail.settings.basic` scope), rules and sweep, and rich-text signatures.
 
+## Rendering
+
+Received HTML goes through three stages before the native view sees it, all in `overlook-core`:
+
+1. `prepass::prepare` works on the DOM (html5ever). It removes what a browser would hide
+   (`display:none`, `visibility:hidden`, zero font size, `max-height:0`, `mso-hide`, the `hidden`
+   attribute, `preheader` classes, 1×1 tracking pixels, `<head>`/`<title>`/`<style>`), drops spacer
+   blocks (Gmail's `<div><br></div>`, Outlook's `<p>&nbsp;</p>`), trims `<br>`s that only add blank
+   lines, rewrites `<center>` to `<div>` and `<dt>/<dd>` to blocks, protects `<pre>` whitespace, turns
+   bare URLs into links, and splits the quoted history of a reply (Gmail `gmail_quote`, `blockquote
+   type=cite`, Yahoo, Thunderbird, Outlook's `From:` header block) into `Sanitized.quoted`. Forwards
+   are not split.
+2. `sanitize_html` (ammonia) enforces the tag and attribute allow-list and the remote-image policy,
+   then `flatten_tables` turns layout tables into block flow.
+3. The view, `TextView::html` from the vendored `gpui-base` (see `vendor/README.md`), renders it.
+
+The reader collapses `Sanitized.quoted` behind "Show quoted text" per message, and replaces `cid:`
+image references with `data:` URLs built from the downloaded inline attachment (`Attachment.content_id`,
+schema v6; inline images of the open conversation are fetched automatically, up to 4 MB each; a
+one-time backfill re-fetches older messages with `cid:` references). Plain-text mail is converted by
+`text_to_html`: paragraphs, `<br>` line breaks, nested blockquotes for `>` quoting with the markers
+removed, and linked URLs.
+
+`cargo run -p overlook-core --example sanitize_dump -- file.html` prints the sanitized output for a
+saved message. The rendering review of 2026-10-12 used fourteen fixtures (Gmail reply with quoted
+thread, newsletter with preheader and tables, nested lists, Outlook/Word mail, plain text with
+quotes, code, inline cid image, headings and rules, data table, Unicode/RTL, dark-mode hostile
+colors, hidden junk and tracking, forwarded message, long paragraphs); all render correctly. Known
+remaining gaps: data tables are flattened rather than laid out as a grid; `sup`/`sub` are shown
+inline; styles and colors from the mail are ignored by design.
+
 ## Gmail
 
 1. Create a Google Cloud OAuth client of type **Desktop app** with the Gmail API enabled and the scopes `gmail.modify`, `gmail.send`, `openid`, `userinfo.email` on the consent screen (Testing mode with test users is fine for development; restricted-scope verification is needed for public release).
@@ -86,7 +117,7 @@ Keyboard additions: `Ctrl 1` Mail, `Ctrl 2` Calendar, `Ctrl Shift A` new event; 
 cargo test --workspace
 ```
 
-63 tests cover: appearance resolution (Follow system is not a third theme), recipient parsing, conversation summaries, reply/forward drafts, HTML sanitization and remote-image blocking, local time formatting, PKCE/OAuth request building, the sample provider, store durability across reopen, atomic change+operation (a failing change leaves no operation), Outbox queue/cancel, send completion, FTS search and coverage, settings, and the sync engine (offline leaves work queued; ordered replay; uncertain send reconciled without duplicates; cancelled send never sent).
+72 tests cover: appearance resolution (Follow system is not a third theme), recipient parsing, conversation summaries, reply/forward drafts, HTML sanitization and remote-image blocking, local time formatting, PKCE/OAuth request building, the sample provider, store durability across reopen, atomic change+operation (a failing change leaves no operation), Outbox queue/cancel, send completion, FTS search and coverage, settings, and the sync engine (offline leaves work queued; ordered replay; uncertain send reconciled without duplicates; cancelled send never sent).
 
 The manual scenario used to validate the shell (keyboard only, with `wtype` on Hyprland):
 

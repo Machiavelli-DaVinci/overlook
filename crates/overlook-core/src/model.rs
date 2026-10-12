@@ -229,9 +229,18 @@ pub struct Attachment {
     /// Relative path inside the account's attachment store, once downloaded.
     pub local_path: Option<String>,
     pub provider_id: Option<ProviderId>,
+    /// The `Content-ID` of an inline part, without angle brackets, so `cid:` images in the
+    /// HTML body can be resolved to it.
+    #[serde(default)]
+    pub content_id: Option<String>,
 }
 
 impl Attachment {
+    /// An image the HTML body embeds with a `cid:` reference.
+    pub fn is_inline_image(&self) -> bool {
+        self.content_id.is_some() && self.mime_type.starts_with("image/")
+    }
+
     pub fn is_downloaded(&self) -> bool {
         self.local_path.is_some()
     }

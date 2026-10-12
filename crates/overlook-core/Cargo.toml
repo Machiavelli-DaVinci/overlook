@@ -13,3 +13,5 @@ thiserror = { workspace = true }
 uuid = { workspace = true }
 ammonia = { workspace = true }
 jiff = { workspace = true }
+html5ever = "0.27"
+markup5ever_rcdom = "0.3"

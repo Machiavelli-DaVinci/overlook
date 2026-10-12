@@ -362,6 +362,10 @@ impl MailWindow {
             (None, None) => String::new(),
         };
         let sanitized = sanitize_html(&html, policy);
+        let body_html = self.resolve_inline_images(m, sanitized.html);
+        let quoted_html = sanitized.quoted.map(|q| self.resolve_inline_images(m, q));
+        let quote_shown = self.quotes_shown.contains(&m.id);
+        let quote_id = m.id.clone();
         let to_line = {
             let mut parts: Vec<String> = m
                 .to
@@ -447,10 +451,45 @@ impl MailWindow {
                     .line_height(px(24.))
                     .max_w(px(760.))
                     .child(
-                        TextView::html(SharedString::from(format!("body-{}-{}", m.id, allow_remote)), sanitized.html)
+                        TextView::html(SharedString::from(format!("body-{}-{}", m.id, allow_remote)), body_html)
                             .selectable(true),
                     ),
             )
+            .when_some(quoted_html, |d, quoted| {
+                d.child(
+                    v_flex()
+                        .gap(px(8.))
+                        .child(
+                            div().child(
+                                Button::new(SharedString::from(format!("quote-{}", m.id)))
+                                    .ghost()
+                                    .xsmall()
+                                    .icon(icon("ellipsis").size(px(14.)))
+                                    .label(if quote_shown { "Hide quoted text" } else { "Show quoted text" })
+                                    .tooltip("The earlier messages this one replies to")
+                                    .on_click(cx.listener(move |this, _, _w, cx| {
+                                        if !this.quotes_shown.remove(&quote_id) {
+                                            this.quotes_shown.insert(quote_id.clone());
+                                        }
+                                        cx.notify();
+                                    })),
+                            ),
+                        )
+                        .when(quote_shown, |d| {
+                            d.child(
+                                div()
+                                    .pl(px(14.))
+                                    .border_l_2()
+                                    .border_color(p.divider)
+                                    .text_size(px(15.))
+                                    .line_height(px(24.))
+                                    .max_w(px(760.))
+                                    .text_color(p.muted)
+                                    .child(TextView::html(SharedString::from(format!("quoted-{}-{}", m.id, allow_remote)), quoted).selectable(true)),
+                            )
+                        }),
+                )
+            })
             .when(!m.attachments.is_empty(), |d| {
                 d.child(
                     v_flex()
@@ -470,6 +509,38 @@ impl MailWindow {
                         ),
                 )
             })
+    }
+
+    /// Replaces `cid:` image references with the downloaded attachment as a `data:` URL,
+    /// which the HTML view decodes inline. Images not downloaded yet stay as they are.
+    fn resolve_inline_images(&self, m: &Message, html: String) -> String {
+        if !html.contains("cid:") {
+            return html;
+        }
+        let mut out = html;
+        for a in m.attachments.iter().filter(|a| a.is_inline_image()) {
+            let Some(cid) = a.content_id.as_deref() else { continue };
+            let needle = format!("src=\"cid:{cid}\"");
+            if !out.contains(&needle) {
+                continue;
+            }
+            if let Some(url) = self.inline_image_data_url(a) {
+                out = out.replace(&needle, &format!("src=\"{url}\""));
+            }
+        }
+        out
+    }
+
+    fn inline_image_data_url(&self, a: &Attachment) -> Option<String> {
+        if let Some(cached) = self.inline_images.borrow().get(&a.id) {
+            return cached.clone();
+        }
+        let path = a.local_path.as_deref().map(std::path::PathBuf::from).filter(|p| p.exists())?;
+        let bytes = std::fs::read(&path).ok()?;
+        let mime = a.mime_type.split(';').next().unwrap_or("image/png").trim();
+        let url = format!("data:{mime};base64,{}", base64_encode(&bytes));
+        self.inline_images.borrow_mut().insert(a.id.clone(), Some(url.clone()));
+        Some(url)
     }
 
     fn render_attachment(&self, a: &Attachment, cx: &mut Context<Self>) -> impl IntoElement {
@@ -700,4 +771,19 @@ fn c(hex: u32, p: &crate::theme::Palette) -> Hsla {
     } else {
         Rgba::from(gpui_kit::rgb(hex)).into()
     }
+}
+
+/// Standard base64 with padding, enough for `data:` URLs.
+fn base64_encode(bytes: &[u8]) -> String {
+    const TABLE: &[u8; 64] = b"ABCDEFGHIJKLMNOPQRSTUVWXYZabcdefghijklmnopqrstuvwxyz0123456789+/";
+    let mut out = String::with_capacity(bytes.len().div_ceil(3) * 4);
+    for chunk in bytes.chunks(3) {
+        let b = [chunk[0], *chunk.get(1).unwrap_or(&0), *chunk.get(2).unwrap_or(&0)];
+        let n = (u32::from(b[0]) << 16) | (u32::from(b[1]) << 8) | u32::from(b[2]);
+        out.push(TABLE[(n >> 18) as usize & 63] as char);
+        out.push(TABLE[(n >> 12) as usize & 63] as char);
+        out.push(if chunk.len() > 1 { TABLE[(n >> 6) as usize & 63] as char } else { '=' });
+        out.push(if chunk.len() > 2 { TABLE[n as usize & 63] as char } else { '=' });
+    }
+    out
 }

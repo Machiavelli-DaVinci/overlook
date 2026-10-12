@@ -597,6 +597,20 @@ impl Store {
 
     /// Provider ids of messages that carry a calendar attachment but no parsed invitation
     /// (stored before invitation parsing existed).
+    /// Provider ids of messages whose HTML embeds `cid:` images but whose attachments were
+    /// stored before `Content-ID` was recorded.
+    pub fn messages_needing_inline_parse(&self, account: &AccountId) -> Result<Vec<ProviderId>> {
+        self.with_conn(|c| {
+            let mut stmt = c.prepare(
+                "SELECT DISTINCT m.provider_id FROM messages m
+                 WHERE m.account_id=?1 AND m.provider_id IS NOT NULL AND m.body_html LIKE '%cid:%'
+                   AND NOT EXISTS (SELECT 1 FROM attachments a WHERE a.message_id = m.id AND a.content_id IS NOT NULL)",
+            )?;
+            let rows = stmt.query_map([&account.0], |r| Ok(ProviderId(r.get(0)?)))?;
+            Ok(rows.collect::<std::result::Result<Vec<_>, _>>()?)
+        })
+    }
+
     pub fn messages_needing_invitation_parse(&self, account: &AccountId) -> Result<Vec<ProviderId>> {
         self.with_conn(|c| {
             let mut stmt = c.prepare(
@@ -998,8 +1012,8 @@ fn upsert_message_tx(tx: &Connection, m: &Message) -> Result<()> {
     tx.execute("DELETE FROM attachments WHERE message_id=?1", [&m.id.0])?;
     for a in &m.attachments {
         tx.execute(
-            "INSERT INTO attachments(id, message_id, filename, mime_type, size_bytes, local_path, provider_id) VALUES(?1,?2,?3,?4,?5,?6,?7)",
-            params![a.id.0, m.id.0, a.filename, a.mime_type, a.size_bytes as i64, a.local_path, a.provider_id.as_ref().map(|p| &p.0)],
+            "INSERT INTO attachments(id, message_id, filename, mime_type, size_bytes, local_path, provider_id, content_id) VALUES(?1,?2,?3,?4,?5,?6,?7,?8)",
+            params![a.id.0, m.id.0, a.filename, a.mime_type, a.size_bytes as i64, a.local_path, a.provider_id.as_ref().map(|p| &p.0), a.content_id],
         )?;
     }
     Ok(())
@@ -1175,7 +1189,7 @@ fn load_messages(c: &Connection, where_clause: &str, args: impl rusqlite::Params
             messages[i].label_ids.insert(LabelId(lid));
         }
     }
-    let mut stmt = c.prepare("SELECT id, message_id, filename, mime_type, size_bytes, local_path, provider_id FROM attachments ORDER BY rowid")?;
+    let mut stmt = c.prepare("SELECT id, message_id, filename, mime_type, size_bytes, local_path, provider_id, content_id FROM attachments ORDER BY rowid")?;
     for row in stmt.query_map([], |r| {
         Ok(Attachment {
             id: AttachmentId(r.get(0)?),
@@ -1185,6 +1199,7 @@ fn load_messages(c: &Connection, where_clause: &str, args: impl rusqlite::Params
             size_bytes: r.get::<_, i64>(4)? as u64,
             local_path: r.get(5)?,
             provider_id: r.get::<_, Option<String>>(6)?.map(ProviderId),
+            content_id: r.get(7)?,
         })
     })? {
         let a = row?;

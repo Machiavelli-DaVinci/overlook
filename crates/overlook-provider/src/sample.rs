@@ -427,6 +427,7 @@ pub fn sample_mailbox(account: &Account, now: Timestamp) -> MailboxSnapshot {
                     size_bytes: size,
                     local_path: None,
                     provider_id: None,
+                    content_id: None,
                 })
                 .collect(),
             rfc_message_id: None,

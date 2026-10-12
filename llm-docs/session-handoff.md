@@ -102,3 +102,10 @@ Brand assets and the HTML design preview keep their existing maintenance command
   makepkg also uploads a `-debug-` package; the updater and installer skip it when choosing an asset.
 
 - v0.1.1 published 2026-10-12 (Gmail line-break fix, calendar shortcut and sync fixes, updater skips debug package). Working version is now 0.1.2.
+
+- Line breaks in HTML mail: `vendor/gpui-base` is a vendored copy of gpui-base 0.7.3 with one patch (`<br>` renders as a hard line break; see `vendor/README.md`), wired through `[patch.crates-io]`. The sanitizer no longer splits blocks at `<br>`. Worth upstreaming to longbridge/gpui-component; drop the vendor copy when it lands.
+
+- Rendering review (2026-10-12): see "Rendering" in `overlook-native-app.md`. New `prepass.rs` DOM stage,
+  quoted-text collapsing, inline `cid:` images (schema v6, `content_id`), plain-text quotes, vendored
+  parser patches for `<br>`, block assembly, `<hr>`, `<pre>`, `<ol start>`. The "Show quoted text"
+  toggle was not exercised by click during the review (no pointer automation at the time); verify once by hand.

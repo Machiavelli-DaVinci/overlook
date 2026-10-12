@@ -20,15 +20,23 @@ pub enum RemoteContent {
 #[derive(Clone, Debug, PartialEq, Eq, Default)]
 pub struct Sanitized {
     pub html: String,
+    /// The quoted history of a reply, split off so the reader can collapse it.
+    pub quoted: Option<String>,
     /// Number of remote resources removed.
     pub blocked_remote: usize,
-    /// Plain-text rendering for previews and search.
+    /// Plain-text rendering for previews and search (body and quoted history).
     pub text: String,
 }
 
 /// Sanitizes `html` for display. Never fails: malformed input yields best-effort output.
 pub fn sanitize_html(html: &str, policy: RemoteContent) -> Sanitized {
-    let blocked_remote = if policy == RemoteContent::Blocked { count_remote(html) } else { 0 };
+    let prepared = crate::prepass::prepare(html);
+    let blocked_remote = if policy == RemoteContent::Blocked {
+        count_remote(&prepared.html) + prepared.quoted.as_deref().map(count_remote).unwrap_or(0)
+    } else {
+        0
+    };
+    let html = prepared.html.as_str();
 
     let mut builder = ammonia::Builder::default();
     let tags: HashSet<&str> = [
@@ -68,9 +76,24 @@ pub fn sanitize_html(html: &str, policy: RemoteContent) -> Sanitized {
         }
     }
 
-    let clean = normalize_breaks(&flatten_tables(&builder.clean(html).to_string()));
-    let text = html_to_text(&clean);
-    Sanitized { html: clean, blocked_remote, text }
+    let mut clean = flatten_tables(&builder.clean(html).to_string());
+    let mut quoted = prepared.quoted.as_deref().map(|q| flatten_tables(&builder.clean(q).to_string()));
+    let mut text = html_to_text(&clean);
+    if let Some(q) = &quoted {
+        let quoted_text = html_to_text(q);
+        if text.trim().is_empty() {
+            // Nothing but history: show it inline rather than behind a toggle.
+            clean.push_str(q);
+            quoted = None;
+            text = quoted_text;
+        } else if !quoted_text.trim().is_empty() {
+            text.push_str("\n\n");
+            text.push_str(&quoted_text);
+        } else {
+            quoted = None;
+        }
+    }
+    Sanitized { html: clean, quoted, blocked_remote, text }
 }
 
 /// Rewrites tables into block flow: each row becomes a block, cells are separated by a
@@ -134,68 +157,6 @@ pub fn flatten_tables(html: &str) -> String {
                 }
             }
             _ => out.push_str(tag),
-        }
-        rest = &tag_rest[end + 1..];
-    }
-    out.push_str(rest);
-    out
-}
-
-/// Turns `<br>` inside a paragraph or a `<div>` into a block boundary.
-///
-/// The native HTML view treats `<br>` as a block-level break and ignores it inside a
-/// text container, which swallows the line breaks in signatures, addresses, and in mail
-/// composed in Gmail, whose body is `<div>` wrappers with `<br>` between the lines.
-/// Splitting the container keeps every line visible; a run of consecutive breaks becomes a
-/// single boundary so blank lines do not turn into empty blocks. Breaks outside any
-/// container are left alone.
-pub fn normalize_breaks(html: &str) -> String {
-    let mut out = String::with_capacity(html.len() + 32);
-    let mut rest = html;
-    // Innermost-last stack of open text containers ("p" or "div").
-    let mut open: Vec<&'static str> = Vec::new();
-    let mut after_break = false;
-    while let Some(start) = rest.find('<') {
-        let text = &rest[..start];
-        if !text.trim().is_empty() {
-            after_break = false;
-        }
-        out.push_str(text);
-        let tag_rest = &rest[start..];
-        let Some(end) = tag_rest.find('>') else {
-            out.push_str(tag_rest);
-            return out;
-        };
-        let tag = &tag_rest[..=end];
-        let lower = tag.to_ascii_lowercase();
-        let is_br = lower.starts_with("<br>") || lower.starts_with("<br/>") || lower.starts_with("<br ");
-        if lower.starts_with("<p>") || lower.starts_with("<p ") {
-            open.push("p");
-            after_break = false;
-            out.push_str(tag);
-        } else if lower.starts_with("<div>") || lower.starts_with("<div ") {
-            open.push("div");
-            after_break = false;
-            out.push_str(tag);
-        } else if lower.starts_with("</p>") || lower.starts_with("</div>") {
-            open.pop();
-            after_break = false;
-            out.push_str(tag);
-        } else if is_br && !open.is_empty() {
-            if !after_break {
-                let container = open[open.len() - 1];
-                out.push_str("</");
-                out.push_str(container);
-                out.push_str("><");
-                out.push_str(container);
-                out.push('>');
-            }
-            after_break = true;
-        } else {
-            if !is_br {
-                after_break = false;
-            }
-            out.push_str(tag);
         }
         rest = &tag_rest[end + 1..];
     }
@@ -340,21 +301,93 @@ fn collapse_whitespace(s: &str) -> String {
     out.trim().to_owned()
 }
 
-/// Converts plain text to safe HTML paragraphs for display in the HTML view.
+/// Converts plain text to safe HTML for display in the HTML view.
+///
+/// Blank lines separate paragraphs; single newlines become `<br>`. Lines quoted with `>`
+/// are grouped into (nested) blockquotes with the markers removed, the way a mail client
+/// shows a plain-text reply. Bare URLs become links.
 pub fn text_to_html(text: &str) -> String {
     let mut out = String::new();
-    for para in text.split("\n\n") {
-        let escaped = escape_html(para).replace('\n', "<br>");
-        if para.trim_start().starts_with('>') {
-            out.push_str("<blockquote>");
-            out.push_str(&escaped);
-            out.push_str("</blockquote>");
-        } else {
-            out.push_str("<p>");
-            out.push_str(&escaped);
-            out.push_str("</p>");
+    let mut depth = 0usize;
+    let mut open_paragraph = false;
+    let mut first_in_block = true;
+    let mut pending_blank = false;
+
+    for raw in text.lines() {
+        let (line_depth, body) = strip_quote_markers(raw);
+        if body.trim().is_empty() {
+            pending_blank = true;
+            continue;
         }
+        if line_depth != depth {
+            if open_paragraph {
+                out.push_str("</p>");
+                open_paragraph = false;
+            }
+            while depth > line_depth {
+                out.push_str("</blockquote>");
+                depth -= 1;
+            }
+            while depth < line_depth {
+                out.push_str("<blockquote>");
+                depth += 1;
+            }
+            first_in_block = true;
+            pending_blank = false;
+        }
+        if depth == 0 {
+            if pending_blank && open_paragraph {
+                out.push_str("</p>");
+                open_paragraph = false;
+            }
+            if !open_paragraph {
+                out.push_str("<p>");
+                open_paragraph = true;
+                first_in_block = true;
+            }
+            if !first_in_block {
+                out.push_str("<br>");
+            }
+        } else if !first_in_block {
+            out.push_str(if pending_blank { "<br><br>" } else { "<br>" });
+        }
+        out.push_str(&linkify_escaped(body));
+        first_in_block = false;
+        pending_blank = false;
     }
+    if open_paragraph {
+        out.push_str("</p>");
+    }
+    while depth > 0 {
+        out.push_str("</blockquote>");
+        depth -= 1;
+    }
+    out
+}
+
+/// Counts the leading `>` markers of a quoted line and returns the text after them.
+fn strip_quote_markers(line: &str) -> (usize, &str) {
+    let mut depth = 0;
+    let mut rest = line.trim_start();
+    while let Some(after) = rest.strip_prefix('>') {
+        depth += 1;
+        rest = after.strip_prefix(' ').unwrap_or(after);
+    }
+    (depth, rest)
+}
+
+/// Escapes text for HTML, turning bare URLs into links.
+fn linkify_escaped(text: &str) -> String {
+    let mut out = String::new();
+    let mut rest = text;
+    while let Some((start, len)) = crate::prepass::find_url(rest) {
+        out.push_str(&escape_html(&rest[..start]));
+        let url = &rest[start..start + len];
+        let href = if url.starts_with("www.") { format!("https://{url}") } else { url.to_owned() };
+        out.push_str(&format!("<a href=\"{}\">{}</a>", escape_html(&href), escape_html(url)));
+        rest = &rest[start + len..];
+    }
+    out.push_str(&escape_html(rest));
     out
 }
 
@@ -421,22 +454,27 @@ mod tests {
     }
 
     #[test]
-    fn breaks_inside_paragraphs_become_paragraphs() {
+    fn breaks_are_kept_for_the_view() {
+        // The HTML view (vendored gpui-base) renders <br> as a hard line break, so the
+        // sanitizer leaves it alone; the text extraction keeps it as a newline.
         let s = sanitize_html("<p>Thanks,<br>Maya<br><small>Design Director</small></p><div>a<br>b</div>", RemoteContent::Blocked);
-        assert_eq!(s.html, "<p>Thanks,</p><p>Maya</p><p><small>Design Director</small></p><div>a</div><div>b</div>");
-        assert_eq!(s.text, "Thanks,\n\nMaya\n\nDesign Director\n\na\n\nb");
+        assert_eq!(s.html, "<p>Thanks,<br>Maya<br><small>Design Director</small></p><div>a<br>b</div>");
+        assert_eq!(s.text, "Thanks,\nMaya\nDesign Director\n\na\nb");
     }
 
     #[test]
     fn gmail_div_bodies_keep_their_lines() {
-        // Gmail composes mail as nested divs with <br> between lines and <br><br> between paragraphs.
+        // Gmail composes mail as nested divs with <br> between lines; every break survives.
         let s = sanitize_html("<div dir=\"ltr\"><div dir=\"auto\">Hey,<br><br>Step 1<br>- one<br>- two<br><br>Bye</div></div>", RemoteContent::Blocked);
-        assert_eq!(s.html, "<div dir=\"ltr\"><div dir=\"auto\">Hey,</div><div>Step 1</div><div>- one</div><div>- two</div><div>Bye</div></div>");
+        assert_eq!(s.html, "<div dir=\"ltr\"><div dir=\"auto\">Hey,<br><br>Step 1<br>- one<br>- two<br><br>Bye</div></div>");
     }
 
     #[test]
     fn text_round_trips_to_html() {
-        let html = text_to_html("Hello <you>\n\n> quoted");
-        assert_eq!(html, "<p>Hello &lt;you&gt;</p><blockquote>&gt; quoted</blockquote>");
+        let html = text_to_html("Hello <you>\nsecond line\n\n> quoted one\n> quoted two\n>\n> > nested\n\nAfter https://ex.com/a.");
+        assert_eq!(
+            html,
+            "<p>Hello &lt;you&gt;<br>second line</p><blockquote>quoted one<br>quoted two<blockquote>nested</blockquote></blockquote><p>After <a href=\"https://ex.com/a\">https://ex.com/a</a>.</p>"
+        );
     }
 }
