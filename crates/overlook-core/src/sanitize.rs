@@ -141,17 +141,26 @@ pub fn flatten_tables(html: &str) -> String {
     out
 }
 
-/// Turns `<br>` inside a paragraph into a paragraph boundary.
+/// Turns `<br>` inside a paragraph or a `<div>` into a block boundary.
 ///
 /// The native HTML view treats `<br>` as a block-level break and ignores it inside a
-/// paragraph, which swallows the line breaks in signatures and addresses. Splitting the
-/// paragraph keeps every line visible. Breaks outside paragraphs are left alone.
+/// text container, which swallows the line breaks in signatures, addresses, and in mail
+/// composed in Gmail, whose body is `<div>` wrappers with `<br>` between the lines.
+/// Splitting the container keeps every line visible; a run of consecutive breaks becomes a
+/// single boundary so blank lines do not turn into empty blocks. Breaks outside any
+/// container are left alone.
 pub fn normalize_breaks(html: &str) -> String {
     let mut out = String::with_capacity(html.len() + 32);
     let mut rest = html;
-    let mut in_paragraph = false;
+    // Innermost-last stack of open text containers ("p" or "div").
+    let mut open: Vec<&'static str> = Vec::new();
+    let mut after_break = false;
     while let Some(start) = rest.find('<') {
-        out.push_str(&rest[..start]);
+        let text = &rest[..start];
+        if !text.trim().is_empty() {
+            after_break = false;
+        }
+        out.push_str(text);
         let tag_rest = &rest[start..];
         let Some(end) = tag_rest.find('>') else {
             out.push_str(tag_rest);
@@ -159,15 +168,33 @@ pub fn normalize_breaks(html: &str) -> String {
         };
         let tag = &tag_rest[..=end];
         let lower = tag.to_ascii_lowercase();
+        let is_br = lower.starts_with("<br>") || lower.starts_with("<br/>") || lower.starts_with("<br ");
         if lower.starts_with("<p>") || lower.starts_with("<p ") {
-            in_paragraph = true;
+            open.push("p");
+            after_break = false;
             out.push_str(tag);
-        } else if lower.starts_with("</p>") {
-            in_paragraph = false;
+        } else if lower.starts_with("<div>") || lower.starts_with("<div ") {
+            open.push("div");
+            after_break = false;
             out.push_str(tag);
-        } else if in_paragraph && (lower.starts_with("<br>") || lower.starts_with("<br/>") || lower.starts_with("<br ")) {
-            out.push_str("</p><p>");
+        } else if lower.starts_with("</p>") || lower.starts_with("</div>") {
+            open.pop();
+            after_break = false;
+            out.push_str(tag);
+        } else if is_br && !open.is_empty() {
+            if !after_break {
+                let container = open[open.len() - 1];
+                out.push_str("</");
+                out.push_str(container);
+                out.push_str("><");
+                out.push_str(container);
+                out.push('>');
+            }
+            after_break = true;
         } else {
+            if !is_br {
+                after_break = false;
+            }
             out.push_str(tag);
         }
         rest = &tag_rest[end + 1..];
@@ -396,8 +423,15 @@ mod tests {
     #[test]
     fn breaks_inside_paragraphs_become_paragraphs() {
         let s = sanitize_html("<p>Thanks,<br>Maya<br><small>Design Director</small></p><div>a<br>b</div>", RemoteContent::Blocked);
-        assert_eq!(s.html, "<p>Thanks,</p><p>Maya</p><p><small>Design Director</small></p><div>a<br>b</div>");
-        assert_eq!(s.text, "Thanks,\n\nMaya\n\nDesign Director\n\na\nb");
+        assert_eq!(s.html, "<p>Thanks,</p><p>Maya</p><p><small>Design Director</small></p><div>a</div><div>b</div>");
+        assert_eq!(s.text, "Thanks,\n\nMaya\n\nDesign Director\n\na\n\nb");
+    }
+
+    #[test]
+    fn gmail_div_bodies_keep_their_lines() {
+        // Gmail composes mail as nested divs with <br> between lines and <br><br> between paragraphs.
+        let s = sanitize_html("<div dir=\"ltr\"><div dir=\"auto\">Hey,<br><br>Step 1<br>- one<br>- two<br><br>Bye</div></div>", RemoteContent::Blocked);
+        assert_eq!(s.html, "<div dir=\"ltr\"><div dir=\"auto\">Hey,</div><div>Step 1</div><div>- one</div><div>- two</div><div>Bye</div></div>");
     }
 
     #[test]
