@@ -57,6 +57,7 @@ actions!(
         CalendarDay,
         CalendarWeek,
         CalendarAgenda,
+        CalendarMonth,
         NewEventAction,
         ArchiveSelected,
         TrashSelected,
@@ -96,6 +97,7 @@ pub fn init(cx: &mut App) {
         KeyBinding::new("d", CalendarDay, Some(CALENDAR_CONTEXT)),
         KeyBinding::new("w", CalendarWeek, Some(CALENDAR_CONTEXT)),
         KeyBinding::new("a", CalendarAgenda, Some(CALENDAR_CONTEXT)),
+        KeyBinding::new("m", CalendarMonth, Some(CALENDAR_CONTEXT)),
         KeyBinding::new("j", NextConversation, Some(LIST_CONTEXT)),
         KeyBinding::new("down", NextConversation, Some(LIST_CONTEXT)),
         KeyBinding::new("k", PrevConversation, Some(LIST_CONTEXT)),
@@ -197,6 +199,9 @@ pub struct MailWindow {
     pub(crate) cal_scrolled_for: std::cell::Cell<Option<(CalView, i64)>>,
     pub(crate) cal_focus: FocusHandle,
     pub(crate) new_event: Option<NewEvent>,
+    pub(crate) reminders_enabled: bool,
+    /// Reminders already shown this session: (event, minutes before).
+    pub(crate) notified: HashSet<(EventId, i32)>,
     sidebar_width: f32,
     list_width: f32,
     list_height: f32,
@@ -257,6 +262,7 @@ impl MailWindow {
         let sidebar_width = store.setting::<f32>("panes.sidebar").ok().flatten().unwrap_or(232.);
         let collapsed_sections: HashSet<String> = store.setting::<Vec<String>>("sidebar.collapsed").ok().flatten().unwrap_or_default().into_iter().collect();
         let focused_enabled = store.setting::<bool>("focused_inbox").ok().flatten().unwrap_or(true);
+        let reminders_enabled = store.setting::<bool>("reminders").ok().flatten().unwrap_or(true);
         let attachments_dir = crate::data_dir().join("attachments");
         let list_width = store.setting::<f32>("panes.list").ok().flatten().unwrap_or(340.);
         let list_height = store.setting::<f32>("panes.list_height").ok().flatten().unwrap_or(300.);
@@ -310,6 +316,8 @@ impl MailWindow {
             cal_scrolled_for: std::cell::Cell::new(None),
             cal_focus: cx.focus_handle(),
             new_event: None,
+            reminders_enabled,
+            notified: HashSet::new(),
             sidebar_width,
             list_width,
             list_height,
@@ -346,10 +354,13 @@ impl MailWindow {
             this.start_google_sign_in(None, window, cx);
         }
 
-        // Periodic synchronization while accounts are reachable.
+        // Periodic synchronization while accounts are reachable, and reminder checks.
         cx.spawn_in(window, async move |this, cx| loop {
             cx.background_executor().timer(Duration::from_secs(30)).await;
-            let alive = this.update_in(cx, |this, window, cx| this.sync_all(window, cx));
+            let alive = this.update_in(cx, |this, window, cx| {
+                this.sync_all(window, cx);
+                this.check_reminders(window, cx);
+            });
             if alive.is_err() {
                 break;
             }
@@ -1200,6 +1211,9 @@ impl MailWindow {
     fn on_cal_agenda(&mut self, _: &CalendarAgenda, _w: &mut Window, cx: &mut Context<Self>) {
         self.set_cal_view(CalView::Agenda, cx);
     }
+    fn on_cal_month(&mut self, _: &CalendarMonth, _w: &mut Window, cx: &mut Context<Self>) {
+        self.set_cal_view(CalView::Month, cx);
+    }
     fn on_new_event(&mut self, _: &NewEventAction, window: &mut Window, cx: &mut Context<Self>) {
         self.set_module(Module::Calendar, window, cx);
         self.start_new_event(window, cx);
@@ -1214,6 +1228,7 @@ impl MailWindow {
         let reading_pane = self.reading_pane;
         let density = self.density;
         let focused_enabled = self.focused_enabled;
+        let reminders_enabled = self.reminders_enabled;
         let this = cx.entity().downgrade();
         let this2 = cx.entity().downgrade();
 
@@ -1324,6 +1339,7 @@ impl MailWindow {
                                 let b = this2.clone();
                                 let c = this2.clone();
                                 let d = this2.clone();
+                                let r = this2.clone();
                                 menu.label("Reading pane")
                                     .item(PopupMenuItem::new("On the right").checked(reading_pane == ReadingPane::Right).on_click(move |_, _w, cx| {
                                         let _ = a.update(cx, |this, cx| this.set_reading_pane(ReadingPane::Right, cx));
@@ -1340,6 +1356,15 @@ impl MailWindow {
                                     .label("Inbox")
                                     .item(PopupMenuItem::new("Focused Inbox").checked(focused_enabled).on_click(move |_, _w, cx| {
                                         let _ = d.update(cx, |this, cx| this.toggle_focused_inbox(cx));
+                                    }))
+                                    .separator()
+                                    .label("Calendar")
+                                    .item(PopupMenuItem::new("Event reminders").checked(reminders_enabled).on_click(move |_, _w, cx| {
+                                        let _ = r.update(cx, |this, cx| {
+                                            this.reminders_enabled = !this.reminders_enabled;
+                                            let _ = this.store.set_setting("reminders", &this.reminders_enabled);
+                                            cx.notify();
+                                        });
                                     }))
                             }),
                     )
@@ -1566,6 +1591,7 @@ impl Render for MailWindow {
             .on_action(cx.listener(Self::on_cal_day))
             .on_action(cx.listener(Self::on_cal_week))
             .on_action(cx.listener(Self::on_cal_agenda))
+            .on_action(cx.listener(Self::on_cal_month))
             .on_action(cx.listener(Self::on_new_event))
             .size_full()
             .bg(p.background)

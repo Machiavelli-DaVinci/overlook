@@ -87,6 +87,7 @@ mod tests {
             category: None,
             is_important: false,
             focus_override: None,
+            invitation: None,
         }
     }
 

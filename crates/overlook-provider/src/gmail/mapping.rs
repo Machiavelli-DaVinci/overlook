@@ -116,11 +116,13 @@ pub fn message_from_json(account: &Account, v: &Value, labels: &HashMap<String, 
 
     let mut text = None;
     let mut html = None;
+    let mut calendar_text = None;
     let mut attachments = Vec::new();
     let local_id = local_message_id(&account.id, gmail_id);
     if let Some(p) = payload {
-        collect_parts(p, &mut text, &mut html, &mut attachments, &local_id);
+        collect_parts(p, &mut text, &mut html, &mut calendar_text, &mut attachments, &local_id);
     }
+    let invitation = calendar_text.as_deref().and_then(overlook_core::ics::parse_invitation);
     if text.is_none() && html.is_some() {
         text = html.as_deref().map(html_to_text);
     }
@@ -157,13 +159,19 @@ pub fn message_from_json(account: &Account, v: &Value, labels: &HashMap<String, 
         category: label_ids_raw.iter().find_map(|l| l.strip_prefix("CATEGORY_").map(|c| c.to_ascii_lowercase())),
         is_important: has("IMPORTANT"),
         focus_override: None,
+        invitation,
     })
 }
 
-fn collect_parts(part: &Value, text: &mut Option<String>, html: &mut Option<String>, attachments: &mut Vec<Attachment>, message_id: &MessageId) {
+fn collect_parts(part: &Value, text: &mut Option<String>, html: &mut Option<String>, calendar: &mut Option<String>, attachments: &mut Vec<Attachment>, message_id: &MessageId) {
     let mime = part.get("mimeType").and_then(|m| m.as_str()).unwrap_or("");
     let filename = part.get("filename").and_then(|f| f.as_str()).unwrap_or("");
     let body = part.get("body");
+    if mime.starts_with("text/calendar") && calendar.is_none() {
+        if let Some(data) = body.and_then(|b| b.get("data")).and_then(|d| d.as_str()) {
+            *calendar = Some(String::from_utf8_lossy(&base64url_decode(data)).into_owned());
+        }
+    }
     if !filename.is_empty() {
         let size = body.and_then(|b| b.get("size")).and_then(|s| s.as_u64()).unwrap_or(0);
         let attachment_id = body.and_then(|b| b.get("attachmentId")).and_then(|a| a.as_str());
@@ -186,7 +194,7 @@ fn collect_parts(part: &Value, text: &mut Option<String>, html: &mut Option<Stri
     }
     if let Some(parts) = part.get("parts").and_then(|p| p.as_array()) {
         for child in parts {
-            collect_parts(child, text, html, attachments, message_id);
+            collect_parts(child, text, html, calendar, attachments, message_id);
         }
     }
 }
@@ -322,7 +330,8 @@ mod tests {
                         {"mimeType": "text/plain", "body": {"data": base64url_encode(b"Hello there")}},
                         {"mimeType": "text/html", "body": {"data": base64url_encode(b"<p>Hello there</p>")}}
                     ]},
-                    {"mimeType": "application/pdf", "filename": "brief.pdf", "body": {"attachmentId": "ATT1", "size": 1234}}
+                    {"mimeType": "application/pdf", "filename": "brief.pdf", "body": {"attachmentId": "ATT1", "size": 1234}},
+                    {"mimeType": "text/calendar; method=REQUEST", "filename": "invite.ics", "body": {"attachmentId": "ATT2", "size": 400, "data": base64url_encode(b"BEGIN:VCALENDAR\nMETHOD:REQUEST\nBEGIN:VEVENT\nUID:ev1@google.com\nSUMMARY:Launch review\nDTSTART:20261014T160000Z\nEND:VEVENT\nEND:VCALENDAR")}}
                 ]
             }
         });
@@ -345,8 +354,11 @@ mod tests {
         assert_eq!(m.category, None);
         assert_eq!(m.body.text.as_deref(), Some("Hello there"));
         assert_eq!(m.body.html.as_deref(), Some("<p>Hello there</p>"));
-        assert_eq!(m.attachments.len(), 1);
+        assert_eq!(m.attachments.len(), 2);
         assert_eq!(m.attachments[0].provider_id.as_ref().unwrap().as_str(), "ATT1");
+        let inv = m.invitation.as_ref().expect("invitation parsed from text/calendar part");
+        assert_eq!(inv.uid, "ev1@google.com");
+        assert_eq!(inv.method, "REQUEST");
         assert_eq!(m.rfc_message_id.as_deref(), Some("<abc@northstar.example>"));
         assert!(m.is_important);
         assert_eq!(gmail_id(&account().id, m.id.as_str()).as_deref(), Some("18f1"));

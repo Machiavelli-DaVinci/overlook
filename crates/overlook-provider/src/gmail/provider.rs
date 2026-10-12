@@ -63,11 +63,31 @@ impl GmailProvider {
     }
 
     fn fetch_message(&self, account: &Account, id: &str, labels: &HashMap<String, LabelId>) -> Result<Option<Message>, ApiError> {
-        match self.client.get(&format!("messages/{id}"), &[("format", "full")]) {
-            Ok(v) => Ok(message_from_json(account, &v, labels)),
-            Err(ApiError::NotFound) => Ok(None),
-            Err(e) => Err(e),
+        let mut message = match self.client.get(&format!("messages/{id}"), &[("format", "full")]) {
+            Ok(v) => message_from_json(account, &v, labels),
+            Err(ApiError::NotFound) => return Ok(None),
+            Err(e) => return Err(e),
+        };
+        // Gmail often ships the calendar part as an attachment reference instead of inline
+        // text; fetch it so invitations are recognised.
+        if let Some(m) = message.as_mut() {
+            if m.invitation.is_none() {
+                let ics = m
+                    .attachments
+                    .iter()
+                    .find(|a| a.mime_type.starts_with("text/calendar") || a.mime_type.starts_with("application/ics") || a.filename.to_ascii_lowercase().ends_with(".ics"))
+                    .and_then(|a| a.provider_id.clone());
+                if let Some(aid) = ics {
+                    if let Ok(v) = self.client.get(&format!("messages/{id}/attachments/{}", aid.0), &[]) {
+                        if let Some(data) = v.get("data").and_then(|d| d.as_str()) {
+                            let text = String::from_utf8_lossy(&mapping::base64url_decode(data)).into_owned();
+                            m.invitation = overlook_core::ics::parse_invitation(&text);
+                        }
+                    }
+                }
+            }
         }
+        Ok(message)
     }
 
     /// Lists ids for every view in [`INITIAL_VIEWS`], newest first, de-duplicated.

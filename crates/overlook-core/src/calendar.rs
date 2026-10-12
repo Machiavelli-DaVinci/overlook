@@ -18,6 +18,9 @@ pub struct Calendar {
     /// Shown in the calendar views (user toggle).
     pub visible: bool,
     pub sort_order: i32,
+    /// Default popup reminders in minutes before the start, from the provider.
+    #[serde(default)]
+    pub default_reminders: Vec<i32>,
 }
 
 #[derive(Clone, Copy, Debug, PartialEq, Eq, Serialize, Deserialize, Default)]
@@ -100,6 +103,10 @@ pub struct Event {
     /// Provider event type: `default`, `working-location`, `out-of-office`, `focus-time`,
     /// `birthday`. Working-location entries are shown in the day header, not as events.
     pub event_type: Option<String>,
+    /// Event-specific color (hex) when the provider has one; otherwise the calendar's.
+    pub color: Option<String>,
+    /// Popup reminders in minutes before the start. `None` means use the calendar default.
+    pub reminders: Option<Vec<i32>>,
     /// Set while a local change (RSVP, edit) is waiting to reach the provider.
     pub pending: bool,
 }
@@ -120,6 +127,24 @@ impl Event {
     /// An invitation is an event someone else organized where we are an attendee.
     pub fn is_invitation(&self) -> bool {
         self.my_attendance().is_some_and(|a| !a.is_organizer) && self.organizer.as_ref().is_some_and(|_| true)
+    }
+
+    /// Effective reminder offsets (minutes before start) for this event.
+    pub fn effective_reminders<'a>(&'a self, calendar_default: &'a [i32]) -> &'a [i32] {
+        match &self.reminders {
+            Some(r) => r.as_slice(),
+            None => calendar_default,
+        }
+    }
+
+    /// Whether the user may change this event (owner of the calendar and organizer, or
+    /// a personal event without guests).
+    pub fn editable_by(&self, owner_email: &str, calendar: &Calendar) -> bool {
+        if !calendar.can_edit {
+            return false;
+        }
+        let organizer_is_me = self.organizer.as_ref().is_none_or(|o| o.email.eq_ignore_ascii_case(owner_email));
+        organizer_is_me || self.my_attendance().is_some_and(|a| a.is_organizer)
     }
 
     pub fn is_working_location(&self) -> bool {

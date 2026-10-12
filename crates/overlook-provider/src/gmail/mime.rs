@@ -93,6 +93,7 @@ mod tests {
             category: None,
             is_important: false,
             focus_override: None,
+            invitation: None,
         };
         source.in_reply_to = Some("<root@northstar.example>".into());
         let raw = String::from_utf8(build_raw(&account, &draft, Some(&source), "<d1@overlook.lastrefuge.ai>").unwrap()).unwrap();

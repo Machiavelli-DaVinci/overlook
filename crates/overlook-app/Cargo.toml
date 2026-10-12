@@ -23,4 +23,5 @@ tracing = { workspace = true }
 tracing-subscriber = { workspace = true }
 directories = { workspace = true }
 oo7 = "0.4"
+notify-rust = "4"
 tokio = { version = "1", features = ["rt-multi-thread"] }

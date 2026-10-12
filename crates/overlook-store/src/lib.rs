@@ -461,10 +461,10 @@ impl Store {
             for c in calendars {
                 let visible = existing.get(&c.id.0).copied().unwrap_or(c.visible);
                 tx.execute(
-                    "INSERT INTO calendars(id, account_id, provider_id, name, color, is_primary, can_edit, visible, sort_order) VALUES(?1,?2,?3,?4,?5,?6,?7,?8,?9)
+                    "INSERT INTO calendars(id, account_id, provider_id, name, color, is_primary, can_edit, visible, sort_order, default_reminders_json) VALUES(?1,?2,?3,?4,?5,?6,?7,?8,?9,?10)
                      ON CONFLICT(id) DO UPDATE SET provider_id=excluded.provider_id, name=excluded.name, color=excluded.color, is_primary=excluded.is_primary,
-                       can_edit=excluded.can_edit, visible=excluded.visible, sort_order=excluded.sort_order",
-                    params![c.id.0, c.account_id.0, c.provider_id.as_ref().map(|p| &p.0), c.name, c.color, c.is_primary, c.can_edit, visible, c.sort_order],
+                       can_edit=excluded.can_edit, visible=excluded.visible, sort_order=excluded.sort_order, default_reminders_json=excluded.default_reminders_json",
+                    params![c.id.0, c.account_id.0, c.provider_id.as_ref().map(|p| &p.0), c.name, c.color, c.is_primary, c.can_edit, visible, c.sort_order, serde_json::to_string(&c.default_reminders)?],
                 )?;
             }
             let keep: Vec<&str> = calendars.iter().map(|c| c.id.0.as_str()).collect();
@@ -477,7 +477,7 @@ impl Store {
 
     pub fn calendars(&self, account: &AccountId) -> Result<Vec<Calendar>> {
         self.with_conn(|c| {
-            let mut stmt = c.prepare("SELECT id, account_id, provider_id, name, color, is_primary, can_edit, visible, sort_order FROM calendars WHERE account_id=?1 ORDER BY is_primary DESC, sort_order, name")?;
+            let mut stmt = c.prepare("SELECT id, account_id, provider_id, name, color, is_primary, can_edit, visible, sort_order, default_reminders_json FROM calendars WHERE account_id=?1 ORDER BY is_primary DESC, sort_order, name")?;
             let rows = stmt.query_map([&account.0], |r| {
                 Ok(Calendar {
                     id: CalendarId(r.get(0)?),
@@ -489,6 +489,7 @@ impl Store {
                     can_edit: r.get(6)?,
                     visible: r.get(7)?,
                     sort_order: r.get(8)?,
+                    default_reminders: serde_json::from_str(&r.get::<_, String>(9)?).unwrap_or_default(),
                 })
             })?;
             Ok(rows.collect::<std::result::Result<Vec<_>, _>>()?)
@@ -518,6 +519,30 @@ impl Store {
                 n += tx.execute("DELETE FROM events WHERE id=?1", [&id.0])?;
             }
             Ok(n)
+        })
+    }
+
+    pub fn event_by_ical_uid(&self, account: &AccountId, uid: &str) -> Result<Option<Event>> {
+        self.with_conn(|c| {
+            let mut found = load_events(c, "WHERE e.account_id=?1 AND e.ical_uid=?2 AND e.status != 'cancelled' ORDER BY e.start", params![account.0, uid])?;
+            // Prefer the next upcoming instance for recurring series.
+            let now_ms = now();
+            let upcoming = found.iter().position(|e| e.end >= now_ms);
+            Ok(match upcoming {
+                Some(i) => Some(found.swap_remove(i)),
+                None => found.pop(),
+            })
+        })
+    }
+
+    /// Events (visible calendars) starting within `[from, to)`, for reminders.
+    pub fn events_starting_between(&self, account: &AccountId, from: Timestamp, to: Timestamp) -> Result<Vec<Event>> {
+        self.with_conn(|c| {
+            load_events(
+                c,
+                "JOIN calendars cal ON cal.id = e.calendar_id WHERE e.account_id=?1 AND cal.visible=1 AND e.start >= ?2 AND e.start < ?3 AND e.status != 'cancelled' AND e.all_day = 0",
+                params![account.0, from, to],
+            )
         })
     }
 
@@ -567,6 +592,20 @@ impl Store {
                 OperationKind::DeleteEvent { event_id: event.id.clone(), calendar_id: event.calendar_id.clone(), provider_id: event.provider_id.clone() },
                 ts,
             )
+        })
+    }
+
+    /// Provider ids of messages that carry a calendar attachment but no parsed invitation
+    /// (stored before invitation parsing existed).
+    pub fn messages_needing_invitation_parse(&self, account: &AccountId) -> Result<Vec<ProviderId>> {
+        self.with_conn(|c| {
+            let mut stmt = c.prepare(
+                "SELECT DISTINCT m.provider_id FROM messages m JOIN attachments a ON a.message_id = m.id
+                 WHERE m.account_id=?1 AND m.invitation_json IS NULL AND m.provider_id IS NOT NULL
+                   AND (a.mime_type LIKE 'text/calendar%' OR a.mime_type LIKE 'application/ics%' OR lower(a.filename) LIKE '%.ics')",
+            )?;
+            let rows = stmt.query_map([&account.0], |r| Ok(ProviderId(r.get(0)?)))?;
+            Ok(rows.collect::<std::result::Result<Vec<_>, _>>()?)
         })
     }
 
@@ -909,15 +948,15 @@ fn upsert_message_tx(tx: &Connection, m: &Message) -> Result<()> {
     tx.execute(
         "INSERT INTO messages(id, account_id, conversation_id, provider_id, from_json, to_json, cc_json, bcc_json, reply_to_json,
             subject, snippet, body_text, body_html, search_text, date, is_read, is_starred, is_outgoing, rfc_message_id, in_reply_to,
-            category, is_important, focus_override)
-         VALUES(?1,?2,?3,?4,?5,?6,?7,?8,?9,?10,?11,?12,?13,?14,?15,?16,?17,?18,?19,?20,?21,?22,?23)
+            category, is_important, focus_override, invitation_json)
+         VALUES(?1,?2,?3,?4,?5,?6,?7,?8,?9,?10,?11,?12,?13,?14,?15,?16,?17,?18,?19,?20,?21,?22,?23,?24)
          ON CONFLICT(id) DO UPDATE SET conversation_id=excluded.conversation_id, provider_id=excluded.provider_id,
             from_json=excluded.from_json, to_json=excluded.to_json, cc_json=excluded.cc_json, bcc_json=excluded.bcc_json,
             reply_to_json=excluded.reply_to_json, subject=excluded.subject, snippet=excluded.snippet,
             body_text=excluded.body_text, body_html=excluded.body_html, search_text=excluded.search_text, date=excluded.date,
             is_read=excluded.is_read, is_starred=excluded.is_starred, is_outgoing=excluded.is_outgoing,
             rfc_message_id=excluded.rfc_message_id, in_reply_to=excluded.in_reply_to,
-            category=excluded.category, is_important=excluded.is_important, focus_override=excluded.focus_override",
+            category=excluded.category, is_important=excluded.is_important, focus_override=excluded.focus_override, invitation_json=excluded.invitation_json",
         params![
             m.id.0,
             m.account_id.0,
@@ -942,6 +981,7 @@ fn upsert_message_tx(tx: &Connection, m: &Message) -> Result<()> {
             m.category,
             m.is_important,
             m.focus_override,
+            m.invitation.as_ref().map(serde_json::to_string).transpose()?,
         ],
     )?;
     tx.execute("DELETE FROM message_labels WHERE message_id=?1", [&m.id.0])?;
@@ -961,13 +1001,13 @@ fn upsert_message_tx(tx: &Connection, m: &Message) -> Result<()> {
 fn upsert_event_tx(tx: &Connection, e: &Event) -> Result<()> {
     tx.execute(
         "INSERT INTO events(id, account_id, calendar_id, provider_id, ical_uid, summary, description, location, start, end, all_day, status,
-            organizer_json, attendees_json, html_link, conference_url, recurring_event_id, updated, event_type)
-         VALUES(?1,?2,?3,?4,?5,?6,?7,?8,?9,?10,?11,?12,?13,?14,?15,?16,?17,?18,?19)
+            organizer_json, attendees_json, html_link, conference_url, recurring_event_id, updated, event_type, color, reminders_json)
+         VALUES(?1,?2,?3,?4,?5,?6,?7,?8,?9,?10,?11,?12,?13,?14,?15,?16,?17,?18,?19,?20,?21)
          ON CONFLICT(id) DO UPDATE SET calendar_id=excluded.calendar_id, provider_id=excluded.provider_id, ical_uid=excluded.ical_uid,
             summary=excluded.summary, description=excluded.description, location=excluded.location, start=excluded.start, end=excluded.end,
             all_day=excluded.all_day, status=excluded.status, organizer_json=excluded.organizer_json, attendees_json=excluded.attendees_json,
             html_link=excluded.html_link, conference_url=excluded.conference_url, recurring_event_id=excluded.recurring_event_id, updated=excluded.updated,
-            event_type=excluded.event_type",
+            event_type=excluded.event_type, color=excluded.color, reminders_json=excluded.reminders_json",
         params![
             e.id.0,
             e.account_id.0,
@@ -988,6 +1028,8 @@ fn upsert_event_tx(tx: &Connection, e: &Event) -> Result<()> {
             e.recurring_event_id,
             e.updated,
             e.event_type,
+            e.color,
+            e.reminders.as_ref().map(serde_json::to_string).transpose()?,
         ],
     )?;
     Ok(())
@@ -996,7 +1038,7 @@ fn upsert_event_tx(tx: &Connection, e: &Event) -> Result<()> {
 fn load_events(c: &Connection, clause: &str, args: impl rusqlite::Params) -> Result<Vec<Event>> {
     let sql = format!(
         "SELECT e.id, e.account_id, e.calendar_id, e.provider_id, e.ical_uid, e.summary, e.description, e.location, e.start, e.end, e.all_day, e.status,
-                e.organizer_json, e.attendees_json, e.html_link, e.conference_url, e.recurring_event_id, e.updated, e.event_type FROM events e {clause}"
+                e.organizer_json, e.attendees_json, e.html_link, e.conference_url, e.recurring_event_id, e.updated, e.event_type, e.color, e.reminders_json FROM events e {clause}"
     );
     let mut stmt = c.prepare(&sql)?;
     let rows = stmt.query_map(args, |r| {
@@ -1020,11 +1062,13 @@ fn load_events(c: &Connection, clause: &str, args: impl rusqlite::Params) -> Res
             r.get::<_, Option<String>>(16)?,
             r.get::<_, i64>(17)?,
             r.get::<_, Option<String>>(18)?,
+            r.get::<_, Option<String>>(19)?,
+            r.get::<_, Option<String>>(20)?,
         ))
     })?;
     let mut out = Vec::new();
     for row in rows {
-        let (id, account, calendar, provider, ical, summary, description, location, start, end, all_day, status, organizer, attendees, link, conf, recurring, updated, event_type) = row?;
+        let (id, account, calendar, provider, ical, summary, description, location, start, end, all_day, status, organizer, attendees, link, conf, recurring, updated, event_type, color, reminders) = row?;
         out.push(Event {
             id: EventId(id),
             account_id: AccountId(account),
@@ -1045,6 +1089,8 @@ fn load_events(c: &Connection, clause: &str, args: impl rusqlite::Params) -> Res
             recurring_event_id: recurring,
             updated,
             event_type,
+            color,
+            reminders: reminders.as_deref().map(serde_json::from_str).transpose()?,
             pending: false,
         });
     }
@@ -1069,7 +1115,7 @@ fn load_messages(c: &Connection, where_clause: &str, args: impl rusqlite::Params
     let sql = format!(
         "SELECT m.id, m.account_id, m.conversation_id, m.provider_id, m.from_json, m.to_json, m.cc_json, m.bcc_json, m.reply_to_json,
                 m.subject, m.snippet, m.body_text, m.body_html, m.date, m.is_read, m.is_starred, m.is_outgoing, m.rfc_message_id, m.in_reply_to,
-                m.category, m.is_important, m.focus_override
+                m.category, m.is_important, m.focus_override, m.invitation_json
          FROM messages m {where_clause} ORDER BY m.date DESC"
     );
     let mut stmt = c.prepare(&sql)?;
@@ -1099,6 +1145,7 @@ fn load_messages(c: &Connection, where_clause: &str, args: impl rusqlite::Params
                 category: r.get(19)?,
                 is_important: r.get(20)?,
                 focus_override: r.get(21)?,
+                invitation_json: r.get(22)?,
             })
         })?
         .collect::<std::result::Result<Vec<_>, _>>()?
@@ -1164,6 +1211,7 @@ struct RawMessage {
     category: Option<String>,
     is_important: bool,
     focus_override: Option<bool>,
+    invitation_json: Option<String>,
 }
 
 impl RawMessage {
@@ -1192,6 +1240,7 @@ impl RawMessage {
             category: self.category,
             is_important: self.is_important,
             focus_override: self.focus_override,
+            invitation: self.invitation_json.as_deref().and_then(|j| serde_json::from_str(j).ok()),
         })
     }
 }
@@ -1430,6 +1479,7 @@ mod tests {
             category: None,
             is_important: false,
             focus_override: None,
+            invitation: None,
         }
     }
 
@@ -1661,6 +1711,7 @@ mod tests {
             can_edit: true,
             visible: true,
             sort_order: 0,
+            default_reminders: vec![10],
         };
         store.replace_calendars(&acct, &[cal.clone()]).unwrap();
         store.set_calendar_visible(&cal.id, false).unwrap();
@@ -1689,9 +1740,14 @@ mod tests {
             recurring_event_id: None,
             updated: 0,
             event_type: None,
+            color: None,
+            reminders: None,
             pending: false,
         };
         store.upsert_events(&[event.clone()]).unwrap();
+        assert_eq!(store.event_by_ical_uid(&acct, "e1@google.com").unwrap().unwrap().id, event.id);
+        assert_eq!(store.events_starting_between(&acct, 0, 2_000_000).unwrap().len(), 1);
+        assert_eq!(store.calendars(&acct).unwrap()[0].default_reminders, vec![10]);
         let found = store.events_between(&acct, 0, 2_000_000).unwrap();
         assert_eq!(found.len(), 1);
         assert!(found[0].is_invitation());

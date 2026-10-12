@@ -2,7 +2,7 @@
 
 use rusqlite::Connection;
 
-const MIGRATIONS: &[&str] = &[V1, V2, V3, V4];
+const MIGRATIONS: &[&str] = &[V1, V2, V3, V4, V5];
 
 pub fn migrate(conn: &Connection) -> rusqlite::Result<()> {
     let current: i64 = conn.query_row("PRAGMA user_version", [], |r| r.get(0))?;
@@ -210,5 +210,15 @@ COMMIT;
 const V4: &str = r#"
 BEGIN;
 ALTER TABLE events ADD COLUMN event_type TEXT;
+COMMIT;
+"#;
+
+const V5: &str = r#"
+BEGIN;
+ALTER TABLE events ADD COLUMN color TEXT;
+ALTER TABLE events ADD COLUMN reminders_json TEXT;
+ALTER TABLE calendars ADD COLUMN default_reminders_json TEXT NOT NULL DEFAULT '[]';
+ALTER TABLE messages ADD COLUMN invitation_json TEXT;
+CREATE INDEX events_ical ON events(account_id, ical_uid);
 COMMIT;
 "#;

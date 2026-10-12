@@ -67,7 +67,7 @@ fn sync_calendar(store: &Store, provider: &dyn CalendarProvider, account: &Accou
     }
     // Bumped when the event mapping gains fields: existing sync tokens are dropped once so
     // the window is downloaded again with the new fields.
-    const CALENDAR_COVERAGE: u32 = 2;
+    const CALENDAR_COVERAGE: u32 = 3;
     let coverage_key = format!("cal_coverage:{}", acct.0);
     let refresh = store.setting::<u32>(&coverage_key).ok().flatten().unwrap_or(1) < CALENDAR_COVERAGE;
     let calendars = store.calendars(acct).unwrap_or_default();
@@ -109,7 +109,7 @@ const DOWNLOAD_BATCH: usize = 20;
 
 /// Bump when the set of views the first download covers changes; accounts downloaded with
 /// an older version list the new views and queue what is missing, keeping their checkpoint.
-const COVERAGE_VERSION: u32 = 3;
+const COVERAGE_VERSION: u32 = 4;
 
 fn coverage_key(account: &AccountId) -> String {
     format!("download_coverage:{}", account.0)
@@ -211,7 +211,7 @@ fn download(store: &Store, provider: &dyn MailProvider, account: &Account, outco
         store.replace_labels(acct, &snapshot.labels).map_err(|e| ProviderError::Temporary(e.to_string()))?;
         store.merge_remote_messages(&snapshot.messages, &protected).map_err(|e| ProviderError::Temporary(e.to_string()))?;
         // Version 3 added category/importance hints to the mapping: refresh what is stored.
-        enqueue(store, acct, snapshot.message_ids, covered >= 3);
+        enqueue(store, acct, snapshot.message_ids, covered >= 4);
         let _ = store.set_setting(&coverage_key(acct), &COVERAGE_VERSION);
         info!("extended download coverage for {}", account.email);
         drain_backlog(store, provider, account, outcome)
@@ -234,6 +234,17 @@ fn download(store: &Store, provider: &dyn MailProvider, account: &Account, outco
                 outcome.downloaded += changes.upserts.len();
                 drain_backlog(store, provider, account, outcome)?;
                 extend_coverage(outcome)?;
+                // One-time: re-fetch messages whose calendar part was stored before
+                // invitation parsing existed.
+                let invite_key = format!("invites_parsed:{}", acct.0);
+                if store.setting::<bool>(&invite_key).ok().flatten() != Some(true) {
+                    let ids = store.messages_needing_invitation_parse(acct).unwrap_or_default();
+                    if !ids.is_empty() {
+                        enqueue(store, acct, ids, false);
+                        drain_backlog(store, provider, account, outcome)?;
+                    }
+                    let _ = store.set_setting(&invite_key, &true);
+                }
                 Ok(outcome.downloaded)
             }
             Err(ProviderError::CheckpointExpired) => {

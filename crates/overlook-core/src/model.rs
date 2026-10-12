@@ -309,6 +309,8 @@ pub struct Message {
     pub is_important: bool,
     /// User override for Focused Inbox: `Some(true)` forces Focused, `Some(false)` Other.
     pub focus_override: Option<bool>,
+    /// Calendar invitation carried by the message (from a `text/calendar` part).
+    pub invitation: Option<crate::ics::Invitation>,
 }
 
 impl Message {
@@ -715,6 +717,7 @@ mod tests {
             category: None,
             is_important: false,
             focus_override: None,
+            invitation: None,
         }
     }
 

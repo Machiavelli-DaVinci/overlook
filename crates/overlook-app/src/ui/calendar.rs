@@ -8,7 +8,7 @@ use crate::assets::icon;
 use crate::theme::ActivePalette;
 use gpui_kit::base::{h_flex, v_flex};
 use gpui_kit::component::button::{Button, ButtonVariants};
-use gpui_kit::component::input::{Input, InputState};
+use gpui_kit::component::input::{Input, InputState, Textarea, TextareaState};
 use gpui_kit::component::menu::{DropdownMenu, PopupMenuItem};
 use gpui_kit::component::notification::Notification;
 use gpui_kit::component::scroll::ScrollableElement;
@@ -32,6 +32,7 @@ pub enum Module {
 pub enum CalView {
     Day,
     Week,
+    Month,
     Agenda,
 }
 
@@ -45,9 +46,16 @@ pub struct NewEvent {
     pub start: Entity<InputState>,
     pub end: Entity<InputState>,
     pub location: Entity<InputState>,
+    pub description: Entity<TextareaState>,
     pub calendar: Option<CalendarId>,
     pub all_day: bool,
     pub error: Option<String>,
+    /// `Some` when editing an existing event.
+    pub editing: Option<EventId>,
+}
+
+fn clock_text(ts: i64) -> String {
+    tz::format_clock(ts)
 }
 
 fn hex_to_hsla(hex: &str) -> Option<Hsla> {
@@ -64,6 +72,10 @@ impl MailWindow {
             CalView::Week => {
                 let start = tz::week_start(self.cal_anchor, true);
                 (start, tz::add_days(start, 7))
+            }
+            CalView::Month => {
+                let start = tz::week_start(tz::month_start(self.cal_anchor), true);
+                (start, tz::add_days(start, 42))
             }
             CalView::Agenda => (self.cal_anchor, tz::add_days(self.cal_anchor, AGENDA_DAYS)),
         }
@@ -103,12 +115,12 @@ impl MailWindow {
     }
 
     pub(crate) fn cal_step(&mut self, direction: i32, cx: &mut Context<Self>) {
-        let days = match self.cal_view {
-            CalView::Day => 1,
-            CalView::Week => 7,
-            CalView::Agenda => AGENDA_DAYS,
+        self.cal_anchor = match self.cal_view {
+            CalView::Day => tz::add_days(self.cal_anchor, direction),
+            CalView::Week => tz::add_days(self.cal_anchor, direction * 7),
+            CalView::Month => tz::add_months(tz::month_start(self.cal_anchor), direction),
+            CalView::Agenda => tz::add_days(self.cal_anchor, direction * AGENDA_DAYS),
         };
-        self.cal_anchor = tz::add_days(self.cal_anchor, direction * days);
         self.reload_calendar();
         cx.notify();
     }
@@ -134,6 +146,73 @@ impl MailWindow {
 
     fn calendar_of(&self, event: &Event) -> Option<&Calendar> {
         self.calendars.iter().find(|c| c.id == event.calendar_id)
+    }
+
+    /// Switches to the calendar, moves to the event's day, and selects it.
+    pub(crate) fn show_event_in_calendar(&mut self, id: EventId, window: &mut Window, cx: &mut Context<Self>) {
+        let Some(event) = self.store.event(&id).ok().flatten() else { return };
+        self.set_module(Module::Calendar, window, cx);
+        self.cal_anchor = tz::day_start(event.start);
+        if self.cal_view == CalView::Agenda {
+            self.cal_view = CalView::Week;
+        }
+        self.new_event = None;
+        self.reload_calendar();
+        self.cal_selected = Some(id);
+        cx.notify();
+    }
+
+    /// Fires due reminders: a desktop notification plus an in-app toast, once per event
+    /// and offset per session.
+    pub(crate) fn check_reminders(&mut self, window: &mut Window, cx: &mut Context<Self>) {
+        if !self.reminders_enabled {
+            return;
+        }
+        let now_ms = now();
+        let horizon = now_ms + 2 * 3_600_000;
+        let accounts = self.accounts.clone();
+        for account in accounts {
+            let calendars = self.store.calendars(&account.id).unwrap_or_default();
+            let Ok(events) = self.store.events_starting_between(&account.id, now_ms - 60_000, horizon) else { continue };
+            for event in events {
+                if event.my_response() == Some(ResponseStatus::Declined) || event.is_working_location() {
+                    continue;
+                }
+                // Google reports no default for some calendars; 10 minutes is Google's own
+                // default and close to Outlook's 15, and reminders can be switched off.
+                let defaults: Vec<i32> = calendars.iter().find(|c| c.id == event.calendar_id).map(|c| c.default_reminders.clone()).filter(|d| !d.is_empty()).unwrap_or_else(|| vec![10]);
+                let offsets: Vec<i32> = event.effective_reminders(&defaults).to_vec();
+                for minutes in offsets {
+                    let fire_at = event.start - i64::from(minutes) * 60_000;
+                    let key = (event.id.clone(), minutes);
+                    if fire_at <= now_ms && event.start > now_ms - 60_000 && !self.notified.contains(&key) {
+                        self.notified.insert(key);
+                        let remaining = ((event.start - now_ms) / 60_000).max(0);
+                        let when = if remaining == 0 { "now".to_owned() } else { format!("in {remaining} min") };
+                        let title = event.display_title();
+                        let mut body = format!("{} · {} – {}", when, tz::format_clock(event.start), tz::format_clock(event.end));
+                        if let Some(l) = &event.location {
+                            body.push_str(&format!("\n{l}"));
+                        }
+                        crate::notify::desktop(title.clone(), body);
+                        window.push_notification(Notification::info(format!("{title} · {when}")), cx);
+                    }
+                }
+            }
+        }
+    }
+
+    pub(crate) fn start_edit_event(&mut self, id: EventId, window: &mut Window, cx: &mut Context<Self>) {
+        let Some(event) = self.store.event(&id).ok().flatten() else { return };
+        let title = cx.new(|cx| InputState::new(window, cx).placeholder("Add a title").default_value(event.summary.clone()));
+        let date = cx.new(|cx| InputState::new(window, cx).placeholder("YYYY-MM-DD").default_value(tz::local_date(event.start).to_string()));
+        let start = cx.new(|cx| InputState::new(window, cx).placeholder("9:00 AM").default_value(clock_text(event.start)));
+        let end = cx.new(|cx| InputState::new(window, cx).placeholder("10:00 AM").default_value(clock_text(if event.all_day { event.start + 3_600_000 } else { event.end })));
+        let location = cx.new(|cx| InputState::new(window, cx).placeholder("Add a location").default_value(event.location.clone().unwrap_or_default()));
+        let description = cx.new(|cx| TextareaState::new(window, cx).placeholder("Add a description").default_value(event.description.clone().unwrap_or_default()));
+        title.update(cx, |s, cx| s.focus(window, cx));
+        self.new_event = Some(NewEvent { title, date, start, end, location, description, calendar: Some(event.calendar_id.clone()), all_day: event.all_day, error: None, editing: Some(id) });
+        cx.notify();
     }
 
     pub(crate) fn respond_to_event(&mut self, id: EventId, response: ResponseStatus, window: &mut Window, cx: &mut Context<Self>) {
@@ -200,9 +279,10 @@ impl MailWindow {
         let start = cx.new(|cx| InputState::new(window, cx).placeholder("9:00 AM").default_value(next_hour));
         let end = cx.new(|cx| InputState::new(window, cx).placeholder("10:00 AM").default_value(end_hour));
         let location = cx.new(|cx| InputState::new(window, cx).placeholder("Add a location"));
+        let description = cx.new(|cx| TextareaState::new(window, cx).placeholder("Add a description"));
         title.update(cx, |s, cx| s.focus(window, cx));
         self.cal_selected = None;
-        self.new_event = Some(NewEvent { title, date, start, end, location, calendar, all_day: false, error: None });
+        self.new_event = Some(NewEvent { title, date, start, end, location, description, calendar, all_day: false, error: None, editing: None });
         cx.notify();
     }
 
@@ -219,7 +299,9 @@ impl MailWindow {
         let start_text = form.start.read(cx).value().trim().to_owned();
         let end_text = form.end.read(cx).value().trim().to_owned();
         let location = form.location.read(cx).value().trim().to_owned();
+        let description = form.description.read(cx).value().trim().to_owned();
         let all_day = form.all_day;
+        let editing = form.editing.clone();
         let calendar = form.calendar.clone().and_then(|id| self.calendars.iter().find(|c| c.id == id).cloned());
         let fail = |msg: &str, this: &mut Self, cx: &mut Context<Self>| {
             if let Some(f) = this.new_event.as_mut() {
@@ -242,6 +324,32 @@ impl MailWindow {
             }
             (s, e)
         };
+        if let Some(existing_id) = editing {
+            let Some(mut existing) = self.store.event(&existing_id).ok().flatten() else { return fail("This event no longer exists.", self, cx) };
+            existing.summary = if title.is_empty() { "(No title)".into() } else { title };
+            existing.location = if location.is_empty() { None } else { Some(location) };
+            existing.description = if description.is_empty() { None } else { Some(description) };
+            existing.start = start;
+            existing.end = end;
+            existing.all_day = all_day;
+            existing.updated = now();
+            match self.store.apply_event_change(&self.account.id, &existing, OperationKind::UpdateEvent { event_id: existing_id.clone() }) {
+                Ok(_) => {
+                    self.new_event = None;
+                    self.cal_anchor = tz::day_start(start);
+                    self.reload_calendar();
+                    self.cal_selected = Some(existing_id);
+                    self.cal_focus.focus(window, cx);
+                    cx.notify();
+                    window.push_notification(Notification::info("Saved on this device. Syncing to your calendar…"), cx);
+                    if self.connected(&self.account.id) {
+                        self.sync_now(window, cx);
+                    }
+                }
+                Err(e) => fail(&format!("Couldn’t save the event: {e}"), self, cx),
+            }
+            return;
+        }
         let pid = new_provider_event_id();
         let event = Event {
             id: EventId(format!("{}:{pid}", calendar.id.0)),
@@ -250,7 +358,7 @@ impl MailWindow {
             provider_id: Some(ProviderId(pid)),
             ical_uid: None,
             summary: if title.is_empty() { "(No title)".into() } else { title },
-            description: None,
+            description: if description.is_empty() { None } else { Some(description) },
             location: if location.is_empty() { None } else { Some(location) },
             start,
             end,
@@ -263,6 +371,8 @@ impl MailWindow {
             recurring_event_id: None,
             updated: now(),
             event_type: None,
+            color: None,
+            reminders: None,
             pending: true,
         };
         match self.store.apply_event_change(&self.account.id, &event, OperationKind::CreateEvent { event_id: event.id.clone() }) {
@@ -380,6 +490,7 @@ impl MailWindow {
         let title = match self.cal_view {
             CalView::Day => tz::zoned(self.cal_anchor).strftime("%A, %B %-d, %Y").to_string(),
             CalView::Week => tz::format_week_range(from),
+            CalView::Month => tz::format_month_year(self.cal_anchor),
             CalView::Agenda => format!("{} – {}", tz::format_day(from), tz::format_day(tz::add_days(to, -1))),
         };
         let view_button = |label: &'static str, view: CalView, cx: &mut Context<Self>| {
@@ -412,6 +523,7 @@ impl MailWindow {
                     .border_color(p.divider)
                     .child(view_button("Day", CalView::Day, cx))
                     .child(view_button("Week", CalView::Week, cx))
+                    .child(view_button("Month", CalView::Month, cx))
                     .child(view_button("Agenda", CalView::Agenda, cx)),
             );
 
@@ -453,6 +565,7 @@ impl MailWindow {
         let grid: AnyElement = match self.cal_view {
             CalView::Day => self.render_time_grid(from, 1, cx).into_any_element(),
             CalView::Week => self.render_time_grid(from, 7, cx).into_any_element(),
+            CalView::Month => self.render_month_grid(from, cx).into_any_element(),
             CalView::Agenda => self.render_agenda(from, cx).into_any_element(),
         };
 
@@ -604,7 +717,12 @@ impl MailWindow {
     }
 
     fn event_colors(&self, e: &Event, p: &crate::theme::Palette) -> (Hsla, Hsla) {
-        let base = self.calendar_of(e).and_then(|c| c.color.as_deref()).and_then(hex_to_hsla).unwrap_or(p.accent);
+        let base = e
+            .color
+            .as_deref()
+            .and_then(hex_to_hsla)
+            .or_else(|| self.calendar_of(e).and_then(|c| c.color.as_deref()).and_then(hex_to_hsla))
+            .unwrap_or(p.accent);
         let mut fill = base;
         fill.a = if p.is_dark() { 0.28 } else { 0.18 };
         let mut edge = base;
@@ -670,6 +788,104 @@ impl MailWindow {
                 this.cal_selected = Some(id.clone());
                 cx.notify();
             }))
+    }
+
+    fn render_month_grid(&self, from: i64, cx: &mut Context<Self>) -> impl IntoElement {
+        let p = *cx.palette();
+        let today = tz::day_start(now());
+        let month = tz::local_date(self.cal_anchor).month();
+        let header = h_flex().border_b_1().border_color(p.divider).children(["Mon", "Tue", "Wed", "Thu", "Fri", "Sat", "Sun"].iter().map(|d| {
+            div().flex_1().py(px(6.)).text_size(px(11.)).font_weight(FontWeight::MEDIUM).text_color(p.muted).child(div().px(px(8.)).child(d.to_uppercase()))
+        }));
+        let mut rows = v_flex().flex_1().min_h_0();
+        for week in 0..6 {
+            let mut row = h_flex().flex_1().min_h_0().border_b_1().border_color(p.divider);
+            for dow in 0..7 {
+                let day = tz::add_days(from, week * 7 + dow);
+                let next = tz::add_days(day, 1);
+                let z = tz::zoned(day);
+                let in_month = z.month() == month;
+                let is_today = day == today;
+                let mut events: Vec<&Event> = self.cal_events.iter().filter(|e| !e.is_working_location() && e.overlaps(day, next)).collect();
+                events.sort_by_key(|e| (!e.all_day, e.start));
+                let shown = events.iter().take(3).copied().collect::<Vec<_>>();
+                let more = events.len().saturating_sub(shown.len());
+                let day_for_click = day;
+                row = row.child(
+                    v_flex()
+                        .id(SharedString::from(format!("month-{day}")))
+                        .flex_1()
+                        .min_w_0()
+                        .min_h(px(96.))
+                        .p(px(4.))
+                        .gap(px(2.))
+                        .border_l_1()
+                        .border_color(p.divider)
+                        .when(!in_month, |d| d.bg(p.background))
+                        .child(
+                            h_flex().justify_end().child(
+                                div()
+                                    .id(SharedString::from(format!("month-day-{day}")))
+                                    .size(px(24.))
+                                    .rounded_full()
+                                    .flex()
+                                    .items_center()
+                                    .justify_center()
+                                    .text_size(px(12.))
+                                    .cursor_pointer()
+                                    .text_color(if in_month { p.foreground } else { p.muted })
+                                    .when(is_today, |d| d.bg(p.action).text_color(p.on_action).font_weight(FontWeight::SEMIBOLD))
+                                    .hover(|d| d.bg(p.hover))
+                                    .child(z.day().to_string())
+                                    .on_click(cx.listener(move |this, _, _w, cx| {
+                                        this.cal_anchor = day_for_click;
+                                        this.set_cal_view(CalView::Day, cx);
+                                    })),
+                            ),
+                        )
+                        .children(shown.into_iter().map(|e| {
+                            let (fill, edge) = self.event_colors(e, &p);
+                            let id = e.id.clone();
+                            let label = if e.all_day { e.display_title() } else { format!("{} {}", tz::format_clock(e.start), e.display_title()) };
+                            div()
+                                .id(SharedString::from(format!("mev-{}-{day}", e.id)))
+                                .px(px(5.))
+                                .py(px(1.))
+                                .rounded(px(4.))
+                                .bg(fill)
+                                .border_l_2()
+                                .border_color(edge)
+                                .text_size(px(11.))
+                                .truncate()
+                                .cursor_pointer()
+                                .when(self.cal_selected.as_ref() == Some(&e.id), |d| d.bg(fill.opacity(1.0)))
+                                .child(label)
+                                .on_click(cx.listener(move |this, _, _w, cx| {
+                                    this.new_event = None;
+                                    this.cal_selected = Some(id.clone());
+                                    cx.notify();
+                                }))
+                        }))
+                        .when(more > 0, |d| {
+                            d.child(
+                                div()
+                                    .id(SharedString::from(format!("more-{day}")))
+                                    .px(px(5.))
+                                    .text_size(px(11.))
+                                    .text_color(p.muted)
+                                    .cursor_pointer()
+                                    .child(format!("+{more} more"))
+                                    .on_click(cx.listener(move |this, _, _w, cx| {
+                                        this.cal_anchor = day_for_click;
+                                        this.set_cal_view(CalView::Day, cx);
+                                    })),
+                            )
+                        }),
+                );
+            }
+            rows = rows.child(row);
+        }
+        v_flex().id("month-grid").size_full().child(header).child(rows).overflow_y_scrollbar()
     }
 
     fn render_agenda(&self, from: i64, cx: &mut Context<Self>) -> impl IntoElement {
@@ -746,7 +962,20 @@ impl MailWindow {
         };
         let my = e.my_response();
         let id = e.id.clone();
-        let can_delete = calendar.is_some_and(|c| c.can_edit) && (e.attendees.is_empty() || e.my_attendance().is_some_and(|a| a.is_organizer) || e.organizer.as_ref().is_some_and(|o| o.email.eq_ignore_ascii_case(&self.account.email)));
+        let can_edit = calendar.is_some_and(|c| e.editable_by(&self.account.email, c));
+        let can_delete = can_edit;
+        let defaults: Vec<i32> = calendar.map(|c| c.default_reminders.clone()).filter(|d| !d.is_empty()).unwrap_or_else(|| vec![10]);
+        let reminders: Vec<i32> = e.effective_reminders(&defaults).to_vec();
+        let reminder_text = if reminders.is_empty() || e.all_day {
+            None
+        } else {
+            Some(reminders.iter().map(|m| match *m {
+                0 => "at start".to_owned(),
+                m if m % 1440 == 0 => format!("{} day{} before", m / 1440, if m == 1440 { "" } else { "s" }),
+                m if m % 60 == 0 => format!("{} hour{} before", m / 60, if m == 60 { "" } else { "s" }),
+                m => format!("{m} minutes before"),
+            }).collect::<Vec<_>>().join(", "))
+        };
         let response_button = |label: &'static str, response: ResponseStatus, icon_name: &'static str, cx: &mut Context<Self>| {
             let id = id.clone();
             Button::new(SharedString::from(format!("rsvp-{label}")))
@@ -779,6 +1008,7 @@ impl MailWindow {
                 .child(h_flex().gap(px(8.)).items_center().child(icon("clock").size(px(15.)).text_color(p.muted)).child(when))
                 .children(e.location.clone().map(|l| h_flex().gap(px(8.)).items_center().child(icon("map-pin").size(px(15.)).text_color(p.muted)).child(div().flex_1().child(l))))
                 .children(calendar.map(|c| h_flex().gap(px(8.)).items_center().child(icon("calendar").size(px(15.)).text_color(p.muted)).child(c.name.clone())))
+                .children(reminder_text.map(|t| h_flex().gap(px(8.)).items_center().child(icon("bell").size(px(15.)).text_color(p.muted)).child(format!("Reminder {t}"))))
                 .when(e.pending, |d| d.child(h_flex().gap(px(8.)).items_center().text_color(p.warning).child(icon("cloud-off").size(px(15.)).text_color(p.warning)).child("Saved on this device, waiting to sync"))))
             .when(e.is_invitation(), |d| {
                 d.child(
@@ -792,7 +1022,7 @@ impl MailWindow {
                             h_flex()
                                 .gap(px(6.))
                                 .child(response_button("Accept", ResponseStatus::Accepted, "check", cx))
-                                .child(response_button("Tentative", ResponseStatus::Tentative, "circle-help", cx))
+                                .child(response_button("Tentative", ResponseStatus::Tentative, "circle-question-mark", cx))
                                 .child(response_button("Decline", ResponseStatus::Declined, "x", cx)),
                         ),
                 )
@@ -816,7 +1046,7 @@ impl MailWindow {
                             let (ic, color) = match a.response {
                                 ResponseStatus::Accepted => ("circle-check", p.success),
                                 ResponseStatus::Declined => ("circle-x", p.error),
-                                ResponseStatus::Tentative => ("circle-help", p.warning),
+                                ResponseStatus::Tentative => ("circle-question-mark", p.warning),
                                 ResponseStatus::NeedsAction => ("circle", p.muted),
                             };
                             h_flex()
@@ -831,9 +1061,15 @@ impl MailWindow {
             })
             .children(description_html.map(|html| div().text_size(px(13.)).line_height(px(20.)).child(TextView::html(SharedString::from(format!("evdesc-{}", e.id)), html).selectable(true))))
             .child(div().flex_1())
-            .when(can_delete, |d| {
-                let id = e.id.clone();
-                d.child(Button::new("delete-event").ghost().small().icon(icon("trash").size(px(14.)).text_color(p.error)).label("Delete event").on_click(cx.listener(move |this, _, window, cx| this.delete_event(id.clone(), window, cx))))
+            .when(can_edit || can_delete, |d| {
+                let edit_id = e.id.clone();
+                let del_id = e.id.clone();
+                d.child(
+                    h_flex()
+                        .gap(px(6.))
+                        .when(can_edit, |r| r.child(Button::new("edit-event").small().icon(icon("pencil").size(px(14.))).label("Edit").on_click(cx.listener(move |this, _, window, cx| this.start_edit_event(edit_id.clone(), window, cx)))))
+                        .when(can_delete, |r| r.child(Button::new("delete-event").ghost().small().icon(icon("trash").size(px(14.)).text_color(p.error)).label("Delete").on_click(cx.listener(move |this, _, window, cx| this.delete_event(del_id.clone(), window, cx))))),
+                )
             })
     }
 
@@ -851,7 +1087,7 @@ impl MailWindow {
             .size_full()
             .p(px(20.))
             .gap(px(12.))
-            .child(h_flex().items_center().child(div().flex_1().text_size(px(16.)).font_weight(FontWeight::SEMIBOLD).child("New event")).child(Button::new("cancel-new-event").ghost().xsmall().icon(icon("x").size(px(14.))).on_click(cx.listener(|this, _, window, cx| this.cancel_new_event(window, cx)))))
+            .child(h_flex().items_center().child(div().flex_1().text_size(px(16.)).font_weight(FontWeight::SEMIBOLD).child(if form.editing.is_some() { "Edit event" } else { "New event" })).child(Button::new("cancel-new-event").ghost().xsmall().icon(icon("x").size(px(14.))).on_click(cx.listener(|this, _, window, cx| this.cancel_new_event(window, cx)))))
             .child(field("Title", Input::new(&form.title).into_any_element()))
             .child(field("Date", Input::new(&form.date).into_any_element()))
             .child(h_flex().items_center().gap(px(10.)).child(Switch::new("all-day").checked(form.all_day).label("All day").on_click(cx.listener(|this, checked: &bool, _w, cx| {
@@ -862,7 +1098,8 @@ impl MailWindow {
             }))))
             .when(!form.all_day, |d| d.child(h_flex().gap(px(10.)).child(div().flex_1().child(field("Start", Input::new(&form.start).into_any_element()))).child(div().flex_1().child(field("End", Input::new(&form.end).into_any_element())))))
             .child(field("Location", Input::new(&form.location).into_any_element()))
-            .child(field(
+            .child(field("Description", div().h(px(120.)).child(Textarea::new(&form.description).h_full()).into_any_element()))
+            .when(form.editing.is_none(), |d| d.child(field(
                 "Calendar",
                 Button::new("pick-calendar")
                     .small()
@@ -884,7 +1121,7 @@ impl MailWindow {
                         menu
                     })
                     .into_any_element(),
-            ))
+            )))
             .children(form.error.clone().map(|e| h_flex().gap(px(6.)).items_center().text_size(px(12.)).text_color(p.error).child(icon("circle-alert").size(px(14.)).text_color(p.error)).child(e)))
             .child(div().flex_1())
             .child(h_flex().gap(px(8.)).child(Button::new("save-event").primary().label("Save").on_click(cx.listener(|this, _, window, cx| this.save_new_event(window, cx)))).child(Button::new("discard-event").ghost().label("Cancel").on_click(cx.listener(|this, _, window, cx| this.cancel_new_event(window, cx)))))

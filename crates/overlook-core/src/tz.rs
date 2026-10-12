@@ -42,6 +42,18 @@ pub fn week_start(ts: Timestamp, monday: bool) -> Timestamp {
     date_start(date.checked_sub((back as i32).days()).unwrap_or(date))
 }
 
+/// Midnight on the first day of the month containing `ts`.
+pub fn month_start(ts: Timestamp) -> Timestamp {
+    let d = local_date(ts);
+    date_start(d.first_of_month())
+}
+
+/// The same day `n` months later (clamped to the month length), at local midnight.
+pub fn add_months(ts: Timestamp, n: i32) -> Timestamp {
+    let d = local_date(ts);
+    date_start(d.checked_add(n.months()).unwrap_or(d))
+}
+
 pub fn add_days(ts: Timestamp, days: i32) -> Timestamp {
     let date = local_date(ts);
     date_start(date.checked_add(days.days()).unwrap_or(date))
@@ -156,6 +168,14 @@ mod tests {
         assert_eq!(minutes_into_day(wednesday + 9 * 3_600_000 + 30 * 60_000), 570);
         assert_eq!(local_date(wednesday).day(), 14);
         assert!(format_week_range(monday).starts_with("Oct 12 – 18"));
+    }
+
+    #[test]
+    fn month_math() {
+        let mid = date_start(Date::constant(2026, 10, 31));
+        assert_eq!(local_date(month_start(mid)).day(), 1);
+        assert_eq!(local_date(add_months(mid, 1)), Date::constant(2026, 11, 30));
+        assert_eq!(local_date(add_months(month_start(mid), -1)), Date::constant(2026, 9, 1));
     }
 
     #[test]

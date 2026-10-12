@@ -359,6 +359,7 @@ impl MailWindow {
                         .child("This message hasn’t been downloaded. Connect to read it."),
                 )
             })
+            .children(m.invitation.as_ref().map(|inv| self.render_invitation_card(inv, cx)))
             .when(sanitized.blocked_remote > 0, |d| {
                 d.child(
                     h_flex()
@@ -441,6 +442,85 @@ impl MailWindow {
                     })),
             )
             .on_click(cx.listener(move |this, _, window, cx| this.open_attachment(open.clone(), window, cx)))
+    }
+
+    /// Invitation card for messages that carry a `text/calendar` part.
+    fn render_invitation_card(&self, inv: &overlook_core::ics::Invitation, cx: &mut Context<Self>) -> impl IntoElement {
+        let p = *cx.palette();
+        let event = self.store.event_by_ical_uid(&self.account.id, &inv.uid).ok().flatten();
+        let title = event.as_ref().map(|e| e.display_title()).or_else(|| inv.summary.clone()).unwrap_or_else(|| "Invitation".into());
+        let when = match &event {
+            Some(e) if e.all_day => format!("{} · All day", overlook_core::tz::format_day(e.start)),
+            Some(e) => format!("{} · {} – {}", overlook_core::tz::zoned(e.start).strftime("%A, %B %-d"), overlook_core::tz::format_clock(e.start), overlook_core::tz::format_clock(e.end)),
+            None => match inv.start {
+                Some(s) if inv.all_day => format!("{} · All day", overlook_core::tz::format_day(s)),
+                Some(s) => format!("{} · {}", overlook_core::tz::zoned(s).strftime("%A, %B %-d"), overlook_core::tz::format_clock(s)),
+                None => String::new(),
+            },
+        };
+        let my = event.as_ref().and_then(|e| e.my_response());
+        let status_line = if inv.is_cancellation() {
+            Some(("This event was cancelled.".to_owned(), p.error))
+        } else if event.is_none() {
+            Some(("Not on your calendar yet. It will appear after the next calendar sync.".to_owned(), p.muted))
+        } else {
+            my.filter(|r| *r != ResponseStatus::NeedsAction).map(|r| (format!("You {} this invitation.", r.label().to_lowercase()), p.success))
+        };
+        let event_id = event.as_ref().map(|e| e.id.clone());
+        let can_respond = !inv.is_cancellation() && event.as_ref().is_some_and(|e| e.is_invitation());
+        let response_button = |label: &'static str, response: ResponseStatus, icon_name: &'static str, cx: &mut Context<Self>| {
+            let id = event_id.clone();
+            Button::new(SharedString::from(format!("inv-{label}")))
+                .small()
+                .icon(icon(icon_name).size(px(14.)))
+                .label(label)
+                .when(my == Some(response), |b| b.primary())
+                .on_click(cx.listener(move |this, _, window, cx| {
+                    if let Some(id) = id.clone() {
+                        this.respond_to_event(id, response, window, cx);
+                    }
+                }))
+        };
+        v_flex()
+            .gap(px(10.))
+            .px(px(14.))
+            .py(px(12.))
+            .rounded(px(10.))
+            .border_1()
+            .border_color(p.divider)
+            .bg(p.chip)
+            .child(
+                h_flex()
+                    .items_start()
+                    .gap(px(10.))
+                    .child(icon("calendar").size(px(18.)).text_color(p.accent))
+                    .child(
+                        v_flex()
+                            .flex_1()
+                            .min_w_0()
+                            .child(div().text_size(px(14.)).font_weight(FontWeight::SEMIBOLD).child(title))
+                            .when(!when.is_empty(), |d| d.child(div().text_size(px(12.)).text_color(p.muted).child(when)))
+                            .children(event.as_ref().and_then(|e| e.location.clone()).map(|l| div().text_size(px(12.)).text_color(p.muted).child(l))),
+                    ),
+            )
+            .children(status_line.map(|(text, color)| div().text_size(px(12.)).text_color(color).child(text)))
+            .child(
+                h_flex()
+                    .gap(px(6.))
+                    .when(can_respond, |r| {
+                        r.child(response_button("Accept", ResponseStatus::Accepted, "check", cx))
+                            .child(response_button("Tentative", ResponseStatus::Tentative, "circle-question-mark", cx))
+                            .child(response_button("Decline", ResponseStatus::Declined, "x", cx))
+                    })
+                    .children(event_id.clone().map(|id| {
+                        Button::new("show-in-calendar")
+                            .ghost()
+                            .small()
+                            .icon(icon("calendar-days").size(px(14.)))
+                            .label("Show in calendar")
+                            .on_click(cx.listener(move |this, _, window, cx| this.show_event_in_calendar(id.clone(), window, cx)))
+                    })),
+            )
     }
 
     fn render_outbox_item(&self, d: &Draft, cx: &mut Context<Self>) -> impl IntoElement {

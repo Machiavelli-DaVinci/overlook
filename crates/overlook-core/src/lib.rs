@@ -9,6 +9,7 @@
 pub mod appearance;
 pub mod calendar;
 pub mod focus;
+pub mod ics;
 pub mod ids;
 pub mod model;
 pub mod ops;

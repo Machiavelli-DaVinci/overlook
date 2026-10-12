@@ -4756,6 +4756,7 @@ dependencies = [
  "anyhow",
  "directories",
  "gpui-kit",
+ "notify-rust",
  "oo7 0.4.3",
  "overlook-core",
  "overlook-provider",

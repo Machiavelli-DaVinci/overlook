@@ -39,12 +39,12 @@ Working end to end against the user's real account: sign-in through the system b
 
 ## Daily-use features (added later on 12 October 2026, at the user's request)
 
-Focused Inbox (local classification with per-sender rules), attachment download/open/save, and Google Calendar (week/day/agenda, invitations with Accept/Tentative/Decline, new event, delete, incremental sync) are implemented and validated against the user's real account: 1,189 event instances downloaded, working-location entries shown in the day header. Calendar was deferred in the product plan; the user explicitly moved it up. See `overlook-native-app.md`.
+Focused Inbox (local classification with per-sender rules), attachment download/open/save, and Google Calendar (week/day/month/agenda, invitations with Accept/Tentative/Decline in the calendar and inside the mail reader, new/edit/delete event, reminders with desktop notifications, event colors, incremental sync) are implemented and validated against the user's real account: 1,189 event instances downloaded, working-location entries shown in the day header. Calendar was deferred in the product plan; the user explicitly moved it up. See `overlook-native-app.md`.
 
 ## What does not exist yet
 
 - Inline `cid:` images, progressive download of older mail history, Gmail batch requests.
-- Calendar: editing existing events (only create/delete/respond), reminders and notifications, month view, invitations surfaced inside the mail reader, multiple-calendar colors from Google's palette beyond the background color.
+- Calendar: recurring-series editing (edits apply to the single instance), attendee editing in the form, drag to move or resize, time-zone display for events in other zones, calendars from more than one account merged in one view.
 - Rich-text composition, signatures, HTML output. Received-attachment download. Multi-select, drag-and-drop, undo.
 - A proper table layout in the HTML view; GNOME/KDE/fractional-scaling checks; screen-reader checks; Flatpak build.
 

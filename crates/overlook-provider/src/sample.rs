@@ -197,6 +197,7 @@ pub fn sent_message(
         category: None,
         is_important: false,
         focus_override: None,
+        invitation: None,
     }
 }
 
@@ -277,6 +278,7 @@ pub fn sample_mailbox(account: &Account, now: Timestamp) -> MailboxSnapshot {
             category: None,
             is_important: false,
             focus_override: None,
+            invitation: None,
         }
     };
 

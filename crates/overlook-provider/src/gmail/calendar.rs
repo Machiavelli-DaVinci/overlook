@@ -51,6 +51,37 @@ pub fn calendar_from_json(account: &AccountId, v: &Value, sort_order: i32) -> Op
         can_edit: matches!(role, "owner" | "writer"),
         visible: v.get("selected").and_then(|s| s.as_bool()).unwrap_or(true),
         sort_order,
+        default_reminders: popup_minutes(v.get("defaultReminders")),
+    })
+}
+
+/// Popup reminder offsets from a Google `reminders` array.
+fn popup_minutes(v: Option<&Value>) -> Vec<i32> {
+    v.and_then(|a| a.as_array())
+        .map(|arr| {
+            arr.iter()
+                .filter(|r| r.get("method").and_then(|m| m.as_str()).is_none_or(|m| m == "popup"))
+                .filter_map(|r| r.get("minutes").and_then(|m| m.as_i64()).map(|m| m as i32))
+                .collect()
+        })
+        .unwrap_or_default()
+}
+
+/// Google's fixed event color palette (`colorId` 1–11).
+pub fn event_color_hex(color_id: &str) -> Option<&'static str> {
+    Some(match color_id {
+        "1" => "#7986cb",
+        "2" => "#33b679",
+        "3" => "#8e24aa",
+        "4" => "#e67c73",
+        "5" => "#f6c026",
+        "6" => "#f5511d",
+        "7" => "#039be5",
+        "8" => "#616161",
+        "9" => "#3f51b5",
+        "10" => "#0b8043",
+        "11" => "#d60000",
+        _ => return None,
     })
 }
 
@@ -93,10 +124,16 @@ pub fn event_from_json(account: &Account, calendar: &Calendar, v: &Value) -> Opt
             recurring_event_id: None,
             updated: 0,
             event_type: None,
+            color: None,
+            reminders: None,
             pending: false,
         });
     }
     let (start, all_day) = parse_when(v.get("start"))?;
+    let reminders = match v.get("reminders") {
+        Some(r) if r.get("useDefault").and_then(|u| u.as_bool()) == Some(false) => Some(popup_minutes(r.get("overrides"))),
+        _ => None,
+    };
     let (end, _) = parse_when(v.get("end")).unwrap_or((start + 3_600_000, all_day));
     let attendees: Vec<Attendee> = v
         .get("attendees")
@@ -162,6 +199,8 @@ pub fn event_from_json(account: &Account, calendar: &Calendar, v: &Value) -> Opt
             "focusTime" => "focus-time".to_owned(),
             other => other.to_owned(),
         }),
+        color: v.get("colorId").and_then(|c| c.as_str()).and_then(event_color_hex).map(str::to_owned),
+        reminders,
         pending: false,
     })
 }
@@ -188,6 +227,9 @@ pub fn event_to_json(event: &Event) -> Value {
     }
     if !event.attendees.is_empty() {
         body["attendees"] = Value::Array(event.attendees.iter().map(attendee_to_json).collect());
+    }
+    if let Some(r) = &event.reminders {
+        body["reminders"] = json!({ "useDefault": false, "overrides": r.iter().map(|m| json!({"method": "popup", "minutes": m})).collect::<Vec<_>>() });
     }
     body
 }
@@ -368,6 +410,10 @@ mod tests {
         assert!(timed.is_invitation());
         assert_eq!(timed.my_response(), Some(ResponseStatus::NeedsAction));
         assert_eq!(timed.conference_url.as_deref(), Some("https://meet.google.com/abc"));
+        assert_eq!(timed.reminders, None);
+        let colored = event_from_json(&account(), &cal, &json!({"id":"k","summary":"x","colorId":"7","start":{"dateTime":"2026-10-14T09:00:00-07:00"},"end":{"dateTime":"2026-10-14T09:30:00-07:00"},"reminders":{"useDefault":false,"overrides":[{"method":"popup","minutes":30},{"method":"email","minutes":60}]}})).unwrap();
+        assert_eq!(colored.color.as_deref(), Some("#039be5"));
+        assert_eq!(colored.reminders, Some(vec![30]));
         let all_day = event_from_json(&account(), &cal, &json!({"id":"d1","summary":"Offsite","start":{"date":"2026-10-20"},"end":{"date":"2026-10-22"}})).unwrap();
         assert!(all_day.all_day);
         assert_eq!(all_day.end - all_day.start, 2 * 86_400_000);
