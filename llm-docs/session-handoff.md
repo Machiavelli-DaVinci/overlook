@@ -113,3 +113,5 @@ Brand assets and the HTML design preview keep their existing maintenance command
 - v0.1.2 published 2026-10-12 (rendering review: pre-pass, quoted text, inline images, vendored parser patches). Working version is now 0.1.3.
 
 - v0.1.3 published 2026-10-12 (Settings segmented controls show the current choice). Working version is now 0.1.4.
+
+- v0.1.4 published 2026-10-12 (shared segmented control with visible selection in header, calendar toolbar, Settings). Working version is now 0.1.5.
