@@ -1,0 +1,37 @@
+# Flatpak manifest draft. Not yet built: flatpak-builder is not installed on the
+# development machine. Validate against the Freedesktop 25.08 runtime and adjust the
+# offline cargo sources (flatpak-cargo-generator) before the first build.
+app-id: ai.lastrefuge.Overlook
+runtime: org.freedesktop.Platform
+runtime-version: '25.08'
+sdk: org.freedesktop.Sdk
+sdk-extensions:
+  - org.freedesktop.Sdk.Extension.rust-stable
+command: overlook
+finish-args:
+  - --share=ipc
+  - --share=network
+  - --socket=wayland
+  - --socket=fallback-x11
+  - --device=dri
+  - --talk-name=org.freedesktop.secrets
+  - --talk-name=org.freedesktop.portal.Desktop
+build-options:
+  append-path: /usr/lib/sdk/rust-stable/bin
+  env:
+    CARGO_HOME: /run/build/overlook/cargo
+modules:
+  - name: overlook
+    buildsystem: simple
+    build-commands:
+      - cargo --offline fetch --manifest-path Cargo.toml
+      - cargo --offline build --release -p overlook
+      - install -Dm755 target/release/overlook /app/bin/overlook
+      - install -Dm644 packaging/ai.lastrefuge.Overlook.desktop /app/share/applications/ai.lastrefuge.Overlook.desktop
+      - install -Dm644 packaging/ai.lastrefuge.Overlook.metainfo.xml /app/share/metainfo/ai.lastrefuge.Overlook.metainfo.xml
+      - install -Dm644 branding/assets/overlook-app-icon.svg /app/share/icons/hicolor/scalable/apps/ai.lastrefuge.Overlook.svg
+      - for s in 16 24 32 48 64 128 256 512; do install -Dm644 branding/assets/overlook-icon-$s.png /app/share/icons/hicolor/${s}x${s}/apps/ai.lastrefuge.Overlook.png; done
+    sources:
+      - type: dir
+        path: ..
+      # - cargo-sources.json  (generate with flatpak-cargo-generator from Cargo.lock)

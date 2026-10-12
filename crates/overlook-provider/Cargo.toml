@@ -1,0 +1,13 @@
+[package]
+name = "overlook-provider"
+version.workspace = true
+edition.workspace = true
+license.workspace = true
+authors.workspace = true
+description = "Mail provider adapters for Overlook: the provider trait, the sample provider, and Gmail OAuth preparation."
+
+[dependencies]
+overlook-core = { workspace = true }
+serde = { workspace = true }
+serde_json = { workspace = true }
+thiserror = { workspace = true }

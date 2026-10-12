@@ -1,0 +1,19 @@
+<?xml version="1.0" encoding="UTF-8"?>
+<component type="desktop-application">
+  <id>ai.lastrefuge.Overlook</id>
+  <metadata_license>CC0-1.0</metadata_license>
+  <project_license>LicenseRef-proprietary</project_license>
+  <name>Overlook</name>
+  <summary>A clear view of what matters</summary>
+  <developer id="ai.lastrefuge"><name>Last Refuge</name></developer>
+  <description>
+    <p>Overlook is a beautiful, considered mail client for Linux. A familiar workspace for reading, writing, and keeping your day in view.</p>
+    <p>Thoughtfully made for Linux. Overlook by Last Refuge.</p>
+  </description>
+  <launchable type="desktop-id">ai.lastrefuge.Overlook.desktop</launchable>
+  <url type="homepage">https://lastrefuge.ai/</url>
+  <content_rating type="oars-1.1" />
+  <releases>
+    <release version="0.1.0" date="2026-10-12"><description><p>Foundation prototype.</p></description></release>
+  </releases>
+</component>

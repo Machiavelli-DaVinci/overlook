@@ -1,0 +1,36 @@
+[workspace]
+resolver = "2"
+members = [
+    "crates/overlook-core",
+    "crates/overlook-store",
+    "crates/overlook-provider",
+    "crates/overlook-app",
+]
+
+[workspace.package]
+version = "0.1.0"
+edition = "2021"
+license = "Proprietary"
+authors = ["Last Refuge"]
+repository = "https://github.com/lastrefuge/overlook"
+
+[workspace.dependencies]
+overlook-core = { path = "crates/overlook-core" }
+overlook-store = { path = "crates/overlook-store" }
+overlook-provider = { path = "crates/overlook-provider" }
+serde = { version = "1", features = ["derive"] }
+serde_json = "1"
+thiserror = "2"
+anyhow = "1"
+uuid = { version = "1", features = ["v4"] }
+rusqlite = { version = "0.40", features = ["bundled", "serde_json"] }
+ammonia = "4"
+tracing = "0.1"
+tracing-subscriber = { version = "0.3", features = ["env-filter"] }
+directories = "6"
+
+[profile.dev]
+opt-level = 1
+
+[profile.dev.package."*"]
+opt-level = 2

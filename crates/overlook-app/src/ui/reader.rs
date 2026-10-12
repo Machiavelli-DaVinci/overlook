@@ -1,0 +1,519 @@
+//! Reading pane: conversation header, collapsed history, expanded message, attachments.
+
+use super::widgets::*;
+use super::MailWindow;
+use crate::assets::icon;
+use crate::theme::ActivePalette;
+use gpui_kit::component::button::{Button, ButtonVariants};
+use gpui_kit::component::scroll::ScrollableElement;
+use gpui_kit::component::text::TextView;
+use gpui_kit::component::{Sizable, StyledExt};
+use gpui_kit::prelude::*;
+use gpui_kit::*;
+use gpui_kit::base::{h_flex, v_flex};
+use overlook_core::sanitize::{sanitize_html, text_to_html, RemoteContent};
+use overlook_core::time::{format_full, relative_label};
+use overlook_core::*;
+
+impl MailWindow {
+    pub(super) fn render_reader(&self, cx: &mut Context<Self>) -> impl IntoElement {
+        let p = *cx.palette();
+        let container = v_flex().size_full().bg(p.surface).min_w_0();
+
+        if let Some(composer) = &self.composer {
+            if composer.draft.kind == DraftKind::New || self.selected.is_none() {
+                return container.child(self.render_composer(cx)).into_any_element();
+            }
+        }
+
+        if let Some(item) = self.outbox_selected.as_ref().and_then(|id| self.outbox.iter().find(|d| &d.id == id)) {
+            return container.child(self.render_outbox_item(item, cx)).into_any_element();
+        }
+
+        let Some(summary) = self.selected_summary() else {
+            return container
+                .child(
+                    v_flex()
+                        .size_full()
+                        .items_center()
+                        .justify_center()
+                        .gap(px(8.))
+                        .child(svg().path("overlook/symbolic.svg").size(px(44.)).text_color(p.divider))
+                        .child(div().text_size(px(15.)).font_weight(FontWeight::MEDIUM).text_color(p.muted).child("Select a conversation to read it here."))
+                        .child(
+                            h_flex()
+                                .gap(px(6.))
+                                .items_center()
+                                .text_size(px(12.))
+                                .text_color(p.muted)
+                                .child(kbd("J", &p))
+                                .child(kbd("K", &p))
+                                .child("move")
+                                .child(kbd("E", &p))
+                                .child("archive")
+                                .child(kbd("Ctrl N", &p))
+                                .child("new message"),
+                        ),
+                )
+                .into_any_element();
+        };
+
+        let selected_ids: Vec<MessageId> = self.thread.iter().map(|m| m.id.clone()).collect();
+        let unread_any = self.thread.iter().any(|m| !m.is_read);
+        let toolbar = h_flex()
+            .items_center()
+            .gap(px(4.))
+            .h(px(48.))
+            .px(px(16.))
+            .border_b_1()
+            .border_color(p.divider)
+            .child(toolbar_button("archive", "Archive", "Archive (E)", cx.listener({
+                let ids = selected_ids.clone();
+                move |this, _, window, cx| this.archive(ids.clone(), window, cx)
+            })))
+            .child(toolbar_button("trash", "Delete", "Delete (Del)", cx.listener({
+                let ids = selected_ids.clone();
+                move |this, _, window, cx| this.trash(ids.clone(), window, cx)
+            })))
+            .child(toolbar_button(
+                if unread_any { "mail-open" } else { "mail" },
+                if unread_any { "Mark as read" } else { "Mark as unread" },
+                "Toggle read (Ctrl U)",
+                cx.listener({
+                    let ids = selected_ids.clone();
+                    move |this, _, window, cx| this.set_read(ids.clone(), unread_any, window, cx)
+                }),
+            ))
+            .child(div().flex_1())
+            .child(toolbar_button("reply", "Reply", "Reply (Ctrl R)", cx.listener(|this, _, window, cx| this.reply(DraftKind::Reply, window, cx))))
+            .child(toolbar_button("reply-all", "Reply all", "Reply all (Ctrl Shift R)", cx.listener(|this, _, window, cx| this.reply(DraftKind::ReplyAll, window, cx))))
+            .child(toolbar_button("forward", "Forward", "Forward (Ctrl F)", cx.listener(|this, _, window, cx| this.reply(DraftKind::Forward, window, cx))))
+            .child(div().w(px(8.)))
+            .child(
+                Button::new("prev-conv")
+                    .ghost()
+                    .small()
+                    .icon(icon("chevron-left").size(px(16.)))
+                    .tooltip("Previous (K)")
+                    .on_click(cx.listener(|this, _, window, cx| this.move_selection(-1, window, cx))),
+            )
+            .child(
+                Button::new("next-conv")
+                    .ghost()
+                    .small()
+                    .icon(icon("chevron-right").size(px(16.)))
+                    .tooltip("Next (J)")
+                    .on_click(cx.listener(|this, _, window, cx| this.move_selection(1, window, cx))),
+            );
+
+        let labels: Vec<String> = summary
+            .label_ids
+            .iter()
+            .filter_map(|id| self.labels.iter().find(|l| &l.id == id))
+            .filter(|l| l.kind == LabelKind::User)
+            .map(|l| l.name.clone())
+            .collect();
+
+        let header = v_flex()
+            .px(px(28.))
+            .pt(px(22.))
+            .pb(px(14.))
+            .gap(px(10.))
+            .child(
+                div()
+                    .text_size(px(24.))
+                    .line_height(px(32.))
+                    .font_weight(FontWeight::SEMIBOLD)
+                    .child(summary.subject.clone()),
+            )
+            .child(
+                h_flex()
+                    .items_center()
+                    .gap(px(8.))
+                    .text_size(px(12.))
+                    .text_color(p.muted)
+                    .children(labels.into_iter().map(|l| chip(l, &p).text_color(p.accent)))
+                    .child(format!(
+                        "{} message{}",
+                        summary.message_count,
+                        if summary.message_count == 1 { "" } else { "s" }
+                    ))
+                    .child("·")
+                    .child(format!("You and {}", summary.participant_line()))
+                    .when(summary.pending, |d| {
+                        d.child("·").child(
+                            h_flex()
+                                .gap(px(4.))
+                                .items_center()
+                                .text_color(p.warning)
+                                .child(icon("cloud-off").size(px(12.)).text_color(p.warning))
+                                .child("Changes saved on this device, waiting to sync"),
+                        )
+                    }),
+            )
+            .child(divider(&p));
+
+        let latest_id = summary.latest_message_id.clone();
+        let mut messages = v_flex().px(px(28.)).gap(px(6.));
+        for m in &self.thread {
+            let expanded = m.id == latest_id || self.expanded.contains(&m.id);
+            messages = messages.child(if expanded {
+                self.render_message_expanded(m, cx).into_any_element()
+            } else {
+                self.render_message_collapsed(m, cx).into_any_element()
+            });
+        }
+
+        let reply_area: AnyElement = match &self.composer {
+            Some(c) if c.draft.conversation_id.as_ref() == Some(&summary.id) => self.render_composer(cx).into_any_element(),
+            _ => {
+                let who = summary.participants.first().map(Address::display_name).unwrap_or_else(|| "sender".into());
+                v_flex()
+                    .mx(px(28.))
+                    .mt(px(18.))
+                    .mb(px(28.))
+                    .rounded(px(10.))
+                    .border_1()
+                    .border_color(p.divider)
+                    .child(
+                        div()
+                            .id("reply-box")
+                            .h_flex()
+                            .items_center()
+                            .gap(px(8.))
+                            .px(px(14.))
+                            .h(px(46.))
+                            .text_size(px(13.))
+                            .text_color(p.muted)
+                            .cursor_text()
+                            .child(icon("corner-up-left").size(px(16.)).text_color(p.muted))
+                            .child(format!("Reply to {who}…"))
+                            .on_click(cx.listener(|this, _, window, cx| this.reply(DraftKind::Reply, window, cx))),
+                    )
+                    .child(
+                        h_flex()
+                            .items_center()
+                            .gap(px(4.))
+                            .px(px(8.))
+                            .py(px(6.))
+                            .border_t_1()
+                            .border_color(p.divider)
+                            .child(
+                                Button::new("reply-btn")
+                                    .ghost()
+                                    .small()
+                                    .icon(icon("reply").size(px(15.)))
+                                    .label("Reply")
+                                    .on_click(cx.listener(|this, _, window, cx| this.reply(DraftKind::Reply, window, cx))),
+                            )
+                            .child(
+                                Button::new("forward-btn")
+                                    .ghost()
+                                    .small()
+                                    .icon(icon("forward").size(px(15.)))
+                                    .label("Forward")
+                                    .on_click(cx.listener(|this, _, window, cx| this.reply(DraftKind::Forward, window, cx))),
+                            )
+                            .child(div().flex_1())
+                            .child(kbd("Ctrl R", &p)),
+                    )
+                    .into_any_element()
+            }
+        };
+
+        container
+            .child(toolbar)
+            .child(
+                v_flex()
+                    .id("reader-scroll")
+                    .flex_1()
+                    .min_h_0()
+                    .child(header)
+                    .child(messages)
+                    .child(reply_area)
+                    .overflow_y_scrollbar(),
+            )
+            .into_any_element()
+    }
+
+    fn render_message_collapsed(&self, m: &Message, cx: &mut Context<Self>) -> impl IntoElement {
+        let p = *cx.palette();
+        let id = m.id.clone();
+        let now = overlook_core::time::now();
+        let who = if m.is_outgoing { Address::named("You", &self.account.email) } else { m.from.clone() };
+        let owner = self.owner();
+        div()
+            .id(SharedString::from(format!("collapsed-{}", m.id)))
+            .h_flex()
+            .items_center()
+            .gap(px(12.))
+            .px(px(6.))
+            .py(px(10.))
+            .rounded(px(8.))
+            .border_b_1()
+            .border_color(p.divider)
+            .cursor_pointer()
+            .hover(|d| d.bg(p.hover))
+            .child(if m.is_outgoing { owner_avatar(&owner, 28., &p) } else { avatar(&who, 28., &p) })
+            .child(
+                v_flex()
+                    .flex_1()
+                    .min_w_0()
+                    .child(div().text_size(px(13.)).font_weight(if m.is_read { FontWeight::MEDIUM } else { FontWeight::SEMIBOLD }).child(who.display_name()))
+                    .child(div().truncate().text_size(px(12.)).text_color(p.muted).child(m.snippet.clone())),
+            )
+            .child(div().text_size(px(11.)).text_color(p.muted).child(relative_label(m.date, now, self.utc_offset)))
+            .on_click(cx.listener(move |this, _, _window, cx| {
+                if !this.expanded.insert(id.clone()) {
+                    this.expanded.remove(&id);
+                }
+                cx.notify();
+            }))
+    }
+
+    fn render_message_expanded(&self, m: &Message, cx: &mut Context<Self>) -> impl IntoElement {
+        let p = *cx.palette();
+        let who = if m.is_outgoing { Address::named("You", &self.account.email) } else { m.from.clone() };
+        let owner = self.owner();
+        let allow_remote = self.remote_allowed.contains(&m.id);
+        let policy = if allow_remote { RemoteContent::Allowed } else { RemoteContent::Blocked };
+        let html = match (&m.body.html, &m.body.text) {
+            (Some(h), _) => h.clone(),
+            (None, Some(t)) => text_to_html(t),
+            (None, None) => String::new(),
+        };
+        let sanitized = sanitize_html(&html, policy);
+        let to_line = {
+            let mut parts: Vec<String> = m
+                .to
+                .iter()
+                .map(|a| if a.email.eq_ignore_ascii_case(&self.account.email) { "me".to_owned() } else { a.display_name() })
+                .collect();
+            if parts.is_empty() {
+                parts.push("me".into());
+            }
+            format!("to {} · {}", parts.join(", "), m.from.email)
+        };
+        let mid = m.id.clone();
+
+        v_flex()
+            .pt(px(10.))
+            .pb(px(6.))
+            .gap(px(14.))
+            .child(
+                h_flex()
+                    .items_center()
+                    .gap(px(12.))
+                    .child(if m.is_outgoing { owner_avatar(&owner, 34., &p) } else { avatar(&who, 34., &p) })
+                    .child(
+                        v_flex()
+                            .flex_1()
+                            .min_w_0()
+                            .child(div().text_size(px(14.)).font_weight(FontWeight::SEMIBOLD).child(who.display_name()))
+                            .child(div().truncate().text_size(px(12.)).text_color(p.muted).child(to_line)),
+                    )
+                    .child(
+                        div()
+                            .text_size(px(12.))
+                            .text_color(p.muted)
+                            .child(format_full(m.date, self.utc_offset)),
+                    ),
+            )
+            .when(!m.body.is_cached(), |d| {
+                d.child(
+                    div()
+                        .px(px(12.))
+                        .py(px(10.))
+                        .rounded(px(8.))
+                        .bg(p.chip)
+                        .text_size(px(12.))
+                        .text_color(p.muted)
+                        .child("This message hasn’t been downloaded. Connect to read it."),
+                )
+            })
+            .when(sanitized.blocked_remote > 0, |d| {
+                d.child(
+                    h_flex()
+                        .items_center()
+                        .gap(px(10.))
+                        .px(px(12.))
+                        .py(px(8.))
+                        .rounded(px(8.))
+                        .bg(p.chip)
+                        .text_size(px(12.))
+                        .text_color(p.muted)
+                        .child(icon("image-off").size(px(14.)).text_color(p.muted))
+                        .child(format!(
+                            "{} remote image{} blocked to protect your privacy.",
+                            sanitized.blocked_remote,
+                            if sanitized.blocked_remote == 1 { "" } else { "s" }
+                        ))
+                        .child(div().flex_1())
+                        .child(
+                            Button::new(SharedString::from(format!("allow-remote-{}", m.id)))
+                                .ghost()
+                                .xsmall()
+                                .label("Show images")
+                                .on_click(cx.listener(move |this, _, _window, cx| {
+                                    this.remote_allowed.insert(mid.clone());
+                                    cx.notify();
+                                })),
+                        ),
+                )
+            })
+            .child(
+                div()
+                    .text_size(px(15.))
+                    .line_height(px(24.))
+                    .max_w(px(760.))
+                    .child(
+                        TextView::html(SharedString::from(format!("body-{}-{}", m.id, allow_remote)), sanitized.html)
+                            .selectable(true),
+                    ),
+            )
+            .when(!m.attachments.is_empty(), |d| {
+                d.child(
+                    v_flex()
+                        .gap(px(10.))
+                        .pt(px(6.))
+                        .child(
+                            div()
+                                .text_size(px(12.))
+                                .font_weight(FontWeight::MEDIUM)
+                                .child(format!("{} attachment{}", m.attachments.len(), if m.attachments.len() == 1 { "" } else { "s" })),
+                        )
+                        .child(
+                            h_flex()
+                                .flex_wrap()
+                                .gap(px(10.))
+                                .children(m.attachments.iter().map(|a| attachment_card(a, &p))),
+                        ),
+                )
+            })
+    }
+
+    fn render_outbox_item(&self, d: &Draft, cx: &mut Context<Self>) -> impl IntoElement {
+        let p = *cx.palette();
+        let state = overlook_core::status::draft_state_label(&d.state);
+        let id = d.id.clone();
+        let cancellable = matches!(d.state, DraftState::Queued | DraftState::Failed(_));
+        v_flex()
+            .size_full()
+            .px(px(28.))
+            .pt(px(22.))
+            .gap(px(14.))
+            .child(div().text_size(px(24.)).font_weight(FontWeight::SEMIBOLD).child(d.display_subject()))
+            .child(
+                h_flex()
+                    .items_center()
+                    .gap(px(8.))
+                    .text_size(px(12.))
+                    .text_color(p.muted)
+                    .child(format!("To {}", d.to.iter().map(Address::to_header).collect::<Vec<_>>().join(", "))),
+            )
+            .child(
+                h_flex()
+                    .items_center()
+                    .gap(px(8.))
+                    .px(px(12.))
+                    .py(px(10.))
+                    .rounded(px(8.))
+                    .bg(p.chip)
+                    .text_size(px(13.))
+                    .child(icon("clock").size(px(15.)).text_color(p.accent))
+                    .child(state)
+                    .child(div().flex_1())
+                    .when(cancellable, |row| {
+                        row.child(
+                            Button::new("outbox-edit")
+                                .small()
+                                .label("Edit message")
+                                .on_click(cx.listener(move |this, _, window, cx| this.cancel_send(id.clone(), window, cx))),
+                        )
+                    }),
+            )
+            .child(divider(&p))
+            .child(
+                div()
+                    .text_size(px(15.))
+                    .line_height(px(24.))
+                    .max_w(px(760.))
+                    .child(TextView::html(SharedString::from(format!("outbox-{}", d.id)), text_to_html(&d.body_text)).selectable(true)),
+            )
+    }
+}
+
+fn toolbar_button(
+    icon_name: &'static str,
+    label: &'static str,
+    tooltip: &'static str,
+    on_click: impl Fn(&ClickEvent, &mut Window, &mut App) + 'static,
+) -> Button {
+    Button::new(SharedString::from(format!("tb-{icon_name}-{label}")))
+        .ghost()
+        .small()
+        .icon(icon(icon_name).size(px(16.)))
+        .label(label)
+        .tooltip(tooltip)
+        .on_click(on_click)
+}
+
+fn attachment_card(a: &Attachment, p: &crate::theme::Palette) -> Div {
+    let badge_bg = match a.badge().as_str() {
+        "PDF" => (c(0xFBE9E7, p), c(0xA13E37, p)),
+        "FIG" | "PNG" | "JPG" | "SVG" => (c(0xEEE8FA, p), c(0x6E55B7, p)),
+        _ => (p.chip, p.muted),
+    };
+    h_flex()
+        .items_center()
+        .gap(px(12.))
+        .w(px(300.))
+        .px(px(12.))
+        .py(px(10.))
+        .rounded(px(8.))
+        .border_1()
+        .border_color(p.divider)
+        .bg(p.surface)
+        .child(
+            div()
+                .flex_none()
+                .size(px(36.))
+                .rounded(px(6.))
+                .bg(badge_bg.0)
+                .text_color(badge_bg.1)
+                .flex()
+                .items_center()
+                .justify_center()
+                .text_size(px(10.))
+                .font_weight(FontWeight::SEMIBOLD)
+                .child(a.badge()),
+        )
+        .child(
+            v_flex()
+                .flex_1()
+                .min_w_0()
+                .child(div().truncate().text_size(px(13.)).font_weight(FontWeight::MEDIUM).child(a.filename.clone()))
+                .child(
+                    div()
+                        .text_size(px(11.))
+                        .text_color(p.muted)
+                        .child(if a.is_downloaded() {
+                            a.human_size()
+                        } else {
+                            format!("{} · Not downloaded", a.human_size())
+                        }),
+                ),
+        )
+}
+
+fn c(hex: u32, p: &crate::theme::Palette) -> Hsla {
+    if p.is_dark() {
+        // Darken pastel badges for the dark theme so they do not glow.
+        let mut h: Hsla = Rgba::from(gpui_kit::rgb(hex)).into();
+        h.l = (h.l * 0.35).min(0.3);
+        h.s *= 0.6;
+        h
+    } else {
+        Rgba::from(gpui_kit::rgb(hex)).into()
+    }
+}

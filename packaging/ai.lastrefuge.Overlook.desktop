@@ -1,0 +1,12 @@
+[Desktop Entry]
+Type=Application
+Name=Overlook
+GenericName=Mail Client
+Comment=A clear view of what matters. A calmer place for your mail.
+Exec=overlook %u
+Icon=ai.lastrefuge.Overlook
+Terminal=false
+Categories=Network;Email;Office;
+MimeType=x-scheme-handler/mailto;
+Keywords=mail;email;gmail;imap;
+StartupWMClass=ai.lastrefuge.Overlook

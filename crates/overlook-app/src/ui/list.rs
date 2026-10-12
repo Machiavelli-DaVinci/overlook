@@ -1,0 +1,388 @@
+//! Message list: title, filter tabs, day groups, and conversation rows.
+
+use super::widgets::*;
+use super::{ListRow, MailWindow};
+use crate::assets::icon;
+use crate::theme::ActivePalette;
+use gpui_kit::component::button::{Button, ButtonVariants};
+use gpui_kit::component::scroll::ScrollableElement;
+use gpui_kit::component::{Sizable, StyledExt};
+use gpui_kit::prelude::*;
+use gpui_kit::*;
+use gpui_kit::base::{h_flex, v_flex};
+use overlook_core::status::draft_state_label;
+use overlook_core::time::{day_group, relative_label, DayGroup};
+use overlook_core::*;
+use overlook_store::{ListFilter, MailboxView};
+
+impl MailWindow {
+    pub(super) fn render_list(&self, cx: &mut Context<Self>) -> impl IntoElement {
+        let p = *cx.palette();
+        let compact = self.density == Density::Compact;
+        let title: SharedString = if !self.search_query.is_empty() {
+            "Search results".into()
+        } else {
+            self.view_title().into()
+        };
+        let rows = self.list_rows();
+        let total = rows.iter().filter(|r| !matches!(r, ListRow::Group(..))).count();
+
+        let tab = |this: &Self, label: &'static str, filter: ListFilter, cx: &mut Context<Self>| {
+            let active = this.filter == filter;
+            div()
+                .id(SharedString::from(format!("filter-{label}")))
+                .pb(px(10.))
+                .border_b_2()
+                .border_color(if active { p.accent } else { gpui_kit::transparent_black() })
+                .text_size(px(13.))
+                .text_color(if active { p.accent } else { p.muted })
+                .font_weight(if active { FontWeight::MEDIUM } else { FontWeight::NORMAL })
+                .cursor_pointer()
+                .child(label)
+                .on_click(cx.listener(move |this, _, window, cx| this.set_filter(filter, window, cx)))
+        };
+
+        let header = v_flex()
+            .px(px(18.))
+            .pt(px(16.))
+            .child(
+                h_flex()
+                    .items_center()
+                    .gap(px(9.))
+                    .child(
+                        div()
+                            .text_size(px(22.))
+                            .font_weight(FontWeight::SEMIBOLD)
+                            .line_height(px(30.))
+                            .child(title),
+                    )
+                    .child(chip(total.to_string(), &p))
+                    .child(div().flex_1())
+                    .child(
+                        Button::new("density")
+                            .ghost()
+                            .small()
+                            .icon(icon(if compact { "rows-4" } else { "rows-3" }).size(px(16.)))
+                            .tooltip(if compact { "Comfortable density" } else { "Compact density" })
+                            .on_click(cx.listener(|this, _, window, cx| this.toggle_density(window, cx))),
+                    ),
+            )
+            .child(
+                h_flex()
+                    .gap(px(18.))
+                    .mt(px(14.))
+                    .border_b_1()
+                    .border_color(p.divider)
+                    .child(tab(self, "All", ListFilter::All, cx))
+                    .child(tab(self, "Unread", ListFilter::Unread, cx))
+                    .child(tab(self, "Attachments", ListFilter::Attachments, cx)),
+            );
+
+        let coverage = if self.search_query.is_empty() {
+            None
+        } else {
+            Some(
+                div()
+                    .px(px(18.))
+                    .pt(px(10.))
+                    .text_size(px(11.))
+                    .text_color(p.muted)
+                    .child(self.search_coverage.clone()),
+            )
+        };
+
+        let body: AnyElement = if rows.is_empty() {
+            let (title, hint): (&str, &str) = match (&self.view, self.search_query.is_empty()) {
+                (_, false) => ("No results", "Try another name or keyword."),
+                (MailboxView::Kind(LabelKind::Inbox), _) => ("Your inbox is clear.", "New mail will appear here."),
+                (MailboxView::Kind(LabelKind::Drafts), _) => ("No drafts", "Messages you start are saved on this device."),
+                (MailboxView::Kind(LabelKind::Outbox), _) => ("Outbox is empty", "Messages waiting to be sent appear here."),
+                _ => ("Nothing here", "There are no messages in this view."),
+            };
+            v_flex()
+                .items_center()
+                .pt(px(72.))
+                .gap(px(6.))
+                .text_color(p.muted)
+                .child(icon("inbox").size(px(28.)).text_color(p.divider))
+                .child(div().text_size(px(14.)).font_weight(FontWeight::MEDIUM).text_color(p.foreground).child(title))
+                .child(div().text_size(px(12.)).child(hint))
+                .into_any_element()
+        } else {
+            let mut list = v_flex().id("message-rows").pb(px(12.)).px(px(8.)).flex_1().min_h_0();
+            for row in rows {
+                list = list.child(match row {
+                    ListRow::Group(label, n) => h_flex()
+                        .items_center()
+                        .justify_between()
+                        .px(px(11.))
+                        .pt(px(13.))
+                        .pb(px(5.))
+                        .text_size(px(11.))
+                        .text_color(p.muted)
+                        .child(label)
+                        .child(n.to_string())
+                        .into_any_element(),
+                    ListRow::Conversation(summary) => self.render_conversation_row(&summary, compact, cx).into_any_element(),
+                    ListRow::Draft(draft) => self.render_draft_row(&draft, cx).into_any_element(),
+                });
+            }
+            list.overflow_y_scrollbar().into_any_element()
+        };
+
+        v_flex()
+            .id("message-list")
+            .key_context("MessageList")
+            .track_focus(&self.list_focus)
+            .size_full()
+            .bg(p.surface)
+            .border_r_1()
+            .border_color(p.divider)
+            .child(header)
+            .children(coverage)
+            .child(body)
+    }
+
+    pub(super) fn list_rows(&self) -> Vec<ListRow> {
+        let mut rows = Vec::new();
+        match &self.view {
+            MailboxView::Kind(LabelKind::Drafts) if self.search_query.is_empty() => {
+                rows.extend(self.drafts.iter().cloned().map(ListRow::Draft));
+            }
+            MailboxView::Kind(LabelKind::Outbox) if self.search_query.is_empty() => {
+                rows.extend(self.outbox.iter().cloned().map(ListRow::Draft));
+            }
+            _ => {
+                let now = overlook_core::time::now();
+                let mut current: Option<DayGroup> = None;
+                for c in &self.conversations {
+                    let group = day_group(c.latest, now, self.utc_offset);
+                    if current.as_ref() != Some(&group) {
+                        let n = self
+                            .conversations
+                            .iter()
+                            .filter(|x| day_group(x.latest, now, self.utc_offset) == group)
+                            .count();
+                        rows.push(ListRow::Group(group.label().to_owned().into(), n));
+                        current = Some(group);
+                    }
+                    rows.push(ListRow::Conversation(c.clone()));
+                }
+            }
+        }
+        rows
+    }
+
+    fn render_conversation_row(&self, c: &ConversationSummary, compact: bool, cx: &mut Context<Self>) -> impl IntoElement {
+        let p = *cx.palette();
+        let selected = self.selected.as_ref() == Some(&c.id);
+        let unread = c.is_unread();
+        let now = overlook_core::time::now();
+        let time = relative_label(c.latest, now, self.utc_offset);
+        let who = c.participants.first().cloned().unwrap_or_else(|| self.owner());
+        let label_name = c
+            .label_ids
+            .iter()
+            .filter_map(|id| self.labels.iter().find(|l| &l.id == id))
+            .find(|l| l.kind == LabelKind::User)
+            .map(|l| l.name.clone());
+        let conv_id = c.id.clone();
+        let star_id = c.latest_message_id.clone();
+        let starred = c.starred;
+        let pending = c.pending;
+
+        div()
+            .id(SharedString::from(format!("conv-{}", c.id)))
+            .relative()
+            .h_flex()
+            .items_start()
+            .gap(px(11.))
+            .px(px(11.))
+            .py(px(if compact { 8. } else { 12. }))
+            .rounded(px(7.))
+            .border_b_1()
+            .border_color(if selected { gpui_kit::transparent_black() } else { p.divider })
+            .cursor_pointer()
+            .when(selected, |d| d.bg(p.selection))
+            .when(!selected, |d| d.hover(|d| d.bg(p.hover)))
+            .when(selected, |d| {
+                d.child(
+                    div()
+                        .absolute()
+                        .left_0()
+                        .top(px(12.))
+                        .bottom(px(12.))
+                        .w(px(3.))
+                        .rounded(px(2.))
+                        .bg(p.accent),
+                )
+            })
+            .when(!compact, |d| d.child(avatar(&who, 30., &p).mt(px(1.))))
+            .child(
+                v_flex()
+                    .flex_1()
+                    .min_w_0()
+                    .gap(px(2.))
+                    .child(
+                        h_flex()
+                            .items_center()
+                            .gap(px(8.))
+                            .child(
+                                div()
+                                    .flex_1()
+                                    .min_w_0()
+                                    .truncate()
+                                    .text_size(px(13.))
+                                    .font_weight(if unread { FontWeight::SEMIBOLD } else { FontWeight::MEDIUM })
+                                    .child(c.participant_line()),
+                            )
+                            .when(c.message_count > 1, |d| {
+                                d.child(div().text_size(px(11.)).text_color(p.muted).child(c.message_count.to_string()))
+                            })
+                            .when(pending, |d| {
+                                d.child(
+                                    icon("cloud-off")
+                                        .size(px(13.))
+                                        .text_color(p.warning),
+                                )
+                            })
+                            .child(
+                                div()
+                                    .flex_none()
+                                    .text_size(px(11.))
+                                    .text_color(if unread { p.accent } else { p.muted })
+                                    .child(time),
+                            ),
+                    )
+                    .child(
+                        div()
+                            .truncate()
+                            .text_size(px(13.))
+                            .font_weight(if unread { FontWeight::SEMIBOLD } else { FontWeight::NORMAL })
+                            .text_color(p.foreground)
+                            .child(c.subject.clone()),
+                    )
+                    .when(!compact, |d| {
+                        d.child(
+                            div()
+                                .truncate()
+                                .text_size(px(12.))
+                                .text_color(p.muted)
+                                .child(c.snippet.clone()),
+                        )
+                    })
+                    .when(!compact && (c.has_attachments || label_name.is_some()), |d| {
+                        d.child(
+                            h_flex()
+                                .items_center()
+                                .gap(px(6.))
+                                .mt(px(4.))
+                                .text_size(px(11.))
+                                .text_color(p.muted)
+                                .when(c.has_attachments, |d| {
+                                    d.child(icon("paperclip").size(px(12.)).text_color(p.muted)).child("Attachments")
+                                })
+                                .children(label_name.map(|l| chip(l, &p))),
+                        )
+                    }),
+            )
+            .child(
+                Button::new(SharedString::from(format!("star-{}", c.id)))
+                    .ghost()
+                    .xsmall()
+                    .icon(
+                        icon("star")
+                            .size(px(15.))
+                            .text_color(if starred { p.brand_accent } else { p.muted }),
+                    )
+                    .tooltip(if starred { "Unstar" } else { "Star" })
+                    .on_click(cx.listener(move |this, _, window, cx| {
+                        cx.stop_propagation();
+                        this.set_starred(vec![star_id.clone()], !starred, window, cx);
+                    })),
+            )
+            .on_click(cx.listener(move |this, _, window, cx| this.select_conversation(Some(conv_id.clone()), window, cx)))
+    }
+
+    fn render_draft_row(&self, d: &Draft, cx: &mut Context<Self>) -> impl IntoElement {
+        let p = *cx.palette();
+        let selected = self.composer.as_ref().is_some_and(|c| c.draft.id == d.id);
+        let recipients = if d.to.is_empty() {
+            "No recipients".to_owned()
+        } else {
+            d.to.iter().map(Address::display_name).collect::<Vec<_>>().join(", ")
+        };
+        let now = overlook_core::time::now();
+        let state = draft_state_label(&d.state);
+        let state_color = match d.state {
+            DraftState::Failed(_) => p.error,
+            DraftState::Uncertain => p.warning,
+            DraftState::Queued | DraftState::Sending => p.accent,
+            _ => p.muted,
+        };
+        let draft_id = d.id.clone();
+        let outbox = d.state.is_outbox();
+        let cancellable = matches!(d.state, DraftState::Queued | DraftState::Failed(_));
+        let preview: String = d.body_text.lines().find(|l| !l.trim().is_empty() && !l.starts_with('>')).unwrap_or("").chars().take(90).collect();
+
+        div()
+            .id(SharedString::from(format!("draft-{}", d.id)))
+            .h_flex()
+            .items_start()
+            .gap(px(11.))
+            .px(px(11.))
+            .py(px(12.))
+            .rounded(px(7.))
+            .border_b_1()
+            .border_color(if selected { gpui_kit::transparent_black() } else { p.divider })
+            .cursor_pointer()
+            .when(selected, |d| d.bg(p.selection))
+            .when(!selected, |d| d.hover(|d| d.bg(p.hover)))
+            .child(owner_avatar(&self.owner(), 30., &p))
+            .child(
+                v_flex()
+                    .flex_1()
+                    .min_w_0()
+                    .gap(px(2.))
+                    .child(
+                        h_flex()
+                            .items_center()
+                            .gap(px(8.))
+                            .child(div().flex_1().min_w_0().truncate().text_size(px(13.)).font_weight(FontWeight::MEDIUM).child(recipients))
+                            .child(div().text_size(px(11.)).text_color(p.muted).child(relative_label(d.updated_at, now, self.utc_offset))),
+                    )
+                    .child(div().truncate().text_size(px(13.)).child(d.display_subject()))
+                    .child(div().truncate().text_size(px(12.)).text_color(p.muted).child(if preview.is_empty() { "Draft in progress".to_owned() } else { preview }))
+                    .child(
+                        h_flex()
+                            .items_center()
+                            .gap(px(6.))
+                            .mt(px(4.))
+                            .text_size(px(11.))
+                            .text_color(state_color)
+                            .child(icon(if outbox { "clock" } else { "check" }).size(px(12.)).text_color(state_color))
+                            .child(state)
+                            .when(cancellable, |row| {
+                                let id = draft_id.clone();
+                                row.child(div().flex_1()).child(
+                                    Button::new(SharedString::from(format!("cancel-{}", draft_id)))
+                                        .ghost()
+                                        .xsmall()
+                                        .label("Edit")
+                                        .on_click(cx.listener(move |this, _, window, cx| {
+                                            cx.stop_propagation();
+                                            this.cancel_send(id.clone(), window, cx);
+                                        })),
+                                )
+                            }),
+                    ),
+            )
+            .on_click(cx.listener(move |this, _, window, cx| {
+                if outbox {
+                    this.select_outbox_item(draft_id.clone(), window, cx);
+                } else {
+                    this.open_draft(draft_id.clone(), window, cx);
+                }
+            }))
+    }
+}

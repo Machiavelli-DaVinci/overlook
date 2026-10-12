@@ -1,0 +1,374 @@
+<style>
+@import url('https://fonts.googleapis.com/css2?family=Inter:wght@400;450;500;550;600;650;700&display=swap');
+#overlook-refined{--om-bg:light-dark(#f5f6f9,#17191e);--om-paper:light-dark(#fff,#202228);--om-side:light-dark(#f3f5f8,#1b1d23);--om-text:light-dark(#202633,#eceef4);--om-muted:light-dark(#6d7687,#9bA2b1);--om-line:light-dark(#e8ebf1,#333640);--om-hover:light-dark(#eef1f7,#2b2e37);--om-blue:light-dark(#2864e9,#91b1ff);--om-fill:light-dark(#2864e9,#3a70ef);--om-soft:light-dark(#eaf0ff,#283651);--om-on:#fff;--om-avatar:light-dark(#eee6ff,#47395e);--om-avatar-ink:light-dark(#7d57b3,#d6b5ff);--om-shadow:light-dark(#182c5025,#0008);font:13px/1.5 'Inter',sans-serif;color:var(--om-text);container:overlook-refined/inline-size;width:100%;isolation:isolate;}
+#overlook-refined *{box-sizing:border-box;}
+#overlook-refined [hidden]{display:none!important;}
+#overlook-refined button,#overlook-refined input,#overlook-refined textarea{font:inherit;color:inherit;}
+#overlook-refined button{border:0;background:transparent;display:inline-flex;align-items:center;justify-content:center;gap:7px;border-radius:6px;padding:0;}
+#overlook-refined button:hover:not(:disabled){background:var(--om-hover);}
+#overlook-refined button:disabled{opacity:.35;}
+#overlook-refined svg{width:17px;height:17px;stroke-width:1.65;flex-shrink:0;}
+#overlook-refined input{min-width:0;}
+#overlook-refined .om-window{background:var(--om-paper);border:1px solid var(--om-line);border-radius:12px;overflow:hidden;position:relative;}
+#overlook-refined .om-header{display:flex;align-items:center;gap:20px;height:65px;padding:0 22px;background:var(--om-paper);border-bottom:1px solid var(--om-line);}
+#overlook-refined .om-brand{display:flex;align-items:center;gap:10px;width:156px;flex-shrink:0;font-size:21px;letter-spacing:-.75px;font-weight:650;}
+#overlook-refined .om-brandmark{width:30px;height:31px;border-radius:8px;background:linear-gradient(145deg,#5189ff,#2858d7);color:#fff;display:grid;place-items:center;font-size:23px;font-weight:650;box-shadow:inset 0 1px 1px #ffffff60;position:relative;}
+#overlook-refined .om-brandmark::after{content:'';position:absolute;right:3px;bottom:5px;width:8px;height:5px;background:#92bdff;border-radius:2px;transform:rotate(-32deg);}
+#overlook-refined .om-search{display:flex;align-items:center;gap:10px;background:var(--om-side);border:1px solid var(--om-line);height:37px;padding:0 12px;border-radius:7px;flex:1;max-width:470px;color:var(--om-muted);}
+#overlook-refined .om-search input{background:none;border:0;flex:1;width:100%;font-size:12px;padding:8px 0;color:var(--om-text);}
+#overlook-refined .om-search input::placeholder{color:var(--om-muted);opacity:1;}
+#overlook-refined kbd{font:11px 'Inter',sans-serif;white-space:nowrap;color:var(--om-muted);border:1px solid var(--om-line);background:var(--om-paper);border-radius:4px;padding:1px 5px;}
+#overlook-refined .om-header-actions{display:flex;gap:14px;align-items:center;margin-left:auto;padding-right:57px;}
+#overlook-refined .om-icon{width:31px;height:31px;flex-shrink:0;color:var(--om-muted);}
+#overlook-refined .om-me{width:29px;height:29px;display:grid;place-items:center;border-radius:50%;background:light-dark(#e3eafa,#35425e);color:light-dark(#465f9b,#c8d7ff);font-size:11px;font-weight:600;}
+#overlook-refined .om-layout{display:grid;grid-template-columns:186px minmax(0,1fr);min-height:724px;}
+#overlook-refined .om-sidebar{background:var(--om-side);border-right:1px solid var(--om-line);padding:20px 11px 15px;display:flex;flex-direction:column;}
+#overlook-refined .om-primary{background:var(--om-fill);color:var(--om-on);padding:10px 15px;font-weight:550;box-shadow:0 1px 2px #15336b24;}
+#overlook-refined .om-primary:hover:not(:disabled){background:var(--om-fill);filter:brightness(1.07);}
+#overlook-refined .om-new{width:100%;min-height:38px;}
+#overlook-refined .om-section-label{font-size:11px;font-weight:550;color:var(--om-muted);padding:22px 11px 8px;display:flex;align-items:center;gap:5px;}
+#overlook-refined .om-section-label svg{width:12px;height:12px;}
+#overlook-refined .om-nav{display:grid;gap:3px;}
+#overlook-refined .om-nav button{justify-content:flex-start;min-height:35px;padding:7px 11px;gap:10px;color:var(--om-text);font-size:12px;}
+#overlook-refined .om-nav button>svg{color:var(--om-muted);width:16px;height:16px;}
+#overlook-refined .om-nav button[aria-current="page"]{background:var(--om-soft);color:var(--om-blue);font-weight:600;}
+#overlook-refined .om-nav button[aria-current="page"]>svg{color:var(--om-blue);}
+#overlook-refined .om-count{margin-left:auto;color:var(--om-muted);font-size:11px;font-weight:400;}
+#overlook-refined .om-nav button[aria-current="page"] .om-count{color:var(--om-blue);}
+#overlook-refined .om-color-dot{width:7px;height:7px;border-radius:50%;margin:0 4px;background:light-dark(#628aeb,#91b1ff);}
+#overlook-refined .om-color-dot.personal{background:light-dark(#9b7be8,#c5aaff);}
+#overlook-refined .om-color-dot.reading{background:light-dark(#d5a258,#dbb980);}
+#overlook-refined .om-account-card{margin-top:auto;padding:24px 9px 0;display:flex;align-items:center;gap:9px;}
+#overlook-refined .om-account-card strong{display:block;font-weight:550;font-size:12px;}
+#overlook-refined .om-account-card small{display:block;font-size:11px;color:var(--om-muted);}
+#overlook-refined .om-main{min-width:0;display:grid;grid-template-columns:300px minmax(0,1fr);}
+#overlook-refined .om-mail-list{min-width:0;border-right:1px solid var(--om-line);background:var(--om-paper);}
+#overlook-refined .om-list-header{padding:19px 18px 0;}
+#overlook-refined .om-list-title{display:flex;align-items:center;gap:9px;}
+#overlook-refined .om-list-title h1{font-size:22px;line-height:1.4;font-weight:600;letter-spacing:-.6px;margin:0;}
+#overlook-refined .om-total{font-size:11px;color:var(--om-muted);background:var(--om-side);border:1px solid var(--om-line);padding:0 6px;border-radius:5px;}
+#overlook-refined .om-list-title .om-icon{margin-left:auto;}
+#overlook-refined .om-tabs{display:flex;gap:18px;margin-top:17px;border-bottom:1px solid var(--om-line);}
+#overlook-refined .om-tabs button{font-size:12px;padding:0 0 11px;border-radius:0;color:var(--om-muted);border-bottom:2px solid transparent;}
+#overlook-refined .om-tabs button[aria-pressed="true"]{border-bottom-color:var(--om-blue);color:var(--om-blue);font-weight:550;}
+#overlook-refined .om-group{display:flex;align-items:center;justify-content:space-between;padding:13px 19px 5px;color:var(--om-muted);font-size:11px;}
+#overlook-refined .om-group span:last-child{font-size:11px;}
+#overlook-refined .om-mail{position:relative;border-bottom:1px solid var(--om-line);margin:0 8px;}
+#overlook-refined .om-mail:last-child{border-bottom:0;}
+#overlook-refined .om-mail.active{background:var(--om-soft);border-radius:7px;border-bottom-color:transparent;}
+#overlook-refined .om-mail.active::before{position:absolute;content:'';left:0;top:13px;bottom:13px;width:3px;border-radius:2px;background:var(--om-blue);}
+#overlook-refined .om-mail-button{width:100%;padding:13px 11px!important;align-items:flex-start!important;justify-content:flex-start!important;text-align:left;gap:10px!important;}
+#overlook-refined .om-mail.active .om-mail-button:hover{background:transparent;}
+#overlook-refined .om-avatar{width:29px;height:29px;display:grid;place-items:center;flex-shrink:0;border-radius:50%;font-size:11px;font-weight:600;background:var(--om-avatar);color:var(--om-avatar-ink);}
+#overlook-refined .om-avatar[data-tone="blue"]{background:light-dark(#dfeaff,#31466c);color:light-dark(#3e6dbc,#b8d1ff);}
+#overlook-refined .om-avatar[data-tone="teal"]{background:light-dark(#def0ed,#2c4846);color:light-dark(#3d7d73,#a0d7cd);}
+#overlook-refined .om-avatar[data-tone="amber"]{background:light-dark(#f8ead9,#504132);color:light-dark(#9e6d2d,#e9c185);}
+#overlook-refined .om-avatar[data-tone="gray"]{background:light-dark(#e9ecf1,#383d48);color:light-dark(#667084,#c3cad8);}
+#overlook-refined .om-mail-text{flex:1;min-width:0;}
+#overlook-refined .om-mail-top{display:flex;align-items:center;gap:5px;}
+#overlook-refined .om-sender{font-size:12px;font-weight:500;overflow:hidden;white-space:nowrap;text-overflow:ellipsis;}
+#overlook-refined .om-unread .om-sender{font-weight:650;}
+#overlook-refined .om-time{font-size:11px;color:var(--om-muted);margin-left:auto;white-space:nowrap;}
+#overlook-refined .om-unread .om-time{color:var(--om-blue);}
+#overlook-refined .om-list-subject{display:block;font-size:12px;font-weight:450;margin-top:4px;white-space:nowrap;text-overflow:ellipsis;overflow:hidden;padding-right:12px;}
+#overlook-refined .om-unread .om-list-subject{font-weight:600;}
+#overlook-refined .om-snippet{display:block;font-size:11px;color:var(--om-muted);white-space:nowrap;overflow:hidden;text-overflow:ellipsis;margin-top:3px;}
+#overlook-refined .om-list-meta{display:flex;align-items:center;gap:6px;margin-top:7px;font-size:11px;color:var(--om-muted);}
+#overlook-refined .om-list-meta svg{width:12px;height:12px;}
+#overlook-refined .om-list-tag{border-radius:3px;background:light-dark(#e5eafb,#374361);color:light-dark(#536eb0,#bccdfd);padding:0 5px;}
+#overlook-refined .om-star{width:22px;height:22px;position:absolute;right:8px;top:38px;color:var(--om-muted);}
+#overlook-refined .om-star svg{width:12px;height:12px;}
+#overlook-refined .om-star[aria-pressed="true"]{color:light-dark(#c39332,#e3bc68);}
+#overlook-refined .om-star[aria-pressed="true"] svg{fill:light-dark(#f2d59060,#c3933240);}
+#overlook-refined .om-reader{min-width:0;background:var(--om-paper);}
+#overlook-refined .om-toolbar{min-height:49px;padding:8px 17px;border-bottom:1px solid var(--om-line);display:flex;gap:5px;align-items:center;}
+#overlook-refined .om-action{padding:6px 8px;color:var(--om-muted);font-size:11px;min-height:30px;}
+#overlook-refined .om-action svg{width:15px;height:15px;}
+#overlook-refined .om-action-text{display:inline;}
+#overlook-refined .om-rule{height:18px;width:1px;background:var(--om-line);margin:0 3px;}
+#overlook-refined .om-toolbar-next{display:flex;margin-left:auto;gap:0;}
+#overlook-refined .om-toolbar-next .om-icon{width:26px;height:28px;}
+#overlook-refined .om-thread{padding:25px 25px 23px;}
+#overlook-refined .om-thread-title{font-size:23px;line-height:1.35;letter-spacing:-.7px;font-weight:600;margin:0 0 11px;}
+#overlook-refined .om-thread-meta{display:flex;align-items:center;gap:9px;color:var(--om-muted);font-size:11px;margin-bottom:23px;flex-wrap:wrap;}
+#overlook-refined .om-tag{padding:2px 7px;border-radius:4px;background:var(--om-soft);color:var(--om-blue);font-size:11px;}
+#overlook-refined .om-history{border-top:1px solid var(--om-line);padding:12px 0;}
+#overlook-refined .om-history summary{display:flex;align-items:center;gap:10px;list-style:none;}
+#overlook-refined .om-history summary::-webkit-details-marker{display:none;}
+#overlook-refined .om-history .om-avatar{width:25px;height:25px;font-size:11px;}
+#overlook-refined .om-history-content{flex:1;min-width:0;}
+#overlook-refined .om-history-content strong{font-size:11px;font-weight:550;}
+#overlook-refined .om-history-content span{display:block;font-size:11px;color:var(--om-muted);white-space:nowrap;overflow:hidden;text-overflow:ellipsis;}
+#overlook-refined .om-history time{font-size:11px;color:var(--om-muted);white-space:nowrap;}
+#overlook-refined .om-history-body{font-size:12px;color:var(--om-muted);line-height:1.8;padding:12px 0 2px 35px;}
+#overlook-refined .om-email{border-top:1px solid var(--om-line);padding-top:19px;}
+#overlook-refined .om-email-header{display:flex;align-items:center;gap:10px;}
+#overlook-refined .om-email-header .om-avatar{width:35px;height:35px;font-size:11px;}
+#overlook-refined .om-person{min-width:0;flex:1;}
+#overlook-refined .om-person strong{font-size:12px;font-weight:600;}
+#overlook-refined .om-person span{display:block;color:var(--om-muted);font-size:11px;}
+#overlook-refined .om-email-header time{font-size:11px;color:var(--om-muted);white-space:nowrap;align-self:flex-start;padding-top:3px;}
+#overlook-refined .om-email-body{font-size:13px;line-height:1.8;padding-top:22px;color:var(--om-text);}
+#overlook-refined .om-email-body p{margin:0 0 15px;}
+#overlook-refined .om-email-body strong{font-weight:600;}
+#overlook-refined .om-email-body ul{padding-left:19px;margin:0 0 15px;}
+#overlook-refined .om-email-body li{padding:1px 0;}
+#overlook-refined .om-signature{font-size:12px;line-height:1.6;}
+#overlook-refined .om-signature small{color:var(--om-muted);font-size:11px;}
+#overlook-refined .om-attachment-label{font-size:11px;font-weight:500;margin:22px 0 9px;}
+#overlook-refined .om-files{display:grid;grid-template-columns:repeat(2,minmax(0,1fr));gap:9px;}
+#overlook-refined .om-file{justify-content:flex-start;padding:11px 10px;border:1px solid var(--om-line);border-radius:7px;text-align:left;gap:9px;background:var(--om-paper);min-width:0;}
+#overlook-refined .om-file-type{width:28px;height:33px;border-radius:4px;background:light-dark(#fff0ec,#4b332f);color:light-dark(#ca624b,#ffab91);display:grid;place-items:center;font-size:11px;font-weight:600;flex-shrink:0;}
+#overlook-refined .om-file-type.fig{background:light-dark(#efeafb,#443b55);color:light-dark(#8863b5,#cdacee);}
+#overlook-refined .om-file-info{min-width:0;flex:1;}
+#overlook-refined .om-file-info strong{display:block;font-weight:500;font-size:11px;white-space:nowrap;overflow:hidden;text-overflow:ellipsis;}
+#overlook-refined .om-file-info small{color:var(--om-muted);font-size:11px;}
+#overlook-refined .om-quick-reply{margin-top:23px;border:1px solid var(--om-line);border-radius:8px;box-shadow:0 2px 3px light-dark(#182c5005,#0001);overflow:hidden;}
+#overlook-refined .om-reply-placeholder{width:100%;justify-content:flex-start;padding:13px 14px;color:var(--om-muted);font-size:12px;}
+#overlook-refined .om-reply-placeholder svg{width:15px;height:15px;}
+#overlook-refined .om-reply-footer{display:flex;align-items:center;gap:8px;border-top:1px solid var(--om-line);padding:8px 11px;background:var(--om-side);}
+#overlook-refined .om-reply-footer button{font-size:11px;color:var(--om-muted);padding:3px 5px;}
+#overlook-refined .om-reply-footer kbd{margin-left:auto;font-size:11px;}
+#overlook-refined .om-footer{display:flex;align-items:center;justify-content:space-between;gap:10px;padding:7px 15px;border-top:1px solid var(--om-line);background:var(--om-side);font-size:11px;color:var(--om-muted);}
+#overlook-refined .om-footer span{display:flex;gap:6px;align-items:center;}
+#overlook-refined .om-footer svg{width:12px;height:12px;color:light-dark(#60917a,#92bdac);}
+#overlook-refined .om-empty{padding:80px 20px;text-align:center;color:var(--om-muted);font-size:12px;}
+#overlook-refined .om-empty svg{width:32px;height:32px;margin-bottom:12px;}
+#overlook-refined .om-empty strong{display:block;font-size:17px;color:var(--om-text);font-weight:500;margin-bottom:7px;}
+#overlook-refined .om-back{display:none;}
+#overlook-refined .om-compose-window{position:absolute;bottom:32px;right:18px;width:min(560px,calc(100% - 36px));z-index:8;background:var(--om-paper);border:1px solid var(--om-line);border-radius:11px;box-shadow:0 16px 60px var(--om-shadow),0 2px 10px var(--om-shadow);overflow:hidden;}
+#overlook-refined .om-compose-titlebar{background:var(--om-side);display:flex;align-items:center;justify-content:space-between;padding:10px 15px;border-bottom:1px solid var(--om-line);}
+#overlook-refined .om-compose-titlebar strong{font-size:13px;font-weight:600;}
+#overlook-refined .om-compose-titlebar>div{display:flex;align-items:center;gap:7px;}
+#overlook-refined .om-saved{display:flex;gap:4px;align-items:center;font-size:11px;color:var(--om-muted);}
+#overlook-refined .om-saved svg{width:12px;height:12px;}
+#overlook-refined .om-field{display:flex;align-items:center;gap:10px;margin:0 19px;padding:11px 0;border-bottom:1px solid var(--om-line);font-size:12px;min-width:0;}
+#overlook-refined .om-field label{width:46px;color:var(--om-muted);flex-shrink:0;}
+#overlook-refined .om-field input{flex:1;background:transparent;border:0;width:100%;padding:1px 0;}
+#overlook-refined .om-field .om-from{flex:1;min-width:0;overflow:hidden;text-overflow:ellipsis;white-space:nowrap;color:var(--om-muted);}
+#overlook-refined .om-field .om-from strong{font-weight:500;color:var(--om-text);}
+#overlook-refined .om-field button{font-size:11px;color:var(--om-muted);padding:0 2px;}
+#overlook-refined .om-rich-editor{padding:19px 20px;min-height:206px;font-size:13px;line-height:1.8;overflow-wrap:anywhere;}
+#overlook-refined .om-rich-editor p{margin:0 0 12px;}
+#overlook-refined .om-rich-editor:empty::before{content:attr(data-placeholder);color:var(--om-muted);}
+#overlook-refined .om-rich-editor a{color:var(--om-blue);text-decoration:underline;}
+#overlook-refined .om-format-bar{display:flex;align-items:center;gap:4px;padding:7px 15px;border-top:1px solid var(--om-line);flex-wrap:wrap;}
+#overlook-refined .om-format-bar .om-icon{width:29px;height:28px;}
+#overlook-refined .om-format-bar button[aria-pressed="true"]{color:var(--om-blue);background:var(--om-soft);}
+#overlook-refined .om-compose-bottom{display:flex;align-items:center;gap:9px;padding:12px 18px;border-top:1px solid var(--om-line);}
+#overlook-refined .om-compose-bottom .om-primary{padding:8px 17px;font-size:12px;}
+#overlook-refined .om-compose-bottom .om-discard{margin-left:auto;}
+#overlook-refined .om-added-files{padding:0 20px 10px;display:flex;gap:6px;flex-wrap:wrap;}
+#overlook-refined .om-added-files:empty{display:none;}
+#overlook-refined .om-added-file{display:flex;align-items:center;gap:6px;padding:4px 8px;border:1px solid var(--om-line);border-radius:5px;font-size:11px;max-width:100%;}
+#overlook-refined .om-added-file span{overflow:hidden;white-space:nowrap;text-overflow:ellipsis;}
+#overlook-refined .om-added-file button{width:18px;height:18px;}
+#overlook-refined .om-added-file svg{width:12px;height:12px;}
+#overlook-refined .om-link-fields{padding:10px 18px;border-top:1px solid var(--om-line);display:flex;gap:8px;align-items:center;font-size:12px;}
+#overlook-refined .om-link-fields input{background:var(--om-side);border:1px solid var(--om-line);border-radius:5px;padding:5px 7px;flex:1;width:100%;}
+#overlook-refined .om-link-fields button{color:var(--om-blue);padding:5px 7px;}
+#overlook-refined .om-toast{position:absolute;bottom:43px;left:50%;transform:translateX(-50%);z-index:11;background:var(--om-text);color:var(--om-paper);padding:12px 17px;max-width:calc(100% - 24px);border-radius:8px;box-shadow:0 4px 20px var(--om-shadow);font-size:12px;display:flex;gap:16px;align-items:center;}
+#overlook-refined .om-toast button{color:inherit;text-decoration:underline;white-space:nowrap;}
+#overlook-refined .om-toast button:hover{background:transparent;}
+#overlook-refined .om-preview{position:absolute;inset:0;z-index:10;background:light-dark(#f0f3f8ed,#15171df2);padding:45px 10%;display:flex;align-items:flex-start;justify-content:center;}
+#overlook-refined .om-preview-sheet{background:var(--om-paper);border:1px solid var(--om-line);border-radius:10px;box-shadow:0 20px 70px var(--om-shadow);width:100%;overflow:hidden;}
+#overlook-refined .om-preview-head{padding:13px 20px;display:flex;align-items:center;justify-content:space-between;gap:10px;border-bottom:1px solid var(--om-line);font-size:12px;}
+#overlook-refined .om-document{padding:35px;background:var(--om-paper);}
+#overlook-refined .om-doc-label{font-size:11px;letter-spacing:2px;color:var(--om-blue);margin-bottom:70px;}
+#overlook-refined .om-document h2{font-size:37px;line-height:1.2;letter-spacing:-1px;font-weight:600;margin:0 0 15px;}
+#overlook-refined .om-document p{color:var(--om-muted);font-size:12px;}
+#overlook-refined .om-doc-stripe{height:100px;background:linear-gradient(110deg,#2864e9,#79b1ff);border-radius:6px;margin:30px 0;}
+#overlook-refined .om-help{position:absolute;top:59px;right:82px;z-index:9;width:260px;padding:18px;background:var(--om-paper);border:1px solid var(--om-line);border-radius:9px;box-shadow:0 7px 25px var(--om-shadow);}
+#overlook-refined .om-help strong{font-size:13px;font-weight:600;}
+#overlook-refined .om-help dl{margin:15px 0 0;display:grid;grid-template-columns:1fr auto;gap:11px;font-size:12px;}
+#overlook-refined .om-help dd{margin:0;}
+#overlook-refined[data-density="compact"] .om-mail-button{padding-top:8px!important;padding-bottom:8px!important;}
+#overlook-refined[data-avatars="false"] .om-mail-button>.om-avatar{display:none;}
+#overlook-refined[data-reading="below"] .om-main{grid-template-columns:minmax(0,1fr);}
+#overlook-refined[data-reading="below"] .om-mail-list{border-right:0;border-bottom:1px solid var(--om-line);}
+#overlook-refined[data-reading="below"] .om-mail-text{display:grid;grid-template-columns:150px minmax(0,1fr) minmax(0,1fr);gap:12px;align-items:center;}
+#overlook-refined[data-reading="below"] .om-mail-button{padding-top:9px!important;padding-bottom:9px!important;}
+#overlook-refined[data-reading="below"] .om-time,#overlook-refined[data-reading="below"] .om-list-meta{display:none;}
+#overlook-refined[data-reading="below"] .om-list-subject,#overlook-refined[data-reading="below"] .om-snippet{margin-top:0;}
+#overlook-refined[data-reading="below"] .om-star{top:13px;}
+#overlook-refined[data-reading="below"] .om-thread{max-width:780px;margin:auto;}
+@container overlook-refined (max-width:920px){
+ #overlook-refined .om-layout{grid-template-columns:168px minmax(0,1fr);}
+ #overlook-refined .om-main{grid-template-columns:270px minmax(0,1fr);}
+ #overlook-refined .om-thread{padding:22px 19px;}
+ #overlook-refined .om-thread-title{font-size:21px;}
+ #overlook-refined .om-action-text{display:none;}
+ #overlook-refined .om-header-actions{padding-right:35px;gap:7px;}
+ #overlook-refined .om-brand{width:138px;}
+ #overlook-refined .om-files{grid-template-columns:minmax(0,1fr);}
+}
+@container overlook-refined (max-width:760px){
+ #overlook-refined .om-layout{grid-template-columns:57px minmax(0,1fr);}
+ #overlook-refined .om-sidebar{padding:16px 8px;}
+ #overlook-refined .om-nav button{justify-content:center;padding:10px;min-height:38px;}
+ #overlook-refined .om-nav button>span,#overlook-refined .om-new>span,#overlook-refined .om-section-label,#overlook-refined .om-account-card,#overlook-refined .om-labels{display:none;}
+ #overlook-refined .om-new{padding:10px;}
+ #overlook-refined .om-folders{margin-top:18px;}
+ #overlook-refined .om-header{padding:0 16px;gap:13px;}
+ #overlook-refined .om-header-actions{padding:0;gap:5px;}
+ #overlook-refined .om-header-actions>.om-me,#overlook-refined #om-help-button,#overlook-refined .om-search kbd{display:none;}
+ #overlook-refined .om-main{grid-template-columns:260px minmax(0,1fr);}
+ #overlook-refined .om-email-header time{display:none;}
+ #overlook-refined .om-email-body{font-size:12px;}
+}
+@container overlook-refined (max-width:630px){
+ #overlook-refined .om-main{display:block;}
+ #overlook-refined .om-mail-list{border-right:0;}
+ #overlook-refined[data-mobile="list"] .om-reader{display:none;}
+ #overlook-refined[data-mobile="reader"] .om-mail-list,#overlook-refined[data-mobile="reader"] .om-sidebar{display:none;}
+ #overlook-refined[data-mobile="reader"] .om-layout{grid-template-columns:minmax(0,1fr);}
+ #overlook-refined .om-back{display:inline-flex;}
+ #overlook-refined .om-thread{padding:23px 21px;}
+ #overlook-refined .om-email-header time{display:block;}
+ #overlook-refined .om-files{grid-template-columns:repeat(2,minmax(0,1fr));}
+ #overlook-refined .om-email-body{font-size:13px;}
+ #overlook-refined .om-brand{width:auto;font-size:19px;gap:8px;}
+ #overlook-refined .om-brandmark{width:27px;height:29px;font-size:22px;}
+ #overlook-refined .om-header{gap:10px;padding:0 13px;height:60px;}
+ #overlook-refined .om-search{padding:0 8px;height:34px;gap:6px;}
+ #overlook-refined .om-search input{font-size:11px;}
+ #overlook-refined .om-search svg{display:none;}
+ #overlook-refined .om-header-actions .om-icon{width:25px;}
+ #overlook-refined .om-footer>span:last-child{display:none;}
+ #overlook-refined .om-compose-window{right:8px;bottom:34px;width:calc(100% - 16px);}
+ #overlook-refined .om-compose-titlebar{padding:9px 12px;}
+ #overlook-refined .om-field{margin:0 14px;}
+ #overlook-refined .om-rich-editor{padding:18px 14px;}
+ #overlook-refined .om-preview{padding:30px 12px;}
+ #overlook-refined .om-document{padding:24px;}
+ #overlook-refined .om-document h2{font-size:30px;}
+ #overlook-refined[data-reading="below"] .om-mail-text{display:block;}
+}
+@container overlook-refined (max-width:370px){
+ #overlook-refined .om-files{grid-template-columns:minmax(0,1fr);}
+ #overlook-refined .om-person>span{font-size:11px;}
+ #overlook-refined .om-thread{padding:20px 16px;}
+ #overlook-refined .om-email-header time{display:none;}
+ #overlook-refined .om-header{gap:7px;padding:0 10px;}
+ #overlook-refined .om-saved{display:none;}
+}
+@media(pointer:coarse){#overlook-refined input,#overlook-refined .om-rich-editor{font-size:16px;}#overlook-refined .om-icon{min-height:36px;}}
+@media(prefers-reduced-motion:no-preference){#overlook-refined button{transition:background .12s ease,color .12s ease;}}
+</style>
+<div id="overlook-refined" data-mobile="list" data-density="comfortable" data-avatars="true" data-reading="right" aria-label="Overlook mail client">
+  <div class="om-window">
+    <header class="om-header">
+      <div class="om-brand"><span class="om-brandmark" aria-hidden="true">O</span>Overlook</div>
+      <label class="om-search"><i data-lucide="search" aria-hidden="true"></i><input id="om-search" type="search" placeholder="Search mail" aria-label="Search mail"><kbd>Ctrl K</kbd></label>
+      <div class="om-header-actions"><button id="om-help-button" class="om-icon cursor-interaction" aria-label="Keyboard shortcuts"><i data-lucide="keyboard" aria-hidden="true"></i></button><button id="om-theme" class="om-icon cursor-interaction" aria-label="Switch appearance"><i data-lucide="sun" aria-hidden="true"></i></button><div class="om-me" aria-label="Jason’s account">JA</div></div>
+    </header>
+    <div class="om-layout">
+      <aside class="om-sidebar" aria-label="Mailbox navigation">
+        <button id="om-new" class="om-primary om-new cursor-interaction" aria-label="New message"><i data-lucide="square-pen" aria-hidden="true"></i><span>New message</span></button>
+        <div class="om-section-label"><i data-lucide="chevron-down" aria-hidden="true"></i>Favorites</div>
+        <nav class="om-nav om-folders" aria-label="Folders">
+          <button class="cursor-interaction" data-folder="Inbox" aria-current="page" aria-label="Inbox"><i data-lucide="inbox" aria-hidden="true"></i><span>Inbox</span><span class="om-count" data-count="Inbox">4</span></button>
+          <button class="cursor-interaction" data-folder="Starred" aria-label="Starred"><i data-lucide="star" aria-hidden="true"></i><span>Starred</span><span class="om-count" data-count="Starred">2</span></button>
+          <button class="cursor-interaction" data-folder="Drafts" aria-label="Drafts"><i data-lucide="file-pen-line" aria-hidden="true"></i><span>Drafts</span><span class="om-count" data-count="Drafts">1</span></button>
+          <button class="cursor-interaction" data-folder="Sent" aria-label="Sent"><i data-lucide="send" aria-hidden="true"></i><span>Sent</span></button>
+          <button class="cursor-interaction" data-folder="Archive" aria-label="Archive"><i data-lucide="archive" aria-hidden="true"></i><span>Archive</span></button>
+          <button class="cursor-interaction" data-folder="Trash" aria-label="Trash"><i data-lucide="trash-2" aria-hidden="true"></i><span>Trash</span></button>
+        </nav>
+        <div class="om-section-label"><i data-lucide="chevron-down" aria-hidden="true"></i>Labels</div>
+        <nav class="om-nav om-labels" aria-label="Labels"><button class="cursor-interaction" data-folder="Projects"><span class="om-color-dot"></span><span>Projects</span></button><button class="cursor-interaction" data-folder="Personal"><span class="om-color-dot personal"></span><span>Personal</span></button><button class="cursor-interaction" data-folder="Reading"><span class="om-color-dot reading"></span><span>Reading</span></button></nav>
+        <div class="om-account-card"><div class="om-me">JA</div><div><strong>Jason</strong><small>Gmail account</small></div></div>
+      </aside>
+      <main class="om-main">
+        <section class="om-mail-list" aria-label="Messages"><div class="om-list-header"><div class="om-list-title"><h1 id="om-folder-title">Inbox</h1><span id="om-total" class="om-total">7</span><button id="om-sort" class="om-icon cursor-interaction" aria-label="Reverse message order" data-tooltip="Reverse message order"><i data-lucide="arrow-down-wide-narrow" aria-hidden="true"></i></button></div><div class="om-tabs" aria-label="Message filter"><button class="cursor-interaction" data-filter="all" aria-pressed="true">All</button><button class="cursor-interaction" data-filter="unread" aria-pressed="false">Unread</button><button class="cursor-interaction" data-filter="files" aria-pressed="false">Attachments</button></div></div><div id="om-message-list"></div></section>
+        <section class="om-reader" aria-label="Conversation"><div id="om-conversation"></div></section>
+      </main>
+    </div>
+    <footer class="om-footer"><span><i data-lucide="check-check" aria-hidden="true"></i>All changes saved</span><span id="om-status">7 conversations · 4 unread</span><span>Gmail · Connected</span></footer>
+    <section id="om-composer" class="om-compose-window" aria-label="Compose message" hidden></section>
+    <div id="om-toast" class="om-toast" role="status" hidden><span id="om-toast-label"></span><button id="om-undo" class="cursor-interaction" hidden>Undo</button></div>
+    <section id="om-preview" class="om-preview" aria-label="Attachment preview" hidden><div class="om-preview-sheet"><header class="om-preview-head"><span id="om-preview-name">Launch-brief.pdf</span><button id="om-preview-close" class="om-icon cursor-interaction" aria-label="Close attachment preview"><i data-lucide="x" aria-hidden="true"></i></button></header><div class="om-document"><div class="om-doc-label">NORTHSTAR / CREATIVE STUDIO</div><h2>Built for<br>what’s next.</h2><p>Q4 launch · Creative direction</p><div class="om-doc-stripe"></div><p>Campaign overview, launch deliverables, and final review notes.</p><p>October 2026</p></div></div></section>
+    <section id="om-help" class="om-help" aria-label="Keyboard shortcuts" hidden><strong>Keyboard shortcuts</strong><dl><dt>Search mail</dt><dd><kbd>Ctrl K</kbd></dd><dt>New message</dt><dd><kbd>Alt N</kbd></dd><dt>Reply</dt><dd><kbd>Alt R</kbd></dd><dt>Close or save draft</dt><dd><kbd>Esc</kbd></dd></dl></section>
+  </div>
+</div>
+<script>
+(() => {
+ const root=document.getElementById('overlook-refined'),q=s=>root.querySelector(s),qa=s=>[...root.querySelectorAll(s)];
+ const esc=v=>String(v??'').replace(/[&<>"']/g,c=>({'&':'&amp;','<':'&lt;','>':'&gt;','"':'&quot;',"'":'&#39;'}[c]));
+ const icon=n=>`<i data-lucide="${n}" aria-hidden="true"></i>`;
+ const icons=()=>{if(globalThis.lucide)lucide.createIcons({attrs:{width:16,height:16}});};
+ const messages=[
+  {id:1,from:'Maya Chen',email:'maya@northstar.example',initials:'MC',tone:'purple',subject:'Launch creative — final review',snippet:'The updated launch materials are ready.',time:'10:42 AM',day:'Today',folder:'Inbox',label:'Projects',unread:false,star:true,files:[{name:'Launch-brief.pdf',size:'2.4 MB',type:'PDF'},{name:'Homepage-v3.fig',size:'8.1 MB',type:'FIG'}],history:[{from:'Maya Chen',initials:'MC',tone:'purple',time:'Yesterday',preview:'Sharing the first round of launch concepts.',body:'Hi Jason, sharing the first round of launch concepts. We’ve put together two directions for the homepage and campaign. I’d love your thoughts before we refine the final route.'},{from:'You',initials:'JA',tone:'blue',time:'9:15 AM',preview:'The second direction looks great. A few notes…',body:'The second direction looks great. Let’s move forward with that one. Can we simplify the headline, give the product a bit more room, and bring the launch checklist into the same file?'}],body:'<p>Hi Jason,</p><p>The updated launch materials are ready for a final look. We’ve worked your feedback into the homepage and campaign.</p><ul><li><strong>Homepage:</strong> refined layout and updated headline</li><li><strong>Campaign:</strong> final assets in both formats</li><li><strong>Launch brief:</strong> checklist and handoff notes</li></ul><p>Could you take a look by tomorrow afternoon? Once we have your sign-off, we’re ready to go.</p>',signature:'Thanks,<br>Maya<br><small>Design Director · Northstar Studio</small>'},
+  {id:2,from:'Alex Rivera',email:'alex@studio.example',initials:'AR',tone:'blue',subject:'Website updates are ready',snippet:'The latest build is ready for your review.',time:'10:18 AM',day:'Today',folder:'Inbox',label:'Projects',unread:true,star:false,files:[],body:'<p>Morning Jason,</p><p>The latest build is ready for your review. The navigation and smaller screens are looking good, and all of the copy updates are in.</p><p>I’ve also addressed the feedback on the checkout flow. Let me know if you spot anything else before we share this with the team.</p>',signature:'Alex'},
+  {id:3,from:'Figma',email:'updates@figma.example',initials:'F',tone:'gray',subject:'Your team’s weekly activity',snippet:'3 files updated in the Northstar workspace.',time:'9:36 AM',day:'Today',folder:'Inbox',label:'Projects',unread:true,star:false,files:[],body:'<p>Here’s what your team has been working on.</p><ul><li>Homepage exploration — updated by Maya</li><li>Component library — updated by Alex</li><li>Campaign concepts — updated by Daniel</li></ul><p>You’re all caught up with this week’s activity.</p>',signature:'The Figma team'},
+  {id:4,from:'Sophie Williams',email:'sophie@example.com',initials:'SW',tone:'amber',subject:'Saturday plans?',snippet:'Coffee first, then a trail with a view?',time:'8:51 AM',day:'Today',folder:'Inbox',label:'Personal',unread:true,star:true,files:[],body:'<p>Hey Jason,</p><p>The weather looks perfect for Saturday. Want to grab coffee and head out for a walk?</p><p>You pick the trail. I’ll bring the snacks.</p>',signature:'Sophie'},
+  {id:5,from:'Daniel Park',email:'daniel@studio.example',initials:'DP',tone:'teal',subject:'Notes from our conversation',snippet:'Thanks again for making the time today.',time:'4:24 PM',day:'Yesterday',folder:'Inbox',label:'Projects',unread:false,star:false,files:[],body:'<p>Hi Jason,</p><p>Thanks again for making the time today. It was helpful to walk through the direction together.</p><p>I’ll collect the remaining feedback and send it over tomorrow. We’re aligned on the timeline and ready for the next stage.</p>',signature:'Daniel'},
+  {id:6,from:'Linear',email:'digest@linear.example',initials:'L',tone:'purple',subject:'Your project update',snippet:'12 issues completed. Here’s what’s next.',time:'2:10 PM',day:'Yesterday',folder:'Inbox',label:'Projects',unread:true,star:false,files:[],body:'<p>A productive week.</p><p>Your team completed 12 issues across design and development. The next milestone is the creative handoff, followed by final testing.</p><p>You can review the remaining tasks with your team.</p>',signature:'Linear'},
+  {id:7,from:'Dense Discovery',email:'read@discovery.example',initials:'DD',tone:'gray',subject:'Ideas worth your attention',snippet:'Design, technology, and a different perspective.',time:'11:03 AM',day:'Yesterday',folder:'Inbox',label:'Reading',unread:false,star:false,files:[],body:'<p>This week’s reading list.</p><p>A thoughtful essay on independent software, a new typeface, and a small studio doing remarkable things with ordinary materials.</p><p>A few things to save for a quiet moment.</p>',signature:'Dense Discovery'},
+  {id:8,from:'Maya Chen',email:'maya@northstar.example',initials:'JA',tone:'blue',subject:'Agenda for next week',snippet:'A few things to cover when we catch up.',time:'Draft',day:'Today',folder:'Drafts',label:'Projects',unread:false,star:false,files:[],body:'<p>Hi Maya,</p><p>A few things to cover when we catch up next week:</p>',signature:''},
+  {id:9,from:'You',email:'daniel@studio.example',initials:'JA',tone:'blue',subject:'Re: Project timeline',snippet:'The timeline works for me. Let’s move ahead.',time:'Friday',day:'Earlier',folder:'Sent',label:'Projects',unread:false,star:false,files:[],body:'<p>Hi Daniel,</p><p>The timeline works for me. Let’s move ahead with the plan we discussed.</p>',signature:'Jason'},
+  {id:10,from:'Alex Rivera',email:'alex@studio.example',initials:'AR',tone:'blue',subject:'First round of concepts',snippet:'Some early thinking to get us started.',time:'Thursday',day:'Earlier',folder:'Archive',label:'Projects',unread:false,star:false,files:[],body:'<p>Hi Jason,</p><p>Some early thinking to get us started. We’ve explored two directions and would love your feedback.</p>',signature:'Alex'}
+ ];
+ let folder='Inbox',filter='all',search='',selected=1,reversed=false,composer=null,undo=null,toastTimer=null,editorRange=null;
+ const design={appearance:'system',density:'comfortable',avatars:true,reading:'right'};
+ function saveState(){if(window.openai?.setWidgetState)window.openai.setWidgetState({modelContent:{application:'Overlook',direction:'Refined mail client',...design},privateContent:{folder,selected,filter,search,mobile:root.dataset.mobile}}).catch(()=>{});}
+ function restoreState(state){if(!state||typeof state!=='object')return;const d=state.modelContent||{},p=state.privateContent||{};if(d.direction!=='Refined mail client')return;if(['system','light','dark'].includes(d.appearance))design.appearance=d.appearance;if(['comfortable','compact'].includes(d.density))design.density=d.density;if(typeof d.avatars==='boolean')design.avatars=d.avatars;if(['right','below'].includes(d.reading))design.reading=d.reading;if(qa('[data-folder]').some(b=>b.dataset.folder===p.folder))folder=p.folder;if(messages.some(m=>m.id===p.selected))selected=p.selected;if(['all','unread','files'].includes(p.filter))filter=p.filter;if(typeof p.search==='string')search=p.search.slice(0,200);if(['list','reader'].includes(p.mobile))root.dataset.mobile=p.mobile;}
+ function applyDesign(){if(design.appearance==='system')root.style.removeProperty('color-scheme');else root.style.colorScheme=design.appearance;root.dataset.density=design.density;root.dataset.avatars=String(design.avatars);root.dataset.reading=design.reading;const scheme=getComputedStyle(root).colorScheme;const dark=design.appearance==='dark'||(design.appearance==='system'&&(scheme==='dark'||scheme.includes('dark')&&matchMedia('(prefers-color-scheme:dark)').matches));q('#om-theme').innerHTML=icon(dark?'sun':'moon');q('#om-theme').setAttribute('aria-label',dark?'Switch to light appearance':'Switch to dark appearance');}
+ function visible(){let list=messages.filter(m=>folder==='Starred'?m.star&&m.folder!=='Trash':['Projects','Personal','Reading'].includes(folder)?m.label===folder&&!['Trash','Drafts'].includes(m.folder):m.folder===folder);if(filter==='unread')list=list.filter(m=>m.unread);if(filter==='files')list=list.filter(m=>m.files.length);if(search.trim())list=list.filter(m=>`${m.from} ${m.subject} ${m.snippet} ${m.body}`.toLowerCase().includes(search.trim().toLowerCase()));return reversed?[...list].reverse():list;}
+ function reconcile(){const list=visible();if(!list.some(m=>m.id===selected))selected=list[0]?.id||null;}
+ function avatar(m){return `<span class="om-avatar" data-tone="${m.tone}">${esc(m.initials)}</span>`;}
+ function renderList(){const list=visible();q('#om-folder-title').textContent=search?'Search results':folder;q('#om-total').textContent=list.length;qa('[data-folder]').forEach(b=>{if(b.dataset.folder===folder)b.setAttribute('aria-current','page');else b.removeAttribute('aria-current');});qa('[data-filter]').forEach(b=>b.setAttribute('aria-pressed',String(b.dataset.filter===filter)));qa('[data-count]').forEach(el=>{const n=messages.filter(m=>el.dataset.count==='Inbox'?m.folder==='Inbox'&&m.unread:el.dataset.count==='Starred'?m.star&&m.folder!=='Trash':m.folder==='Drafts').length;el.textContent=n||'';});q('#om-status').textContent=`${list.length} conversations · ${list.filter(m=>m.unread).length} unread`;let group='';q('#om-message-list').innerHTML=list.length?list.map(m=>{const groupHtml=group!==m.day?`<div class="om-group"><span>${esc(m.day)}</span><span>${list.filter(x=>x.day===m.day).length}</span></div>`:'';group=m.day;return `${groupHtml}<div class="om-mail ${m.id===selected?'active':''} ${m.unread?'om-unread':''}"><button class="om-mail-button cursor-interaction" data-message="${m.id}" aria-pressed="${m.id===selected}" aria-label="${esc(m.from+': '+m.subject)}">${avatar(m)}<span class="om-mail-text"><span class="om-mail-top"><span class="om-sender">${esc(m.from)}</span>${m.history?'<span class="om-count">3</span>':''}<time class="om-time">${esc(m.time)}</time></span><span class="om-list-subject" data-tooltip="${esc(m.subject)}">${esc(m.subject)}</span><span class="om-snippet">${esc(m.snippet)}</span>${m.files.length?`<span class="om-list-meta">${icon('paperclip')}<span>${m.files.length} attachments</span><span class="om-list-tag">${esc(m.label)}</span></span>`:''}</span></button><button class="om-star cursor-interaction" data-star="${m.id}" aria-pressed="${m.star}" aria-label="${m.star?'Unstar':'Star'} ${esc(m.from)} message">${icon('star')}</button></div>`;}).join(''):`<div class="om-empty">${icon('inbox')}<strong>${search?'No results':'You’re all caught up'}</strong>${search?'Try another name or keyword.':'There are no messages in this view.'}</div>`;}
+ function toolbar(m){const list=visible(),index=list.findIndex(x=>x.id===selected);return `<div class="om-toolbar"><button class="om-icon om-back cursor-interaction" data-action="back" aria-label="Back to messages">${icon('arrow-left')}</button><button class="om-action cursor-interaction" data-action="archive" aria-label="Archive conversation" ${m?'':'disabled'}>${icon('archive')}<span class="om-action-text">Archive</span></button><button class="om-action cursor-interaction" data-action="trash" aria-label="Delete conversation" ${m?'':'disabled'}>${icon('trash-2')}<span class="om-action-text">Delete</span></button><span class="om-rule"></span><button class="om-action cursor-interaction" data-action="read" aria-label="${m?.unread?'Mark as read':'Mark as unread'}" ${m?'':'disabled'} data-tooltip="${m?.unread?'Mark as read':'Mark as unread'}">${icon(m?.unread?'mail-open':'mail')}</button><div class="om-toolbar-next"><button class="om-icon cursor-interaction" data-action="previous" aria-label="Previous conversation" ${index<=0?'disabled':''}>${icon('chevron-left')}</button><button class="om-icon cursor-interaction" data-action="next" aria-label="Next conversation" ${index<0||index===list.length-1?'disabled':''}>${icon('chevron-right')}</button></div></div>`;}
+ function renderReader(){const m=messages.find(x=>x.id===selected);if(!m){q('#om-conversation').innerHTML=toolbar(null)+`<div class="om-empty">${icon('mail-open')}<strong>Your mail, in focus</strong>Select a conversation to get started.</div>`;return;}const history=m.history||[];q('#om-conversation').innerHTML=toolbar(m)+`<article class="om-thread"><h2 class="om-thread-title">${esc(m.subject)}</h2><div class="om-thread-meta"><span class="om-tag">${esc(m.label)}</span><span>${history.length+1} message${history.length?'s':''}</span><span>·</span><span>${history.length?'You and '+esc(m.from):esc(m.from)}</span></div>${history.map(h=>`<details class="om-history"><summary class="cursor-interaction">${avatar(h)}<span class="om-history-content"><strong>${esc(h.from)}</strong><span>${esc(h.preview)}</span></span><time>${esc(h.time)}</time></summary><div class="om-history-body">${esc(h.body)}</div></details>`).join('')}<div class="om-email"><header class="om-email-header">${avatar(m)}<div class="om-person"><strong>${esc(m.from)}</strong><span>${m.folder==='Sent'||m.folder==='Drafts'?'To '+esc(m.email):'to me · '+esc(m.email)}</span></div><time>${esc(m.time)}</time></header><div class="om-email-body">${m.body}<div class="om-signature">${m.signature||''}</div></div>${m.files.length?`<div class="om-attachment-label">${m.files.length} attachments</div><div class="om-files">${m.files.map((f,index)=>`<button class="om-file cursor-interaction" data-file="${index}" aria-label="Preview ${esc(f.name)}"><span class="om-file-type ${f.type==='FIG'?'fig':''}">${esc(f.type)}</span><span class="om-file-info"><strong data-tooltip="${esc(f.name)}">${esc(f.name)}</strong><small>${esc(f.size)}</small></span></button>`).join('')}</div>`:''}</div>${m.folder==='Drafts'?`<div class="om-quick-reply"><button class="om-reply-placeholder cursor-interaction" data-action="edit-draft">${icon('square-pen')}Continue writing this draft</button></div>`:`<div class="om-quick-reply"><button class="om-reply-placeholder cursor-interaction" data-action="reply">${icon('reply')}Reply to ${esc(m.from==='You'?m.email:m.from)}…</button><div class="om-reply-footer"><button class="cursor-interaction" data-action="reply">${icon('reply')}Reply</button><button class="cursor-interaction" data-action="forward">${icon('forward')}Forward</button><kbd>Alt R</kbd></div></div>`}</article>`;}
+ function render(){renderList();renderReader();icons();}
+ function notify(text,undoAction=null){clearTimeout(toastTimer);undo=undoAction;q('#om-toast-label').textContent=text;q('#om-undo').hidden=!undoAction;q('#om-toast').hidden=false;toastTimer=setTimeout(()=>{q('#om-toast').hidden=true;undo=null;},5500);}
+ function saveDraft(){if(!composer)return;const draft=messages.find(m=>m.id===composer.id);if(draft)Object.assign(draft,{email:composer.to,subject:composer.subject||'(No subject)',from:composer.to?composer.to.split('@')[0]:'New message',snippet:q('#om-body')?.textContent.slice(0,90)||'Draft in progress',body:composer.html,files:composer.files});}
+ function compose(mode='new',draft=null){if(composer){q('#om-body').focus();return;}const m=messages.find(x=>x.id===selected);if(draft)composer={id:draft.id,mode:'draft',to:draft.email,cc:'',bcc:'',subject:draft.subject,html:draft.body,files:[...draft.files]};else{const id=Math.max(...messages.map(x=>x.id))+1;composer={id,mode,to:mode==='reply'?m?.email||'':'',cc:'',bcc:'',subject:mode==='reply'?'Re: '+(m?.subject||'').replace(/^Re: /,''):mode==='forward'?'Fwd: '+(m?.subject||''):'',html:mode==='reply'?`<p>Hi ${esc(m?.from.split(' ')[0]||'')},</p><p><br></p>`:mode==='forward'?`<p><br></p><p>—— Forwarded message ——<br>From: ${esc(m?.from)}<br>Subject: ${esc(m?.subject)}</p>${m?.body||''}`:'',files:mode==='forward'?[...(m?.files||[])]:[]};messages.unshift({id,from:'New message',email:composer.to,initials:'JA',tone:'blue',subject:composer.subject||'(No subject)',snippet:'Draft in progress',time:'Draft',day:'Today',folder:'Drafts',label:m?.label||'Personal',unread:false,star:false,files:composer.files,body:composer.html,signature:''});}q('#om-composer').hidden=false;q('#om-composer').innerHTML=`<header class="om-compose-titlebar"><strong>${mode==='reply'?'Reply':mode==='forward'?'Forward message':'New message'}</strong><div><span class="om-saved">${icon('check')}Saved to Drafts</span><button class="om-icon cursor-interaction" data-action="close-compose" aria-label="Save and close message">${icon('x')}</button></div></header><div class="om-field"><label>From</label><span class="om-from"><strong>Jason</strong> &lt;jason@example.com&gt;</span></div><div class="om-field"><label for="om-to">To</label><input id="om-to" type="email" multiple value="${esc(composer.to)}" placeholder="Recipients" aria-label="Recipients"><button class="cursor-interaction" data-expand="cc">Cc</button><button class="cursor-interaction" data-expand="bcc">Bcc</button></div><div class="om-field" id="om-cc-row" hidden><label for="om-cc">Cc</label><input id="om-cc" type="email" multiple aria-label="Cc recipients"></div><div class="om-field" id="om-bcc-row" hidden><label for="om-bcc">Bcc</label><input id="om-bcc" type="email" multiple aria-label="Bcc recipients"></div><div class="om-field"><label for="om-subject">Subject</label><input id="om-subject" value="${esc(composer.subject)}" placeholder="Add a subject" aria-label="Subject"></div><div id="om-body" class="om-rich-editor" role="textbox" aria-multiline="true" aria-label="Message body" contenteditable="true" data-placeholder="Write your message…">${composer.html}</div><div id="om-added-files" class="om-added-files"></div><div class="om-format-bar" aria-label="Text formatting"><button class="om-icon cursor-interaction" data-format="bold" aria-label="Bold" aria-pressed="false">${icon('bold')}</button><button class="om-icon cursor-interaction" data-format="italic" aria-label="Italic" aria-pressed="false">${icon('italic')}</button><button class="om-icon cursor-interaction" data-format="underline" aria-label="Underline" aria-pressed="false">${icon('underline')}</button><span class="om-rule"></span><button class="om-icon cursor-interaction" data-format="insertUnorderedList" aria-label="Bulleted list" aria-pressed="false">${icon('list')}</button><button class="om-icon cursor-interaction" data-action="add-link" aria-label="Insert link">${icon('link')}</button></div><div id="om-link-fields" class="om-link-fields" hidden><input id="om-link-url" type="url" placeholder="https://example.com" aria-label="Link URL"><button class="cursor-interaction" data-action="insert-link">Insert</button><button class="cursor-interaction" data-action="cancel-link" aria-label="Cancel link">${icon('x')}</button></div><div class="om-compose-bottom"><button class="om-primary cursor-interaction" data-action="send">Send ${icon('send')}</button><button class="om-icon cursor-interaction" data-action="attach" aria-label="Attach files">${icon('paperclip')}</button><input id="om-file-input" type="file" multiple hidden><button class="om-icon om-discard cursor-interaction" data-action="discard" aria-label="Discard draft">${icon('trash-2')}</button></div>`;renderAttachments();saveDraft();renderList();icons();(mode==='reply'?q('#om-body'):q('#om-to')).focus();}
+ function renderAttachments(){if(!composer)return;q('#om-added-files').innerHTML=composer.files.map((f,index)=>`<span class="om-added-file">${icon('paperclip')}<span>${esc(f.name)}</span><button class="cursor-interaction" data-remove-file="${index}" aria-label="Remove ${esc(f.name)}">${icon('x')}</button></span>`).join('');icons();}
+ function closeComposer(discard=false){if(!composer)return;saveDraft();if(discard){const i=messages.findIndex(m=>m.id===composer.id);if(i>=0)messages.splice(i,1);}composer=null;q('#om-composer').hidden=true;q('#om-composer').innerHTML='';reconcile();render();notify(discard?'Draft discarded':'Saved to Drafts');}
+ function choose(id){selected=id;const m=messages.find(x=>x.id===id);if(!m)return;m.unread=false;root.dataset.mobile='reader';render();saveState();}
+ function saveEditor(){if(!composer||!q('#om-body'))return;composer.html=q('#om-body').innerHTML;saveDraft();renderList();icons();}
+ function rememberRange(){const sel=window.getSelection();if(sel?.rangeCount&&q('#om-body')?.contains(sel.anchorNode))editorRange=sel.getRangeAt(0).cloneRange();}
+ function applyFormat(command,value=null){q('#om-body').focus();if(editorRange){const sel=window.getSelection();sel.removeAllRanges();sel.addRange(editorRange);}document.execCommand(command,false,value);rememberRange();saveEditor();qa('[data-format]').forEach(b=>b.setAttribute('aria-pressed',String(document.queryCommandState(b.dataset.format))));}
+ root.addEventListener('click',event=>{const b=event.target.closest('button');if(!b||!root.contains(b))return;
+  if(b.dataset.folder){folder=b.dataset.folder;filter='all';search='';q('#om-search').value='';reconcile();root.dataset.mobile='list';render();saveState();return;}
+  if(b.dataset.filter){filter=b.dataset.filter;reconcile();render();saveState();return;}
+  if(b.dataset.message){choose(Number(b.dataset.message));return;}
+  if(b.dataset.star){const m=messages.find(x=>x.id===Number(b.dataset.star));m.star=!m.star;reconcile();render();return;}
+  if(b.dataset.file!==undefined){const m=messages.find(x=>x.id===selected);q('#om-preview-name').textContent=m.files[Number(b.dataset.file)].name;q('#om-preview').hidden=false;q('#om-preview-close').focus();return;}
+  if(b.dataset.expand){q('#om-'+b.dataset.expand+'-row').hidden=false;q('#om-'+b.dataset.expand).focus();return;}
+  if(b.dataset.removeFile!==undefined&&composer){composer.files.splice(Number(b.dataset.removeFile),1);saveDraft();renderAttachments();return;}
+  if(b.dataset.format){applyFormat(b.dataset.format);return;}
+  const action=b.dataset.action,m=messages.find(x=>x.id===selected);
+  if(action==='back'){root.dataset.mobile='list';return;}
+  if(action==='reply'||action==='forward'){compose(action);return;}
+  if(action==='edit-draft'){compose('draft',m);return;}
+  if(action==='close-compose'){closeComposer();return;}
+  if(action==='discard'){closeComposer(true);return;}
+  if(action==='attach'){q('#om-file-input').click();return;}
+  if(action==='add-link'){rememberRange();q('#om-link-fields').hidden=false;q('#om-link-url').focus();return;}
+  if(action==='cancel-link'){q('#om-link-fields').hidden=true;q('#om-body').focus();return;}
+  if(action==='insert-link'){const value=q('#om-link-url').value.trim();if(!/^https?:\/\//i.test(value)||!q('#om-link-url').checkValidity()){notify('Enter a full https:// link');return;}applyFormat('createLink',value);q('#om-link-fields').hidden=true;return;}
+  if(action==='send'){if(!composer)return;const to=q('#om-to');if(!to.value||!to.checkValidity()){to.reportValidity();notify('Add a valid recipient');return;}for(const id of ['om-cc','om-bcc']){const field=q('#'+id);if(field.value&&!field.checkValidity()){field.reportValidity();return;}}if(!q('#om-body').textContent.trim()){q('#om-body').focus();notify('Write a message before sending');return;}saveEditor();const sent=messages.find(x=>x.id===composer.id);Object.assign(sent,{folder:'Sent',from:'You',time:'Just now'});composer=null;q('#om-composer').hidden=true;q('#om-composer').innerHTML='';reconcile();render();notify('Message sent in this preview');return;}
+  if(!m)return;
+  if(action==='archive'||action==='trash'){const previous=m.folder;m.folder=action==='archive'?'Archive':'Trash';reconcile();render();notify(action==='archive'?'Conversation archived':'Conversation moved to Trash',()=>{m.folder=previous;selected=m.id;render();notify('Conversation restored');});}
+  if(action==='read'){m.unread=!m.unread;render();notify(m.unread?'Marked as unread':'Marked as read');}
+  if(action==='previous'||action==='next'){const list=visible(),index=list.findIndex(x=>x.id===selected),next=list[index+(action==='next'?1:-1)];if(next)choose(next.id);}
+ });
+ q('#om-new').addEventListener('click',()=>compose());
+ q('#om-search').addEventListener('input',event=>{search=event.target.value;reconcile();root.dataset.mobile='list';render();saveState();});
+ q('#om-sort').addEventListener('click',()=>{reversed=!reversed;render();});
+ q('#om-theme').addEventListener('click',()=>{design.appearance=q('#om-theme').getAttribute('aria-label').includes('light')?'light':'dark';applyDesign();icons();saveState();});
+ q('#om-help-button').addEventListener('click',()=>{q('#om-help').hidden=!q('#om-help').hidden;});
+ q('#om-undo').addEventListener('click',()=>{const run=undo;undo=null;if(run)run();});
+ q('#om-preview-close').addEventListener('click',()=>{q('#om-preview').hidden=true;q('[data-file="0"]')?.focus();});
+ root.addEventListener('input',event=>{if(!composer)return;if(event.target.id==='om-body'){saveEditor();return;}const fields={'om-to':'to','om-cc':'cc','om-bcc':'bcc','om-subject':'subject'};if(fields[event.target.id]){composer[fields[event.target.id]]=event.target.value;saveDraft();renderList();icons();}});
+ root.addEventListener('change',event=>{if(event.target.id==='om-file-input'&&composer){for(const f of event.target.files)composer.files.push({name:f.name,size:f.size<1000000?Math.ceil(f.size/1000)+' KB':(f.size/1000000).toFixed(1)+' MB',type:f.name.split('.').pop().slice(0,4).toUpperCase()});saveDraft();renderAttachments();}});
+ root.addEventListener('paste',event=>{if(event.target.closest('#om-body')){event.preventDefault();document.execCommand('insertText',false,event.clipboardData.getData('text/plain'));saveEditor();}});
+ root.addEventListener('mousedown',event=>{if(event.target.closest('[data-format]')){event.preventDefault();rememberRange();}});
+ root.addEventListener('mouseup',rememberRange);root.addEventListener('keyup',rememberRange);
+ document.addEventListener('keydown',event=>{if((event.ctrlKey||event.metaKey)&&event.key.toLowerCase()==='k'){event.preventDefault();q('#om-search').focus();}if(event.altKey&&event.key.toLowerCase()==='n'){event.preventDefault();compose();}if(event.altKey&&event.key.toLowerCase()==='r'){event.preventDefault();if(selected)compose('reply');}if(event.key==='Escape'){if(!q('#om-preview').hidden){q('#om-preview').hidden=true;return;}q('#om-help').hidden=true;if(composer)closeComposer();}});
+ restoreState(window.openai?.widgetState);applyDesign();q('#om-search').value=search;reconcile();render();
+ window.addEventListener('openai:set_globals',event=>{const state=event.detail?.globals?.widgetState;if(state){restoreState(state);applyDesign();q('#om-search').value=search;reconcile();render();}});
+ if(globalThis.Tweak){const tweak=new Tweak({container:root,onChange:()=>{applyDesign();icons();saveState();}});tweak.addSelect(design,'density',{label:'Message density',options:[{label:'Comfortable',value:'comfortable'},{label:'Compact',value:'compact'}]});tweak.addToggle(design,'avatars',{label:'Sender avatars'});tweak.addSelect(design,'reading',{label:'Reading pane',options:[{label:'On the right',value:'right'},{label:'Below messages',value:'below'}]});}
+})();
+</script>
