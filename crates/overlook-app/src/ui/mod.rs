@@ -1255,8 +1255,15 @@ impl MailWindow {
                             .gap(px(10.))
                             .w(px(214.))
                             .flex_none()
-                            .child(img("overlook/icon-128.png").size(px(30.)).rounded(px(8.)))
-                            .child(svg().path("overlook/wordmark.svg").h(px(23.)).w(px(64.)).text_color(p.foreground)),
+                            .child(brand_tile(30.))
+                            .child(
+                                div()
+                                    .font_family("Source Serif 4 Display")
+                                    .text_size(px(22.))
+                                    .line_height(px(30.))
+                                    .text_color(p.foreground)
+                                    .child("Overlook"),
+                            ),
                     )
                     .child(
                         h_flex()
@@ -1553,6 +1560,29 @@ impl MailWindow {
             }))
             .into_any_element()
     }
+}
+
+/// The app icon drawn from vectors: midnight rounded tile, ivory horizon mark, amber beacon.
+/// Crisp at any scale, unlike a downscaled bitmap.
+fn brand_tile(size: f32) -> impl IntoElement {
+    let midnight: Hsla = Rgba::from(gpui_kit::rgb(0x101C24)).into();
+    let ivory: Hsla = Rgba::from(gpui_kit::rgb(0xF0EBDD)).into();
+    let amber: Hsla = Rgba::from(gpui_kit::rgb(0xFF9D32)).into();
+    // Geometry from branding/assets/overlook-app-icon.svg (128-unit canvas): the mark is
+    // inset 10 units and scaled .84375; the beacon sits at (79, 42) with radius 5.
+    let inset = size * 10. / 128.;
+    let mark = size * 108. / 128.;
+    let dot = size * 10. * 0.84375 / 128.;
+    let dot_cx = inset + mark * 79. / 128.;
+    let dot_cy = inset + mark * 42. / 128.;
+    div()
+        .relative()
+        .flex_none()
+        .size(px(size))
+        .rounded(px(size * 28. / 128.))
+        .bg(midnight)
+        .child(svg().path("overlook/symbolic.svg").absolute().left(px(inset)).top(px(inset)).size(px(mark)).text_color(ivory))
+        .child(div().absolute().left(px(dot_cx - dot / 2.)).top(px(dot_cy - dot / 2.)).size(px(dot)).rounded_full().bg(amber))
 }
 
 impl Focusable for MailWindow {
