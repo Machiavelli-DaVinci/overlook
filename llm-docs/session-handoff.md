@@ -109,3 +109,5 @@ Brand assets and the HTML design preview keep their existing maintenance command
   quoted-text collapsing, inline `cid:` images (schema v6, `content_id`), plain-text quotes, vendored
   parser patches for `<br>`, block assembly, `<hr>`, `<pre>`, `<ol start>`. The "Show quoted text"
   toggle was not exercised by click during the review (no pointer automation at the time); verify once by hand.
+
+- v0.1.2 published 2026-10-12 (rendering review: pre-pass, quoted text, inline images, vendored parser patches). Working version is now 0.1.3.
