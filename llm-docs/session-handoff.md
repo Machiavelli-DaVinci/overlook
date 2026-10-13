@@ -133,3 +133,5 @@ Brand assets and the HTML design preview keep their existing maintenance command
   API, schema v9), named signatures + automatic replies (gmail.settings.basic), mailto with single instance,
   reminder snooze, calendar Enter/Delete/Escape, sup/sub glyphs. New OAuth scopes mean existing sign-ins show
   "Sign in again" in Settings → Accounts for contacts and automatic replies until re-authorised.
+
+- v0.3.0 published 2026-10-12 (Gmail batch endpoint, PDF previews, colspan, contacts, named signatures + automatic replies, mailto single instance, reminder snooze, calendar keys, sup/sub). Working version is now 0.3.1.
