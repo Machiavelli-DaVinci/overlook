@@ -37,7 +37,9 @@ and you can read, search, write, and file mail with no connection at all.
 - **Reading that respects you.** Received HTML is sanitized before it is rendered; scripts never run and remote
   images are blocked until you ask. Attachments download on click and open with your system apps.
 - **Writing.** New, reply, reply all, forward, with autosave to the device, recipient suggestions from people
-  you have written to, attachments, and signatures per account.
+  you have written to, attachments, and signatures per account. Formatting as you type: bold, italics, links,
+  lists, quotes and code, styled live in the editor with the marks still visible, a Preview of exactly what
+  recipients get, and the quoted original kept out of your way below the reply.
 - **A calendar, not an afterthought.** Day, Week, Month, and Agenda. Invitations with Accept, Tentative, and
   Decline, from the calendar or from the email itself. Create, edit, and delete events. Reminders as desktop
   notifications. Working hours shaded. Google's event colors.
@@ -139,6 +141,9 @@ in Google Cloud lifts that. The [native app guide](llm-docs/overlook-native-app.
 | <kbd>Ctrl</kbd>+<kbd>N</kbd> | New message |
 | <kbd>Ctrl</kbd>+<kbd>R</kbd> / <kbd>Ctrl</kbd>+<kbd>Shift</kbd>+<kbd>R</kbd> / <kbd>Ctrl</kbd>+<kbd>F</kbd> | Reply / Reply all / Forward |
 | <kbd>Ctrl</kbd>+<kbd>Enter</kbd> | Send |
+| <kbd>Ctrl</kbd>+<kbd>B</kbd> / <kbd>I</kbd> / <kbd>K</kbd> | Bold / italic / link while writing |
+| <kbd>Ctrl</kbd>+<kbd>Shift</kbd>+<kbd>8</kbd> / <kbd>7</kbd> / <kbd>9</kbd> | Bulleted list / numbered list / quote |
+| <kbd>Ctrl</kbd>+<kbd>Shift</kbd>+<kbd>P</kbd> | Preview the message |
 | <kbd>Ctrl</kbd>+<kbd>E</kbd> | Search |
 | <kbd>J</kbd> / <kbd>K</kbd> | Next / previous conversation |
 | <kbd>E</kbd> | Archive, or Move to Inbox when already archived |
@@ -175,7 +180,7 @@ browser engine in a mail client.
 ## Status
 
 Early daily use by its author on Omarchy (Hyprland, Wayland). Gmail accounts work end to end; IMAP/SMTP and
-POP3 are planned next, as are rich-text composition, attachment previews, and a Flatpak build. GNOME, KDE,
+POP3 are planned next, as are attachment previews and a Flatpak build. GNOME, KDE,
 and screen-reader testing are still to be done. Open an issue with what you did, what you saw, and what you
 expected.
 

@@ -2,7 +2,7 @@
 
 use rusqlite::Connection;
 
-const MIGRATIONS: &[&str] = &[V1, V2, V3, V4, V5, V6];
+const MIGRATIONS: &[&str] = &[V1, V2, V3, V4, V5, V6, V7];
 
 pub fn migrate(conn: &Connection) -> rusqlite::Result<()> {
     let current: i64 = conn.query_row("PRAGMA user_version", [], |r| r.get(0))?;
@@ -226,5 +226,11 @@ COMMIT;
 const V6: &str = r#"
 BEGIN;
 ALTER TABLE attachments ADD COLUMN content_id TEXT;
+COMMIT;
+"#;
+
+const V7: &str = r#"
+BEGIN;
+ALTER TABLE drafts ADD COLUMN include_quote INTEGER NOT NULL DEFAULT 0;
 COMMIT;
 "#;

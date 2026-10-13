@@ -57,6 +57,31 @@ Google Calendar on the same OAuth client, with the `calendar.events` and `calend
 
 Signatures are appended with a blank line when composing, and above the quoted original in replies. Not yet: multiple signatures per account, automatic replies (needs the `gmail.settings.basic` scope), rules and sweep, and rich-text signatures.
 
+## Composer
+
+The body is Markdown-flavoured text edited in the kit's code-editor state (`EditorState`, language
+`mail`, line numbers and indent guides off, soft wrap on, Inter instead of the editor's monospace
+default). `ui/mail_highlight.rs` is an `InputHighlighter` that rescans the text on every edit and
+styles it live: bold, italic, strikethrough, inline code, link text and URLs, headings, quotes and
+list markers, with the marks themselves faded. The toolbar and shortcuts (Ctrl+B/I/K, Ctrl+Shift+X
+strike, Ctrl+Shift+C code, Ctrl+Shift+8/7/9 bullets/numbers/quote, Ctrl+Shift+P preview) edit the
+text through `format_wrap`, `format_link` and `format_lines` in `ui/composer.rs`; Enter inside a
+list continues it and Enter on an empty item ends it. Preview swaps the editor for `TextView::html`
+of the rendered body.
+
+`overlook_core::compose` turns the text into the two parts of the message: `render_markdown`
+(the `markdown` crate, GFM, raw HTML escaped, single newlines as `<br>`) and `markdown_to_plain`.
+`outgoing_bodies` appends the quoted original when `Draft.include_quote` is set (schema v7):
+replies get an attribution line and a blockquote of the original's HTML (`sanitize::clean_only`,
+no pre-pass, so the recipient gets the whole chain), forwards a header block and the original in
+full. The quoted text is no longer part of `body_text`; the composer shows it collapsed under the
+editor with Show and Remove. `mime.rs` sends `multipart/alternative` (text + HTML), inside
+`multipart/mixed` when there are attachments; the local Sent copy and the Outbox preview use the
+same bodies. Drafts save `body_html` on every autosave.
+
+Not yet: pasting rich text (paste is plain), inline images in the composer, tables, font or
+colour choices (by design), and underline, which Markdown has no mark for.
+
 ## Rendering
 
 Received HTML goes through three stages before the native view sees it, all in `overlook-core`:
@@ -117,7 +142,7 @@ Keyboard additions: `Ctrl 1` Mail, `Ctrl 2` Calendar, `Ctrl Shift A` new event; 
 cargo test --workspace
 ```
 
-72 tests cover: appearance resolution (Follow system is not a third theme), recipient parsing, conversation summaries, reply/forward drafts, HTML sanitization and remote-image blocking, local time formatting, PKCE/OAuth request building, the sample provider, store durability across reopen, atomic change+operation (a failing change leaves no operation), Outbox queue/cancel, send completion, FTS search and coverage, settings, and the sync engine (offline leaves work queued; ordered replay; uncertain send reconciled without duplicates; cancelled send never sent).
+79 tests cover: appearance resolution (Follow system is not a third theme), recipient parsing, conversation summaries, reply/forward drafts, HTML sanitization and remote-image blocking, local time formatting, PKCE/OAuth request building, the sample provider, store durability across reopen, atomic change+operation (a failing change leaves no operation), Outbox queue/cancel, send completion, FTS search and coverage, settings, and the sync engine (offline leaves work queued; ordered replay; uncertain send reconciled without duplicates; cancelled send never sent).
 
 The manual scenario used to validate the shell (keyboard only, with `wtype` on Hyprland):
 

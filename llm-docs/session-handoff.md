@@ -115,3 +115,8 @@ Brand assets and the HTML design preview keep their existing maintenance command
 - v0.1.3 published 2026-10-12 (Settings segmented controls show the current choice). Working version is now 0.1.4.
 
 - v0.1.4 published 2026-10-12 (shared segmented control with visible selection in header, calendar toolbar, Settings). Working version is now 0.1.5.
+
+- Rich-text composer (2026-10-12): see "Composer" in `overlook-native-app.md`. Markdown-flavoured
+  editor with live styling (`ui/mail_highlight.rs`), toolbar, shortcuts, preview, list continuation;
+  `overlook_core::compose` renders HTML + text; `Draft.include_quote` (schema v7) replaces inline
+  quoting; MIME is multipart/alternative. First item of roadmap phase 1 done.

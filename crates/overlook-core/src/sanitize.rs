@@ -29,15 +29,8 @@ pub struct Sanitized {
 }
 
 /// Sanitizes `html` for display. Never fails: malformed input yields best-effort output.
-pub fn sanitize_html(html: &str, policy: RemoteContent) -> Sanitized {
-    let prepared = crate::prepass::prepare(html);
-    let blocked_remote = if policy == RemoteContent::Blocked {
-        count_remote(&prepared.html) + prepared.quoted.as_deref().map(count_remote).unwrap_or(0)
-    } else {
-        0
-    };
-    let html = prepared.html.as_str();
-
+/// The ammonia policy shared by the reader and by outgoing quotes.
+fn builder(policy: RemoteContent) -> ammonia::Builder<'static> {
     let mut builder = ammonia::Builder::default();
     let tags: HashSet<&str> = [
         "a", "abbr", "b", "blockquote", "br", "caption", "center", "code", "dd", "del", "div",
@@ -76,6 +69,27 @@ pub fn sanitize_html(html: &str, policy: RemoteContent) -> Sanitized {
         }
     }
 
+    builder
+}
+
+/// Cleans HTML without the structural pre-pass: scripts, handlers, and disallowed tags are
+/// removed, but the quoted history, hidden blocks, and layout stay as they are. Used when an
+/// original message is quoted in a reply or forward, where the recipient should get the whole
+/// thing.
+pub fn clean_only(html: &str, policy: RemoteContent) -> String {
+    builder(policy).clean(html).to_string()
+}
+
+pub fn sanitize_html(html: &str, policy: RemoteContent) -> Sanitized {
+    let prepared = crate::prepass::prepare(html);
+    let blocked_remote = if policy == RemoteContent::Blocked {
+        count_remote(&prepared.html) + prepared.quoted.as_deref().map(count_remote).unwrap_or(0)
+    } else {
+        0
+    };
+    let html = prepared.html.as_str();
+
+    let builder = builder(policy);
     let mut clean = flatten_tables(&builder.clean(html).to_string());
     let mut quoted = prepared.quoted.as_deref().map(|q| flatten_tables(&builder.clean(q).to_string()));
     let mut text = html_to_text(&clean);

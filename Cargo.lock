@@ -4776,6 +4776,7 @@ dependencies = [
  "ammonia",
  "html5ever 0.27.0",
  "jiff",
+ "markdown",
  "markup5ever_rcdom",
  "serde",
  "serde_json",

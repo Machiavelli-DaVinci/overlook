@@ -1347,12 +1347,12 @@ fn insert_operation_tx(tx: &Connection, account: &AccountId, kind: OperationKind
 fn save_draft_tx(tx: &Connection, d: &Draft) -> Result<()> {
     tx.execute(
         "INSERT INTO drafts(id, account_id, kind, conversation_id, in_reply_to, to_json, cc_json, bcc_json, subject, body_text, body_html,
-            state_json, created_at, updated_at, provider_id)
-         VALUES(?1,?2,?3,?4,?5,?6,?7,?8,?9,?10,?11,?12,?13,?14,?15)
+            state_json, created_at, updated_at, provider_id, include_quote)
+         VALUES(?1,?2,?3,?4,?5,?6,?7,?8,?9,?10,?11,?12,?13,?14,?15,?16)
          ON CONFLICT(id) DO UPDATE SET kind=excluded.kind, conversation_id=excluded.conversation_id, in_reply_to=excluded.in_reply_to,
             to_json=excluded.to_json, cc_json=excluded.cc_json, bcc_json=excluded.bcc_json, subject=excluded.subject,
             body_text=excluded.body_text, body_html=excluded.body_html, state_json=excluded.state_json,
-            updated_at=excluded.updated_at, provider_id=excluded.provider_id",
+            updated_at=excluded.updated_at, provider_id=excluded.provider_id, include_quote=excluded.include_quote",
         params![
             d.id.0,
             d.account_id.0,
@@ -1369,6 +1369,7 @@ fn save_draft_tx(tx: &Connection, d: &Draft) -> Result<()> {
             d.created_at,
             d.updated_at,
             d.provider_id.as_ref().map(|p| &p.0),
+            d.include_quote as i64,
         ],
     )?;
     tx.execute("DELETE FROM draft_attachments WHERE draft_id=?1", [&d.id.0])?;
@@ -1384,7 +1385,7 @@ fn save_draft_tx(tx: &Connection, d: &Draft) -> Result<()> {
 fn load_drafts(c: &Connection, where_clause: &str, args: impl rusqlite::Params) -> Result<Vec<Draft>> {
     let sql = format!(
         "SELECT d.id, d.account_id, d.kind, d.conversation_id, d.in_reply_to, d.to_json, d.cc_json, d.bcc_json, d.subject, d.body_text,
-                d.body_html, d.state_json, d.created_at, d.updated_at, d.provider_id FROM drafts d {where_clause}"
+                d.body_html, d.state_json, d.created_at, d.updated_at, d.provider_id, d.include_quote FROM drafts d {where_clause}"
     );
     let mut stmt = c.prepare(&sql)?;
     let rows = stmt.query_map(args, |r| {
@@ -1404,11 +1405,12 @@ fn load_drafts(c: &Connection, where_clause: &str, args: impl rusqlite::Params) 
             r.get::<_, i64>(12)?,
             r.get::<_, i64>(13)?,
             r.get::<_, Option<String>>(14)?,
+            r.get::<_, i64>(15)? != 0,
         ))
     })?;
     let mut drafts = Vec::new();
     for row in rows {
-        let (id, account_id, kind, conv, reply, to, cc, bcc, subject, body_text, body_html, state, created, updated, provider) = row?;
+        let (id, account_id, kind, conv, reply, to, cc, bcc, subject, body_text, body_html, state, created, updated, provider, include_quote) = row?;
         drafts.push(Draft {
             id: DraftId(id),
             account_id: AccountId(account_id),
@@ -1421,6 +1423,7 @@ fn load_drafts(c: &Connection, where_clause: &str, args: impl rusqlite::Params) 
             subject,
             body_text,
             body_html,
+            include_quote,
             attachments: Vec::new(),
             state: serde_json::from_str(&state)?,
             created_at: created,

@@ -1,7 +1,7 @@
 //! Builds the RFC 822 message for `users.messages.send`.
 
 use lettre::message::header::ContentType;
-use lettre::message::{Attachment as MimeAttachment, Mailbox, MultiPart, SinglePart};
+use lettre::message::{Attachment as MimeAttachment, Mailbox, MultiPart};
 use lettre::Message as MimeMessage;
 use overlook_core::*;
 
@@ -36,11 +36,14 @@ pub fn build_raw(account: &Account, draft: &Draft, in_reply_to: Option<&Message>
             builder = builder.references(references);
         }
     }
-    let text = if draft.body_text.is_empty() { "\n".to_owned() } else { draft.body_text.clone() };
+    let bodies = overlook_core::compose::outgoing_bodies(draft, in_reply_to);
+    let text = if bodies.text.is_empty() { "\n".to_owned() } else { bodies.text };
+    let html = format!("<!DOCTYPE html><html><body>{}</body></html>", bodies.html);
+    let alternative = MultiPart::alternative_plain_html(text, html);
     let message = if draft.attachments.is_empty() {
-        builder.header(ContentType::TEXT_PLAIN).body(text)
+        builder.multipart(alternative)
     } else {
-        let mut multipart = MultiPart::mixed().singlepart(SinglePart::plain(text));
+        let mut multipart = MultiPart::mixed().multipart(alternative);
         for att in &draft.attachments {
             let bytes = std::fs::read(&att.local_path).map_err(|e| format!("could not read attachment {}: {e}", att.filename))?;
             let content_type = ContentType::parse(&att.mime_type).unwrap_or(ContentType::parse("application/octet-stream").unwrap());
@@ -103,6 +106,8 @@ mod tests {
         assert!(raw.contains("In-Reply-To: <abc@northstar.example>"));
         assert!(raw.contains("References: <root@northstar.example> <abc@northstar.example>"));
         assert!(raw.contains("Subject: Re: Launch =?utf-8?b?"), "{raw}");
-        assert!(raw.contains("Content-Type: text/plain"));
+        assert!(raw.contains("Content-Type: multipart/alternative"), "{raw}");
+        assert!(raw.contains("Content-Type: text/plain") && raw.contains("Content-Type: text/html"), "{raw}");
+        assert!(raw.contains("<p>Looks great"), "{raw}");
     }
 }

@@ -5,8 +5,12 @@ use super::MailWindow;
 use crate::assets::icon;
 use crate::theme::ActivePalette;
 use gpui_kit::component::button::{Button, ButtonVariants};
-use gpui_kit::component::input::{Input, InputEvent, InputState, Textarea, TextareaState};
-use gpui_kit::component::{Sizable, WindowExt};
+use super::mail_highlight::{list_marker_len, MailHighlighter, LANGUAGE};
+use gpui_kit::component::input::{Editor, EditorState, Input, InputEvent, InputHighlighter, InputState};
+use gpui_kit::component::text::TextView;
+use gpui_kit::component::{Disableable, Sizable, WindowExt};
+use overlook_core::compose::render_markdown;
+use std::rc::Rc;
 use gpui_kit::component::notification::Notification;
 use gpui_kit::prelude::*;
 use gpui_kit::*;
@@ -22,7 +26,11 @@ pub struct Composer {
     pub cc: Entity<InputState>,
     pub bcc: Entity<InputState>,
     pub subject: Entity<InputState>,
-    pub body: Entity<TextareaState>,
+    pub body: Entity<EditorState>,
+    /// The message being replied to or forwarded, for the quoted block.
+    pub source: Option<Message>,
+    pub preview: bool,
+    pub quote_shown: bool,
     pub show_cc: bool,
     pub show_bcc: bool,
     pub dirty: bool,
@@ -42,7 +50,23 @@ impl MailWindow {
         let cc = cx.new(|cx| InputState::new(window, cx).placeholder("Cc").default_value(join(&draft.cc)));
         let bcc = cx.new(|cx| InputState::new(window, cx).placeholder("Bcc").default_value(join(&draft.bcc)));
         let subject = cx.new(|cx| InputState::new(window, cx).placeholder("Add a subject").default_value(draft.subject.clone()));
-        let body = cx.new(|cx| TextareaState::new(window, cx).placeholder("Write your message…").default_value(draft.body_text.clone()));
+        let p = *cx.palette();
+        let (accent, muted, code_bg) = (p.accent, p.muted, p.chip);
+        let factory: gpui_kit::component::input::InputHighlighterFactory = Rc::new(move |language: &str| {
+            (language == LANGUAGE).then(|| Box::new(MailHighlighter::new(accent, muted, code_bg)) as Box<dyn InputHighlighter>)
+        });
+        let body = cx.new(|cx| {
+            let mut state = EditorState::new(window, cx)
+                .language(LANGUAGE)
+                .line_number(false)
+                .soft_wrap(true)
+                .placeholder("Write your message…")
+                .default_value(draft.body_text.clone());
+            state.set_highlighter_factory(factory, cx);
+            state.set_indent_guides(false, window, cx);
+            state
+        });
+        let source = draft.in_reply_to.as_ref().and_then(|id| self.store.message(id).ok().flatten());
 
         let mut subs = Vec::new();
         for state in [&to, &cc, &bcc, &subject] {
@@ -57,6 +81,7 @@ impl MailWindow {
         subs.push(cx.subscribe_in(&body, window, |this, _state, event: &InputEvent, window, cx| match event {
             InputEvent::Change => this.composer_changed(window, cx),
             InputEvent::PressEnter { secondary: true, .. } => this.send_composer(window, cx),
+            InputEvent::PressEnter { .. } => this.continue_list(window, cx),
             _ => {}
         }));
 
@@ -70,6 +95,9 @@ impl MailWindow {
             bcc,
             subject,
             body: body.clone(),
+            source,
+            preview: false,
+            quote_shown: false,
             show_cc,
             show_bcc,
             dirty: false,
@@ -118,6 +146,7 @@ impl MailWindow {
         c.draft.bcc = Address::parse_list(&c.bcc.read(cx).value());
         c.draft.subject = c.subject.read(cx).value().trim().to_owned();
         c.draft.body_text = c.body.read(cx).value().to_string();
+        c.draft.body_html = (!c.draft.body_text.trim().is_empty()).then(|| render_markdown(&c.draft.body_text));
         c.draft.updated_at = now();
     }
 
@@ -447,15 +476,29 @@ impl MailWindow {
             .when(c.show_cc, |d| d.child(field_row("Cc", Input::new(&c.cc).appearance(false).into_any_element())))
             .when(c.show_bcc, |d| d.child(field_row("Bcc", Input::new(&c.bcc).appearance(false).into_any_element())))
             .child(field_row("Subject", Input::new(&c.subject).appearance(false).into_any_element()))
-            .child(
+            .child(self.render_format_toolbar(c, &p, cx))
+            .child(if c.preview {
+                div()
+                    .id("composer-preview")
+                    .flex_1()
+                    .min_h(px(if inline { 180. } else { 240. }))
+                    .overflow_y_scroll()
+                    .px(px(16.))
+                    .py(px(12.))
+                    .text_size(px(15.))
+                    .line_height(px(24.))
+                    .child(TextView::html(SharedString::from(format!("preview-{}", c.draft.id)), render_markdown(&c.draft.body_text)).selectable(true))
+                    .into_any_element()
+            } else {
                 div()
                     .flex_1()
                     .min_h(px(if inline { 180. } else { 240. }))
                     .px(px(10.))
                     .py(px(6.))
-                    .text_size(px(14.))
-                    .child(Textarea::new(&c.body).appearance(false).bordered(false).h_full()),
-            )
+                    .child(Editor::new(&c.body).appearance(false).bordered(false).h_full().font_family("Inter").text_size(px(14.)).line_height(px(22.)))
+                    .into_any_element()
+            })
+            .children(self.render_quote_block(c, &p, cx))
             .children(attachments)
             .children(error)
             .child(
@@ -496,6 +539,259 @@ impl MailWindow {
             .into_any_element()
     }
 
+    fn render_format_toolbar(&self, c: &Composer, p: &crate::theme::Palette, cx: &mut Context<Self>) -> Div {
+        let preview = c.preview;
+        let tool = |id: &'static str, icon_name: &'static str, tip: &'static str, cx: &mut Context<Self>, action: fn(&mut Self, &mut Window, &mut Context<Self>)| {
+            Button::new(id)
+                .ghost()
+                .xsmall()
+                .icon(icon(icon_name).size(px(15.)))
+                .tooltip(tip)
+                .disabled(preview)
+                .on_click(cx.listener(move |this, _, window, cx| action(this, window, cx)))
+        };
+        h_flex()
+            .items_center()
+            .gap(px(2.))
+            .px(px(10.))
+            .h(px(36.))
+            .border_b_1()
+            .border_color(p.divider)
+            .child(tool("fmt-bold", "bold", "Bold (Ctrl B)", cx, |t, w, cx| t.format_wrap("**", w, cx)))
+            .child(tool("fmt-italic", "italic", "Italic (Ctrl I)", cx, |t, w, cx| t.format_wrap("*", w, cx)))
+            .child(tool("fmt-strike", "strikethrough", "Strikethrough (Ctrl Shift X)", cx, |t, w, cx| t.format_wrap("~~", w, cx)))
+            .child(tool("fmt-code", "code", "Code (Ctrl Shift C)", cx, |t, w, cx| t.format_wrap("`", w, cx)))
+            .child(div().w(px(1.)).h(px(18.)).mx(px(4.)).bg(p.divider))
+            .child(tool("fmt-link", "link", "Link (Ctrl K)", cx, |t, w, cx| t.format_link(w, cx)))
+            .child(tool("fmt-bullets", "list", "Bulleted list (Ctrl Shift 8)", cx, |t, w, cx| t.format_lines(LinePrefix::Bullet, w, cx)))
+            .child(tool("fmt-numbers", "list-ordered", "Numbered list (Ctrl Shift 7)", cx, |t, w, cx| t.format_lines(LinePrefix::Number, w, cx)))
+            .child(tool("fmt-quote", "text-quote", "Quote (Ctrl Shift 9)", cx, |t, w, cx| t.format_lines(LinePrefix::Quote, w, cx)))
+            .child(div().flex_1())
+            .child(
+                Button::new("fmt-preview")
+                    .ghost()
+                    .xsmall()
+                    .icon(icon(if preview { "pencil" } else { "eye" }).size(px(15.)))
+                    .label(if preview { "Edit" } else { "Preview" })
+                    .tooltip("Show the message as recipients will see it (Ctrl Shift P)")
+                    .on_click(cx.listener(|this, _, window, cx| this.toggle_preview(window, cx))),
+            )
+    }
+
+    /// The collapsed original under the editor of a reply or forward.
+    fn render_quote_block(&self, c: &Composer, p: &crate::theme::Palette, cx: &mut Context<Self>) -> Option<Div> {
+        if !c.draft.include_quote {
+            return None;
+        }
+        let source = c.source.as_ref()?;
+        let who = source.from.display_name();
+        let when = overlook_core::time::format_full(source.date, self.utc_offset);
+        let label = match c.draft.kind {
+            DraftKind::Forward => format!("Forwarding the message from {who} · {when}"),
+            _ => format!("Quoting {who} · {when}"),
+        };
+        let shown = c.quote_shown;
+        let html = shown.then(|| overlook_core::compose::outgoing_bodies(&Draft { body_text: String::new(), ..c.draft.clone() }, Some(source)).html);
+        Some(
+            v_flex()
+                .px(px(16.))
+                .py(px(8.))
+                .gap(px(8.))
+                .border_t_1()
+                .border_color(p.divider)
+                .child(
+                    h_flex()
+                        .items_center()
+                        .gap(px(8.))
+                        .text_size(px(12.))
+                        .text_color(p.muted)
+                        .child(icon("text-quote").size(px(14.)))
+                        .child(div().flex_1().truncate().child(label))
+                        .child(Button::new("quote-toggle").ghost().xsmall().label(if shown { "Hide" } else { "Show" }).on_click(cx.listener(|this, _, _w, cx| {
+                            if let Some(c) = this.composer.as_mut() {
+                                c.quote_shown = !c.quote_shown;
+                            }
+                            cx.notify();
+                        })))
+                        .child(Button::new("quote-remove").ghost().xsmall().icon(icon("x").size(px(13.))).tooltip("Send without the quoted message").on_click(cx.listener(|this, _, window, cx| {
+                            if let Some(c) = this.composer.as_mut() {
+                                c.draft.include_quote = false;
+                                c.dirty = true;
+                            }
+                            this.save_composer(window, cx);
+                        }))),
+                )
+                .when_some(html, |d, html| {
+                    d.child(
+                        div()
+                            .pl(px(12.))
+                            .border_l_2()
+                            .border_color(p.divider)
+                            .text_size(px(14.))
+                            .line_height(px(22.))
+                            .text_color(p.muted)
+                            .max_h(px(360.))
+                            .overflow_hidden()
+                            .child(TextView::html(SharedString::from(format!("quote-{}", c.draft.id)), html).selectable(true)),
+                    )
+                }),
+        )
+    }
+
+    pub(super) fn composer_body_focused(&self, window: &Window, cx: &App) -> bool {
+        self.composer.as_ref().is_some_and(|c| !c.preview && c.body.read(cx).focus_handle(cx).is_focused(window))
+    }
+
+    pub(super) fn toggle_preview(&mut self, window: &mut Window, cx: &mut Context<Self>) {
+        self.sync_composer_fields(cx);
+        let Some(c) = self.composer.as_mut() else { return };
+        c.preview = !c.preview;
+        if !c.preview {
+            let body = c.body.clone();
+            body.update(cx, |s, cx| s.focus(window, cx));
+        }
+        cx.notify();
+    }
+
+    /// Wraps the selection in `mark` (bold, italic, strike, code), or unwraps it when it
+    /// already is. With nothing selected the marks are inserted and the cursor sits between.
+    pub(super) fn format_wrap(&mut self, mark: &str, window: &mut Window, cx: &mut Context<Self>) {
+        let Some(c) = self.composer.as_ref() else { return };
+        let body = c.body.clone();
+        let m = mark.len();
+        body.update(cx, |s, cx| {
+            let text = s.value().to_string();
+            let range = s.selected_range();
+            let (start, end) = (range.start.min(text.len()), range.end.min(text.len()));
+            let sel = text[start..end].to_string();
+            if start >= m && text[..start].ends_with(mark) && text[end..].starts_with(mark) {
+                // Marks around the selection: remove them.
+                s.set_selected_range(start - m..end + m, cx);
+                s.replace(sel.clone(), window, cx);
+                s.set_selected_range(start - m..start - m + sel.len(), cx);
+            } else if sel.len() >= 2 * m && sel.starts_with(mark) && sel.ends_with(mark) {
+                let inner = sel[m..sel.len() - m].to_string();
+                s.replace(inner.clone(), window, cx);
+                s.set_selected_range(start..start + inner.len(), cx);
+            } else {
+                s.replace(format!("{mark}{sel}{mark}"), window, cx);
+                s.set_selected_range(start + m..start + m + sel.len(), cx);
+            }
+            s.focus(window, cx);
+        });
+        self.composer_changed(window, cx);
+    }
+
+    /// Inserts a Markdown link around the selection, leaving the URL selected for typing.
+    pub(super) fn format_link(&mut self, window: &mut Window, cx: &mut Context<Self>) {
+        let Some(c) = self.composer.as_ref() else { return };
+        let body = c.body.clone();
+        body.update(cx, |s, cx| {
+            let text = s.value().to_string();
+            let range = s.selected_range();
+            let (start, end) = (range.start.min(text.len()), range.end.min(text.len()));
+            let sel = text[start..end].to_string();
+            let is_url = sel.starts_with("http://") || sel.starts_with("https://") || sel.starts_with("www.");
+            let (label, url) = if sel.is_empty() {
+                ("text".to_string(), "https://".to_string())
+            } else if is_url {
+                (sel.clone(), sel.clone())
+            } else {
+                (sel.clone(), "https://".to_string())
+            };
+            s.replace(format!("[{label}]({url})"), window, cx);
+            let url_start = start + 1 + label.len() + 2;
+            s.set_selected_range(url_start..url_start + url.len(), cx);
+            s.focus(window, cx);
+        });
+        self.composer_changed(window, cx);
+    }
+
+    /// Adds or removes a line prefix (bullets, numbers, quote) on every selected line.
+    pub(super) fn format_lines(&mut self, prefix: LinePrefix, window: &mut Window, cx: &mut Context<Self>) {
+        let Some(c) = self.composer.as_ref() else { return };
+        let body = c.body.clone();
+        body.update(cx, |s, cx| {
+            let text = s.value().to_string();
+            let range = s.selected_range();
+            let (sel_start, sel_end) = (range.start.min(text.len()), range.end.min(text.len()));
+            let start = text[..sel_start].rfind('\n').map(|i| i + 1).unwrap_or(0);
+            let end = text[sel_end..].find('\n').map(|i| sel_end + i).unwrap_or(text.len());
+            let block = &text[start..end];
+            let lines: Vec<&str> = block.split('\n').collect();
+            let has = |l: &str| match prefix {
+                LinePrefix::Quote => l.trim_start().starts_with("> ") || l.trim_start() == ">",
+                _ => list_marker_len(l.trim_start()).is_some(),
+            };
+            let all_have = lines.iter().all(|l| l.trim().is_empty() || has(l));
+            let new_block = lines
+                .iter()
+                .enumerate()
+                .map(|(i, l)| {
+                    let indent_len = l.len() - l.trim_start().len();
+                    let (indent, rest) = l.split_at(indent_len);
+                    let stripped = match prefix {
+                        LinePrefix::Quote => rest.strip_prefix("> ").or_else(|| rest.strip_prefix('>')).unwrap_or(rest),
+                        _ => list_marker_len(rest).map(|n| &rest[n..]).unwrap_or(rest),
+                    };
+                    if all_have {
+                        format!("{indent}{stripped}")
+                    } else {
+                        let mark = match prefix {
+                            LinePrefix::Bullet => "- ".to_string(),
+                            LinePrefix::Number => format!("{}. ", i + 1),
+                            LinePrefix::Quote => "> ".to_string(),
+                        };
+                        format!("{indent}{mark}{stripped}")
+                    }
+                })
+                .collect::<Vec<_>>()
+                .join("\n");
+            s.set_selected_range(start..end, cx);
+            s.replace(new_block.clone(), window, cx);
+            s.set_selected_range(start..start + new_block.len(), cx);
+            s.focus(window, cx);
+        });
+        self.composer_changed(window, cx);
+    }
+
+    /// After Enter inside a list, carries the marker to the new line; Enter on an empty
+    /// item ends the list instead.
+    fn continue_list(&mut self, window: &mut Window, cx: &mut Context<Self>) {
+        let Some(c) = self.composer.as_ref() else { return };
+        let body = c.body.clone();
+        let changed = body.update(cx, |s, cx| {
+            let text = s.value().to_string();
+            let cursor = s.cursor().min(text.len());
+            // The newline is already inserted; the previous line is the one Enter was pressed on.
+            let Some(nl) = text[..cursor].rfind('\n') else { return false };
+            let prev_start = text[..nl].rfind('\n').map(|i| i + 1).unwrap_or(0);
+            let prev = &text[prev_start..nl];
+            let indent_len = prev.len() - prev.trim_start().len();
+            let (indent, rest) = prev.split_at(indent_len);
+            let Some(n) = list_marker_len(rest) else { return false };
+            let marker = &rest[..n];
+            if rest[n..].trim().is_empty() {
+                // An empty item: Enter ends the list and removes the dangling marker.
+                s.set_selected_range(prev_start..cursor, cx);
+                s.replace("\n".to_string(), window, cx);
+                return true;
+            }
+            let next = if let Some(dot) = marker.find(|c: char| c == '.' || c == ')') {
+                let num: usize = marker[..dot].parse().unwrap_or(0);
+                format!("{}{}", num + 1, &marker[dot..])
+            } else {
+                marker.to_string()
+            };
+            // Enter in the editor copied the indentation already; add only the marker.
+            s.replace(format!("{}{}", if text[cursor..].starts_with(indent) { "" } else { indent }, next), window, cx);
+            true
+        });
+        if changed {
+            self.composer_changed(window, cx);
+        }
+    }
+
     fn accept_suggestion(&mut self, header: String, window: &mut Window, cx: &mut Context<Self>) {
         let Some(c) = self.composer.as_ref() else { return };
         let current = c.to.read(cx).value().to_string();
@@ -527,4 +823,12 @@ impl MailWindow {
         }
         self.save_composer(window, cx);
     }
+}
+
+/// A per-line formatting applied by the toolbar.
+#[derive(Clone, Copy, Debug, PartialEq, Eq)]
+pub enum LinePrefix {
+    Bullet,
+    Number,
+    Quote,
 }

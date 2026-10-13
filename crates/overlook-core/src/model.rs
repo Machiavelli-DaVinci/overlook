@@ -512,8 +512,13 @@ pub struct Draft {
     pub bcc: Vec<Address>,
     pub subject: String,
     pub body_text: String,
-    /// Reserved for rich-text composition. Theme changes must never rewrite this.
+    /// The HTML rendering of `body_text`, which is Markdown-flavoured. Theme changes must
+    /// never rewrite this.
     pub body_html: Option<String>,
+    /// Whether the message this replies to or forwards is appended below the body when sent
+    /// (and shown, collapsed, in the composer). The quoted text is not part of `body_text`.
+    #[serde(default)]
+    pub include_quote: bool,
     pub attachments: Vec<DraftAttachment>,
     pub state: DraftState,
     pub created_at: Timestamp,
@@ -536,6 +541,7 @@ impl Draft {
             subject: String::new(),
             body_text: String::new(),
             body_html: None,
+            include_quote: false,
             attachments: Vec::new(),
             state: DraftState::Editing,
             created_at: now,
@@ -591,31 +597,11 @@ impl Draft {
                         }
                     }
                 }
-                draft.body_text = if quote {
-                    format!(
-                        "\n\n{}\n{}",
-                        quote_header(source),
-                        quote_text(source.body.text.as_deref().unwrap_or(&source.snippet))
-                    )
-                } else {
-                    "\n\n".to_owned()
-                };
+                draft.include_quote = quote;
             }
             DraftKind::Forward => {
                 draft.subject = format!("Fwd: {base_subject}");
-                draft.body_text = format!(
-                    "\n\n---------- Forwarded message ----------\nFrom: {}\nDate: {}\nSubject: {}\nTo: {}\n\n{}",
-                    source.from.to_header(),
-                    crate::time::format_full(source.date, crate::time::local_utc_offset_minutes()),
-                    source.subject,
-                    source
-                        .to
-                        .iter()
-                        .map(Address::to_header)
-                        .collect::<Vec<_>>()
-                        .join(", "),
-                    source.body.text.as_deref().unwrap_or(&source.snippet)
-                );
+                draft.include_quote = true;
             }
             DraftKind::New => {}
         }
@@ -681,7 +667,8 @@ fn strip_prefixes(subject: &str) -> String {
     s.to_owned()
 }
 
-fn quote_header(source: &Message) -> String {
+/// The attribution line above a quoted reply.
+pub fn quote_header(source: &Message) -> String {
     format!(
         "On {}, {} wrote:",
         crate::time::format_full(source.date, crate::time::local_utc_offset_minutes()),
@@ -689,7 +676,19 @@ fn quote_header(source: &Message) -> String {
     )
 }
 
-fn quote_text(text: &str) -> String {
+/// The header block above forwarded content, as plain text lines.
+pub fn forward_header(source: &Message) -> String {
+    format!(
+        "---------- Forwarded message ----------\nFrom: {}\nDate: {}\nSubject: {}\nTo: {}",
+        source.from.to_header(),
+        crate::time::format_full(source.date, crate::time::local_utc_offset_minutes()),
+        source.subject,
+        source.to.iter().map(Address::to_header).collect::<Vec<_>>().join(", ")
+    )
+}
+
+/// Prefixes every line with `> `.
+pub fn quote_text(text: &str) -> String {
     text.lines()
         .map(|l| if l.is_empty() { ">".to_owned() } else { format!("> {l}") })
         .collect::<Vec<_>>()
@@ -793,7 +792,8 @@ mod tests {
         );
         assert_eq!(draft.subject, "Re: Launch creative");
         assert_eq!(draft.to[0].email, "maya@northstar.example");
-        assert!(draft.body_text.contains("> Hello"));
+        // The original is quoted at send time, not pasted into the editable body.
+        assert!(draft.include_quote && draft.body_text.is_empty());
         assert!(draft.validate_for_send().is_ok());
         let fwd = Draft::in_response_to(
             AccountId::from("acct"),

@@ -336,7 +336,7 @@ pub async fn run_sync(store: Arc<Store>, provider: Arc<dyn MailProvider>, calend
                         Ok(SendOutcome::Delivered(provider_id)) => {
                             let rfc = overlook_provider::draft_message_id(&draft);
                             Ok(overlook_provider::SentReceipt {
-                                message: overlook_provider::sample::sent_message(&account, &draft, &provider_id, &rfc, sent_label.as_ref(), now()),
+                                message: overlook_provider::sample::sent_message(&account, &draft, context.in_reply_to.as_ref(), &provider_id, &rfc, sent_label.as_ref(), now()),
                                 provider_id,
                                 rfc_message_id: Some(rfc),
                             })

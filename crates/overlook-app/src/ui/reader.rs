@@ -691,7 +691,11 @@ impl MailWindow {
                     .text_size(px(15.))
                     .line_height(px(24.))
                     .max_w(px(760.))
-                    .child(TextView::html(SharedString::from(format!("outbox-{}", d.id)), text_to_html(&d.body_text)).selectable(true)),
+                    .child({
+                        let source = d.in_reply_to.as_ref().and_then(|id| self.store.message(id).ok().flatten());
+                        let html = overlook_core::compose::outgoing_bodies(d, source.as_ref()).html;
+                        TextView::html(SharedString::from(format!("outbox-{}", d.id)), html).selectable(true)
+                    }),
             )
     }
 }

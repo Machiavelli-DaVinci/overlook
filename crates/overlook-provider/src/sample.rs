@@ -135,6 +135,7 @@ impl MailProvider for SampleProvider {
         let account = account.clone();
         let draft = draft.clone();
         let sent_label = context.sent_label;
+        let in_reply_to = context.in_reply_to;
         Box::pin(async move {
             self.require_online()?;
             self.sleep().await;
@@ -145,7 +146,7 @@ impl MailProvider for SampleProvider {
                 return Err(ProviderError::Uncertain);
             }
             let provider_id = self.next_id("sent");
-            let message = sent_message(&account, &draft, &provider_id, &rfc_id, sent_label.as_ref(), overlook_core::time::now());
+            let message = sent_message(&account, &draft, in_reply_to.as_ref(), &provider_id, &rfc_id, sent_label.as_ref(), overlook_core::time::now());
             Ok(SentReceipt { provider_id, rfc_message_id: Some(rfc_id), message })
         })
     }
@@ -320,11 +321,13 @@ impl CalendarProvider for SampleProvider {
 pub fn sent_message(
     account: &Account,
     draft: &Draft,
+    in_reply_to: Option<&Message>,
     provider_id: &ProviderId,
     rfc_id: &str,
     sent_label: Option<&LabelId>,
     now: Timestamp,
 ) -> Message {
+    let bodies = overlook_core::compose::outgoing_bodies(draft, in_reply_to);
     let mut label_ids = BTreeSet::new();
     if let Some(l) = sent_label {
         label_ids.insert(l.clone());
@@ -340,8 +343,8 @@ pub fn sent_message(
         bcc: draft.bcc.clone(),
         reply_to: None,
         subject: draft.subject.clone(),
-        snippet: draft.body_text.lines().find(|l| !l.trim().is_empty()).unwrap_or("").chars().take(100).collect(),
-        body: Body { text: Some(draft.body_text.clone()), html: draft.body_html.clone() },
+        snippet: bodies.text.lines().find(|l| !l.trim().is_empty()).unwrap_or("").chars().take(100).collect(),
+        body: Body { text: Some(bodies.text), html: Some(bodies.html) },
         date: now,
         is_read: true,
         is_starred: false,

@@ -2,6 +2,7 @@
 
 mod calendar;
 mod composer;
+mod mail_highlight;
 mod list;
 mod settings;
 mod reader;
@@ -70,6 +71,14 @@ actions!(
         ToggleRead,
         OpenSelected,
         SyncNow,
+        FormatBold,
+        FormatItalic,
+        FormatStrike,
+        FormatCode,
+        FormatBullets,
+        FormatNumbers,
+        FormatQuote,
+        TogglePreview,
     ]
 );
 
@@ -97,6 +106,14 @@ pub fn init(cx: &mut App) {
         KeyBinding::new("ctrl-2", SwitchToCalendar, Some(WINDOW_CONTEXT)),
         KeyBinding::new("ctrl-shift-a", NewEventAction, Some(WINDOW_CONTEXT)),
         KeyBinding::new("ctrl-,", OpenSettings, Some(WINDOW_CONTEXT)),
+        KeyBinding::new("ctrl-b", FormatBold, Some(WINDOW_CONTEXT)),
+        KeyBinding::new("ctrl-i", FormatItalic, Some(WINDOW_CONTEXT)),
+        KeyBinding::new("ctrl-shift-x", FormatStrike, Some(WINDOW_CONTEXT)),
+        KeyBinding::new("ctrl-shift-c", FormatCode, Some(WINDOW_CONTEXT)),
+        KeyBinding::new("ctrl-shift-8", FormatBullets, Some(WINDOW_CONTEXT)),
+        KeyBinding::new("ctrl-shift-7", FormatNumbers, Some(WINDOW_CONTEXT)),
+        KeyBinding::new("ctrl-shift-9", FormatQuote, Some(WINDOW_CONTEXT)),
+        KeyBinding::new("ctrl-shift-p", TogglePreview, Some(WINDOW_CONTEXT)),
         KeyBinding::new("left", CalendarPrevious, Some(CALENDAR_CONTEXT)),
         KeyBinding::new("right", CalendarNext, Some(CALENDAR_CONTEXT)),
         KeyBinding::new("t", CalendarToday, Some(CALENDAR_CONTEXT)),
@@ -1340,11 +1357,9 @@ impl MailWindow {
     pub(crate) fn reply(&mut self, kind: DraftKind, window: &mut Window, cx: &mut Context<Self>) {
         let Some(source) = self.thread.iter().max_by_key(|m| m.date).cloned() else { return };
         let mut draft = Draft::in_response_to_with(self.account.id.clone(), kind, &source, &self.owner(), now(), self.prefs.quote_on_reply);
-        let signature = self.account_prefs_for(&self.account.id).signature_block(true);
-        if !signature.is_empty() {
-            // Signature sits above the quoted original, Outlook style.
-            draft.body_text = format!("{signature}{}", draft.body_text);
-        }
+        // The quoted original is appended at send time and shown collapsed under the editor;
+        // the body starts with two blank lines for the reply and the signature below them.
+        draft.body_text = self.account_prefs_for(&self.account.id).signature_block(true);
         if let Err(e) = self.store.save_draft(&draft) {
             window.push_notification(Notification::error(format!("Couldn’t start the draft: {e}")), cx);
             return;
@@ -1528,6 +1543,11 @@ impl MailWindow {
         self.compose_new(window, cx);
     }
     fn on_focus_search(&mut self, _: &FocusSearch, window: &mut Window, cx: &mut Context<Self>) {
+        // Ctrl+K in the composer body inserts a link, as in Gmail and Outlook.
+        if self.composer_body_focused(window, cx) {
+            self.format_link(window, cx);
+            return;
+        }
         let input = self.search_input.clone();
         input.update(cx, |s, cx| {
             s.focus(window, cx);
@@ -1547,6 +1567,30 @@ impl MailWindow {
         } else {
             self.list_focus.focus(window, cx);
         }
+    }
+    fn on_format_bold(&mut self, _: &FormatBold, window: &mut Window, cx: &mut Context<Self>) {
+        if self.composer_body_focused(window, cx) { self.format_wrap("**", window, cx) } else { cx.propagate() }
+    }
+    fn on_format_italic(&mut self, _: &FormatItalic, window: &mut Window, cx: &mut Context<Self>) {
+        if self.composer_body_focused(window, cx) { self.format_wrap("*", window, cx) } else { cx.propagate() }
+    }
+    fn on_format_strike(&mut self, _: &FormatStrike, window: &mut Window, cx: &mut Context<Self>) {
+        if self.composer_body_focused(window, cx) { self.format_wrap("~~", window, cx) } else { cx.propagate() }
+    }
+    fn on_format_code(&mut self, _: &FormatCode, window: &mut Window, cx: &mut Context<Self>) {
+        if self.composer_body_focused(window, cx) { self.format_wrap("`", window, cx) } else { cx.propagate() }
+    }
+    fn on_format_bullets(&mut self, _: &FormatBullets, window: &mut Window, cx: &mut Context<Self>) {
+        if self.composer_body_focused(window, cx) { self.format_lines(composer::LinePrefix::Bullet, window, cx) } else { cx.propagate() }
+    }
+    fn on_format_numbers(&mut self, _: &FormatNumbers, window: &mut Window, cx: &mut Context<Self>) {
+        if self.composer_body_focused(window, cx) { self.format_lines(composer::LinePrefix::Number, window, cx) } else { cx.propagate() }
+    }
+    fn on_format_quote(&mut self, _: &FormatQuote, window: &mut Window, cx: &mut Context<Self>) {
+        if self.composer_body_focused(window, cx) { self.format_lines(composer::LinePrefix::Quote, window, cx) } else { cx.propagate() }
+    }
+    fn on_toggle_preview(&mut self, _: &TogglePreview, window: &mut Window, cx: &mut Context<Self>) {
+        if self.composer.is_some() { self.toggle_preview(window, cx) } else { cx.propagate() }
     }
     fn on_send(&mut self, _: &SendMessage, window: &mut Window, cx: &mut Context<Self>) {
         if self.composer.is_some() {
@@ -2119,6 +2163,14 @@ impl Render for MailWindow {
             .track_focus(&self.focus_handle)
             .on_action(cx.listener(Self::on_compose))
             .on_action(cx.listener(Self::on_focus_search))
+            .on_action(cx.listener(Self::on_format_bold))
+            .on_action(cx.listener(Self::on_format_italic))
+            .on_action(cx.listener(Self::on_format_strike))
+            .on_action(cx.listener(Self::on_format_code))
+            .on_action(cx.listener(Self::on_format_bullets))
+            .on_action(cx.listener(Self::on_format_numbers))
+            .on_action(cx.listener(Self::on_format_quote))
+            .on_action(cx.listener(Self::on_toggle_preview))
             .on_action(cx.listener(Self::on_escape))
             .on_action(cx.listener(Self::on_send))
             .on_action(cx.listener(Self::on_reply))

@@ -371,7 +371,7 @@ impl MailProvider for GmailProvider {
                 Ok(Some(m)) => m,
                 _ => {
                     // Accepted but not re-fetchable right now: build the Sent copy locally.
-                    let mut m = crate::sample::sent_message(&account, &draft, &ProviderId(id.clone()), &rfc_id, context.sent_label.as_ref(), overlook_core::time::now());
+                    let mut m = crate::sample::sent_message(&account, &draft, context.in_reply_to.as_ref(), &ProviderId(id.clone()), &rfc_id, context.sent_label.as_ref(), overlook_core::time::now());
                     m.id = mapping::local_message_id(&account.id, &id);
                     if let Some(thread) = response.get("threadId").and_then(|t| t.as_str()) {
                         m.conversation_id = mapping::local_conversation_id(&account.id, thread);
