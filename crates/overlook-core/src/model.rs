@@ -241,6 +241,10 @@ impl Attachment {
         self.content_id.is_some() && self.mime_type.starts_with("image/")
     }
 
+    pub fn is_pdf(&self) -> bool {
+        self.mime_type.split(';').next().unwrap_or("").trim().eq_ignore_ascii_case("application/pdf") || self.filename.to_ascii_lowercase().ends_with(".pdf")
+    }
+
     /// An image the reader can show itself (thumbnail and quick look).
     pub fn is_image(&self) -> bool {
         let mime = self.mime_type.split(';').next().unwrap_or("").trim().to_ascii_lowercase();
@@ -821,4 +825,35 @@ mod tests {
         assert_eq!(human_size(512), "512 B");
         assert_eq!(human_size(2_457_600), "2.3 MB");
     }
+}
+
+/// Someone from the account's address book (Google Contacts) or its "other contacts": people
+/// the user has corresponded with. Used for recipient suggestions and the contact card.
+#[derive(Clone, Debug, PartialEq, Eq, Serialize, Deserialize)]
+pub struct Contact {
+    pub account_id: AccountId,
+    pub email: String,
+    pub name: Option<String>,
+    pub photo_url: Option<String>,
+    /// In the address book proper, as opposed to inferred from correspondence.
+    pub in_address_book: bool,
+    pub updated: Timestamp,
+}
+
+impl Contact {
+    pub fn address(&self) -> Address {
+        Address { name: self.name.clone(), email: self.email.clone() }
+    }
+}
+
+/// Automatic replies ("vacation responder") as the provider stores them.
+#[derive(Clone, Debug, PartialEq, Eq, Serialize, Deserialize, Default)]
+#[serde(default)]
+pub struct VacationSettings {
+    pub enabled: bool,
+    pub subject: String,
+    pub body: String,
+    pub start: Option<Timestamp>,
+    pub end: Option<Timestamp>,
+    pub contacts_only: bool,
 }

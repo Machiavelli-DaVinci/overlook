@@ -11,6 +11,7 @@ pub mod calendar;
 pub mod compose;
 pub mod focus;
 pub mod ics;
+pub mod mailto;
 pub mod ids;
 pub mod model;
 pub mod ops;

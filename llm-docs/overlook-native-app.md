@@ -106,6 +106,37 @@ same bodies. Drafts save `body_html` on every autosave.
 Not yet: pasting rich text (paste is plain), inline images in the composer, tables, font or
 colour choices (by design), and underline, which Markdown has no mark for.
 
+## Contacts, signatures, automatic replies, mailto
+
+- **Contacts.** `MailProvider::fetch_contacts` (Google People API: `people/me/connections` and
+  `otherContacts`, scopes `contacts.readonly` and `contacts.other.readonly`) runs once a day from the sync
+  (`contacts_synced_at:<acct>`), into the `contacts` table (schema v9). The composer's suggestions put
+  address-book matches first, then previous correspondents. Clicking a sender's name in the reader opens a
+  contact card with New message and "Mail from them" (a `from:` search). Settings → Accounts shows the count,
+  a sync button, and "Sign in again" when the token lacks the scope.
+- **Signatures.** `AccountPrefs.signatures` is a list of named Markdown-flavoured signatures with
+  `default_new` / `default_reply` ids (`None` = no signature); `normalized()` migrates the old single
+  `signature` field and the two include switches. Settings → Accounts manages them (add, rename, delete, pick
+  defaults); the composer toolbar has a Signature picker that swaps the block at the end of the body.
+- **Automatic replies.** `MailProvider::fetch_vacation` / `set_vacation` (Gmail `settings/vacation`, scope
+  `gmail.settings.basic`). Settings → Accounts loads them when the page opens and saves with one button; the
+  end date is stored exclusive, so the last day runs through midnight.
+- **mailto:.** `overlook mailto:…` parses the link (`overlook_core::mailto`) and opens the composer. A second
+  launch hands the link to the running instance over a Unix socket (`single_instance.rs`, one socket per
+  profile under `$XDG_RUNTIME_DIR`) and exits, so the desktop entry's `mailto` handler never opens a second
+  window.
+- **Reminders** have Snooze 5 min on the in-app toast; a snoozed reminder returns once.
+- **Gmail batch endpoint.** `GmailClient::batch_get` sends up to 20 `messages.get` calls in one
+  multipart request to `batch/gmail/v1`; `fetch_messages` uses it for every multi-message download (first
+  sync, backlog, online search). Per-part 429s surface as `RateLimited` like before; quota units are unchanged,
+  round trips are twenty times fewer.
+- **PDF previews** render through poppler's `pdftoppm` (`pdf_preview.rs`, cached under
+  `~/.cache/overlook/pdf/` by path, size and mtime; first 40 pages at 1400 px; first-page thumbnails on cards).
+  Without `pdftoppm` the card opens the system viewer and says what to install.
+- **Tables**: a cell with `colspan` is followed by empty cells in the vendored parser so later columns keep
+  their place, and the data-table heuristic counts spans.
+- `<sup>`/`<sub>` of digits and signs become Unicode glyphs in the pre-pass (m², H₂O); other content stays inline.
+
 ## Rendering
 
 Received HTML goes through three stages before the native view sees it, all in `overlook-core`:
@@ -182,7 +213,7 @@ Keyboard additions: `Ctrl 1` Mail, `Ctrl 2` Calendar, `Ctrl Shift A` new event; 
 cargo test --workspace
 ```
 
-83 tests cover: appearance resolution (Follow system is not a third theme), recipient parsing, conversation summaries, reply/forward drafts, HTML sanitization and remote-image blocking, local time formatting, PKCE/OAuth request building, the sample provider, store durability across reopen, atomic change+operation (a failing change leaves no operation), Outbox queue/cancel, send completion, FTS search and coverage, settings, and the sync engine (offline leaves work queued; ordered replay; uncertain send reconciled without duplicates; cancelled send never sent).
+87 tests cover: appearance resolution (Follow system is not a third theme), recipient parsing, conversation summaries, reply/forward drafts, HTML sanitization and remote-image blocking, local time formatting, PKCE/OAuth request building, the sample provider, store durability across reopen, atomic change+operation (a failing change leaves no operation), Outbox queue/cancel, send completion, FTS search and coverage, settings, and the sync engine (offline leaves work queued; ordered replay; uncertain send reconciled without duplicates; cancelled send never sent).
 
 The manual scenario used to validate the shell (keyboard only, with `wtype` on Hyprland):
 

@@ -65,6 +65,16 @@ fn clean_children(node: &Handle, flags: &Flags) -> Vec<Handle> {
                 if REMOVE.contains(&local.as_str()) || is_hidden(&local, &attrs_vec) {
                     continue;
                 }
+                // The view has no baseline shift: digits and signs become the Unicode
+                // super/subscript glyphs (m², H₂O, footnote³); other text stays inline.
+                if local == "sup" || local == "sub" {
+                    let text = subtree_text(child, 64);
+                    match script_text(&text, local == "sup") {
+                        Some(converted) => out.push(text_node(&converted)),
+                        None => out.extend(clean_children(child, flags)),
+                    }
+                    continue;
+                }
                 let mut inner = *flags;
                 inner.in_pre |= local == "pre";
                 inner.no_links |= matches!(local.as_str(), "a" | "pre" | "code");
@@ -200,6 +210,30 @@ fn is_hidden(local: &str, attrs: &[Attribute]) -> bool {
         }
     }
     false
+}
+
+/// `text` in superscript or subscript glyphs when every character has one.
+fn script_text(text: &str, superscript: bool) -> Option<String> {
+    let text = text.trim();
+    if text.is_empty() || text.chars().count() > 6 {
+        return None;
+    }
+    text.chars()
+        .map(|c| {
+            let sup = ['⁰', '¹', '²', '³', '⁴', '⁵', '⁶', '⁷', '⁸', '⁹'];
+            let sub = ['₀', '₁', '₂', '₃', '₄', '₅', '₆', '₇', '₈', '₉'];
+            match c {
+                '0'..='9' => Some(if superscript { sup[c as usize - '0' as usize] } else { sub[c as usize - '0' as usize] }),
+                '+' => Some(if superscript { '⁺' } else { '₊' }),
+                '-' => Some(if superscript { '⁻' } else { '₋' }),
+                '(' => Some(if superscript { '⁽' } else { '₍' }),
+                ')' => Some(if superscript { '⁾' } else { '₎' }),
+                'n' if superscript => Some('ⁿ'),
+                'i' if superscript => Some('ⁱ'),
+                _ => None,
+            }
+        })
+        .collect()
 }
 
 /// Whitespace, non-breaking spaces, and the invisible characters preheaders pad with.
@@ -434,6 +468,13 @@ mod tests {
     fn trims_breaks_that_only_add_blank_lines() {
         let p = prepare("<div>FYI<br><br><div>next</div><br></div><div><br>lead<br>line<br></div>");
         assert_eq!(p.html, "<html><body><div>FYI<div>next</div></div><div>lead<br>line</div></body></html>");
+    }
+
+    #[test]
+    fn sup_and_sub_become_glyphs_when_possible() {
+        let p = prepare("<p>E=mc<sup>2</sup>, H<sub>2</sub>O, see note<sup>12</sup> and x<sup>th</sup></p>");
+        assert!(p.html.contains("E=mc²") && p.html.contains("H₂O") && p.html.contains("note¹²"), "{}", p.html);
+        assert!(p.html.contains("xth") && !p.html.contains("<sup>"), "{}", p.html);
     }
 
     #[test]

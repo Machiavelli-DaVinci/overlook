@@ -31,6 +31,7 @@ struct Inner {
     /// Calendar events created or changed through the provider in this session.
     event_overrides: Mutex<Vec<Event>>,
     deleted_events: Mutex<HashSet<String>>,
+    vacation: Mutex<VacationSettings>,
 }
 
 impl Default for SampleProvider {
@@ -51,6 +52,7 @@ impl SampleProvider {
                 applied_ops: Mutex::new(Vec::new()),
                 event_overrides: Mutex::new(Vec::new()),
                 deleted_events: Mutex::new(HashSet::new()),
+                vacation: Mutex::new(VacationSettings::default()),
             }),
         }
     }
@@ -110,6 +112,46 @@ impl MailProvider for SampleProvider {
             self.require_online()?;
             self.sleep().await;
             Ok(sample_mailbox(&account, overlook_core::time::now()))
+        })
+    }
+
+    fn has_contacts_access(&self) -> bool {
+        true
+    }
+
+    fn has_settings_access(&self) -> bool {
+        true
+    }
+
+    fn fetch_vacation(&self, _account: &Account) -> BoxFuture<'_, Result<Option<VacationSettings>, ProviderError>> {
+        Box::pin(async move {
+            self.require_online()?;
+            Ok(Some(self.inner.vacation.lock().unwrap().clone()))
+        })
+    }
+
+    fn set_vacation(&self, _account: &Account, settings: &VacationSettings) -> BoxFuture<'_, Result<(), ProviderError>> {
+        let settings = settings.clone();
+        Box::pin(async move {
+            self.require_online()?;
+            *self.inner.vacation.lock().unwrap() = settings;
+            Ok(())
+        })
+    }
+
+    fn fetch_contacts(&self, account: &Account) -> BoxFuture<'_, Result<Option<Vec<Contact>>, ProviderError>> {
+        let account = account.clone();
+        Box::pin(async move {
+            self.require_online()?;
+            let now = overlook_core::time::now();
+            let book = |name: &str, email: &str, in_book: bool| Contact { account_id: account.id.clone(), email: email.into(), name: Some(name.into()), photo_url: None, in_address_book: in_book, updated: now };
+            Ok(Some(vec![
+                book("Maya Chen", "maya@northstar.example", true),
+                book("Alex Rivera", "alex@northstar.example", true),
+                book("Daniel Okafor", "daniel@example.com", true),
+                book("Sophie Lindqvist", "sophie@example.com", true),
+                book("Priya Natarajan", "priya@fieldandvine.example", false),
+            ]))
         })
     }
 

@@ -7,6 +7,7 @@ use crate::theme::ActivePalette;
 use gpui_kit::component::button::{Button, ButtonVariants};
 use super::mail_highlight::{list_marker_len, MailHighlighter, LANGUAGE};
 use gpui_kit::component::input::{Editor, EditorState, Input, InputEvent, InputHighlighter, InputState};
+use gpui_kit::component::menu::{DropdownMenu, PopupMenuItem};
 use gpui_kit::component::text::TextView;
 use gpui_kit::component::{Disableable, Sizable, WindowExt};
 use overlook_core::compose::render_markdown;
@@ -31,6 +32,8 @@ pub struct Composer {
     pub source: Option<Message>,
     pub preview: bool,
     pub quote_shown: bool,
+    /// The signature currently in the body, by id.
+    pub signature_id: Option<String>,
     pub show_cc: bool,
     pub show_bcc: bool,
     pub dirty: bool,
@@ -67,6 +70,10 @@ impl MailWindow {
             state
         });
         let source = draft.in_reply_to.as_ref().and_then(|id| self.store.message(id).ok().flatten());
+        let signature_id = {
+            let ap = self.account_prefs_for(&self.account.id);
+            ap.default_signature(draft.kind != DraftKind::New).filter(|s| draft.body_text.contains(s.body.trim_end())).map(|s| s.id.clone())
+        };
 
         let mut subs = Vec::new();
         for state in [&to, &cc, &bcc, &subject] {
@@ -98,6 +105,7 @@ impl MailWindow {
             source,
             preview: false,
             quote_shown: false,
+            signature_id,
             show_cc,
             show_bcc,
             dirty: false,
@@ -163,12 +171,16 @@ impl MailWindow {
         let focused = c.to.read(cx).focus_handle(cx).is_focused(window);
         let last_token = to_value.rsplit([',', ';']).next().unwrap_or("").trim().to_owned();
         c.suggestions = if focused && last_token.len() >= 1 {
-            self.store
-                .known_recipients(&self.account.id, &last_token, 5)
-                .unwrap_or_default()
-                .into_iter()
+            // Address book first, then people written to before, without duplicates.
+            let mut seen: std::collections::HashSet<String> = std::collections::HashSet::new();
+            let contacts = self.store.contacts_matching(&self.account.id, &last_token, 5).unwrap_or_default().into_iter().map(|c| c.address());
+            let known = self.store.known_recipients(&self.account.id, &last_token, 5).unwrap_or_default().into_iter();
+            contacts
+                .chain(known)
                 .filter(|a| !a.email.eq_ignore_ascii_case(&self.account.email))
                 .filter(|a| !last_token.eq_ignore_ascii_case(&a.email) && !last_token.eq_ignore_ascii_case(&a.to_header()))
+                .filter(|a| seen.insert(a.email.to_ascii_lowercase()))
+                .take(6)
                 .collect()
         } else {
             Vec::new()
@@ -567,6 +579,30 @@ impl MailWindow {
             .child(tool("fmt-numbers", "list-ordered", "Numbered list (Ctrl Shift 7)", cx, |t, w, cx| t.format_lines(LinePrefix::Number, w, cx)))
             .child(tool("fmt-quote", "text-quote", "Quote (Ctrl Shift 9)", cx, |t, w, cx| t.format_lines(LinePrefix::Quote, w, cx)))
             .child(div().flex_1())
+            .child({
+                let ap = self.account_prefs_for(&self.account.id);
+                let current = c.signature_id.clone();
+                let choices: Vec<(Option<String>, String)> = std::iter::once((None, "None".to_string())).chain(ap.signatures.iter().map(|s| (Some(s.id.clone()), s.name.clone()))).collect();
+                let label = current.as_deref().and_then(|id| ap.signature_by_id(id)).map(|s| s.name.clone()).unwrap_or_else(|| "No signature".into());
+                let t = cx.entity().downgrade();
+                Button::new("fmt-signature")
+                    .ghost()
+                    .xsmall()
+                    .icon(icon("signature").size(px(15.)))
+                    .label(label)
+                    .dropdown_caret(true)
+                    .tooltip("Signature")
+                    .dropdown_menu(move |mut menu, _window, _cx| {
+                        for (id, name) in &choices {
+                            let t = t.clone();
+                            let id = id.clone();
+                            menu = menu.item(PopupMenuItem::new(name.clone()).checked(id == current).on_click(move |_, window, cx| {
+                                let _ = t.update(cx, |this, cx| this.set_signature(id.clone(), window, cx));
+                            }));
+                        }
+                        menu
+                    })
+            })
             .child(
                 Button::new("fmt-preview")
                     .ghost()
@@ -636,6 +672,33 @@ impl MailWindow {
                     )
                 }),
         )
+    }
+
+    /// Swaps the signature block at the end of the body for another one, or removes it.
+    pub(super) fn set_signature(&mut self, id: Option<String>, window: &mut Window, cx: &mut Context<Self>) {
+        let ap = self.account_prefs_for(&self.account.id);
+        let Some(c) = self.composer.as_ref() else { return };
+        let old = c.signature_id.as_deref().and_then(|i| ap.signature_by_id(i)).map(|s| s.body.trim_end().to_owned());
+        let new = id.as_deref().and_then(|i| ap.signature_by_id(i)).map(|s| s.body.trim_end().to_owned());
+        let body = c.body.clone();
+        body.update(cx, |s, cx| {
+            let mut text = s.value().to_string();
+            if let Some(old) = old.filter(|o| !o.is_empty()) {
+                if let Some(pos) = text.rfind(&old) {
+                    let before = text[..pos].trim_end_matches('\n').len();
+                    text = format!("{}{}", &text[..before], &text[pos + old.len()..]);
+                }
+            }
+            if let Some(new) = new.filter(|n| !n.is_empty()) {
+                let trimmed = text.trim_end_matches('\n').len();
+                text = format!("{}\n\n{}", &text[..trimmed], new);
+            }
+            s.set_value(text, window, cx);
+        });
+        if let Some(c) = self.composer.as_mut() {
+            c.signature_id = id;
+        }
+        self.composer_changed(window, cx);
     }
 
     pub(super) fn composer_body_focused(&self, window: &Window, cx: &App) -> bool {

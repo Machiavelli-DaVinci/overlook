@@ -71,13 +71,17 @@ impl GmailProvider {
     }
 
     fn fetch_message(&self, account: &Account, id: &str, labels: &HashMap<String, LabelId>) -> Result<Option<Message>, ApiError> {
-        let mut message = match self.client.get(&format!("messages/{id}"), &[("format", "full")]) {
+        let message = match self.client.get(&format!("messages/{id}"), &[("format", "full")]) {
             Ok(v) => message_from_json(account, &v, labels),
             Err(ApiError::NotFound) => return Ok(None),
             Err(e) => return Err(e),
         };
-        // Gmail often ships the calendar part as an attachment reference instead of inline
-        // text; fetch it so invitations are recognised.
+        Ok(self.finish_message(message, id))
+    }
+
+    /// Gmail often ships the calendar part as an attachment reference instead of inline
+    /// text; fetch it so invitations are recognised.
+    fn finish_message(&self, mut message: Option<Message>, id: &str) -> Option<Message> {
         if let Some(m) = message.as_mut() {
             if m.invitation.is_none() {
                 let ics = m
@@ -95,7 +99,7 @@ impl GmailProvider {
                 }
             }
         }
-        Ok(message)
+        message
     }
 
     /// Lists ids for every view in [`INITIAL_VIEWS`], newest first, de-duplicated.
@@ -190,6 +194,132 @@ impl MailProvider for GmailProvider {
         })
     }
 
+    fn has_settings_access(&self) -> bool {
+        self.client.has_scope(super::oauth::SETTINGS_SCOPE_MARKER)
+    }
+
+    fn fetch_vacation(&self, _account: &Account) -> BoxFuture<'_, Result<Option<VacationSettings>, ProviderError>> {
+        Box::pin(async move {
+            if !self.has_settings_access() {
+                return Ok(None);
+            }
+            let v = self.client.get("settings/vacation", &[])?;
+            let ms = |k: &str| v.get(k).and_then(|x| x.as_str()).and_then(|s| s.parse::<i64>().ok()).filter(|n| *n > 0);
+            Ok(Some(VacationSettings {
+                enabled: v.get("enableAutoReply").and_then(|b| b.as_bool()).unwrap_or(false),
+                subject: v.get("responseSubject").and_then(|s| s.as_str()).unwrap_or("").to_owned(),
+                body: v
+                    .get("responseBodyPlainText")
+                    .and_then(|s| s.as_str())
+                    .map(str::to_owned)
+                    .or_else(|| v.get("responseBodyHtml").and_then(|s| s.as_str()).map(overlook_core::sanitize::html_to_text))
+                    .unwrap_or_default(),
+                start: ms("startTime"),
+                end: ms("endTime"),
+                contacts_only: v.get("restrictToContacts").and_then(|b| b.as_bool()).unwrap_or(false),
+            }))
+        })
+    }
+
+    fn set_vacation(&self, _account: &Account, settings: &VacationSettings) -> BoxFuture<'_, Result<(), ProviderError>> {
+        let settings = settings.clone();
+        Box::pin(async move {
+            if !self.has_settings_access() {
+                return Err(ProviderError::SignInRequired);
+            }
+            let mut body = json!({
+                "enableAutoReply": settings.enabled,
+                "responseSubject": settings.subject,
+                "responseBodyPlainText": settings.body,
+                "restrictToContacts": settings.contacts_only,
+                "restrictToDomain": false,
+            });
+            if let Some(s) = settings.start {
+                body["startTime"] = Value::String(s.to_string());
+            }
+            if let Some(e) = settings.end {
+                body["endTime"] = Value::String(e.to_string());
+            }
+            let url = format!("{}/settings/vacation", super::api::API_BASE);
+            self.client.put_url(&url, &body)?;
+            Ok(())
+        })
+    }
+
+    fn has_contacts_access(&self) -> bool {
+        self.client.has_scope(super::oauth::CONTACTS_SCOPE_MARKER)
+    }
+
+    fn fetch_contacts(&self, account: &Account) -> BoxFuture<'_, Result<Option<Vec<Contact>>, ProviderError>> {
+        let account = account.clone();
+        Box::pin(async move {
+            if !self.has_contacts_access() {
+                return Ok(None);
+            }
+            let now = overlook_core::time::now();
+            let mut out: Vec<Contact> = Vec::new();
+            let mut seen: HashMap<String, usize> = HashMap::new();
+            let mut push = |email: &str, name: Option<String>, photo: Option<String>, in_book: bool, out: &mut Vec<Contact>| {
+                let key = email.trim().to_ascii_lowercase();
+                if key.is_empty() || !key.contains('@') {
+                    return;
+                }
+                match seen.get(&key) {
+                    Some(&i) => {
+                        let c = &mut out[i];
+                        c.in_address_book |= in_book;
+                        if c.name.is_none() {
+                            c.name = name;
+                        }
+                        if c.photo_url.is_none() {
+                            c.photo_url = photo;
+                        }
+                    }
+                    None => {
+                        seen.insert(key.clone(), out.len());
+                        out.push(Contact { account_id: account.id.clone(), email: key, name, photo_url: photo, in_address_book: in_book, updated: now });
+                    }
+                }
+            };
+            let mut collect = |v: &Value, list: &str, in_book: bool, out: &mut Vec<Contact>| {
+                for person in v.get(list).and_then(|c| c.as_array()).into_iter().flatten() {
+                    let name = person.get("names").and_then(|n| n.as_array()).and_then(|a| a.first()).and_then(|n| n.get("displayName")).and_then(|d| d.as_str()).map(str::to_owned);
+                    let photo = person.get("photos").and_then(|p| p.as_array()).and_then(|a| a.iter().find(|p| p.get("default").and_then(|d| d.as_bool()) != Some(true)).or(a.first())).and_then(|p| p.get("url")).and_then(|u| u.as_str()).map(str::to_owned);
+                    for e in person.get("emailAddresses").and_then(|e| e.as_array()).into_iter().flatten() {
+                        if let Some(value) = e.get("value").and_then(|v| v.as_str()) {
+                            push(value, name.clone(), photo.clone(), in_book, out);
+                        }
+                    }
+                }
+            };
+            for (url, list, in_book) in [
+                ("https://people.googleapis.com/v1/people/me/connections?personFields=names,emailAddresses,photos&pageSize=1000", "connections", true),
+                ("https://people.googleapis.com/v1/otherContacts?readMask=names,emailAddresses&pageSize=1000", "otherContacts", false),
+            ] {
+                let mut page: Option<String> = None;
+                loop {
+                    let full = match &page {
+                        Some(p) => format!("{url}&pageToken={}", super::oauth::url_encode(p)),
+                        None => url.to_owned(),
+                    };
+                    let v = match self.client.get_url(&full) {
+                        Ok(v) => v,
+                        // A missing People API or scope must not break the mail sync.
+                        Err(ApiError::Client(403, _)) | Err(ApiError::Unauthorized) if in_book => return Ok(None),
+                        Err(ApiError::Client(403, _)) | Err(ApiError::Unauthorized) => break,
+                        Err(e) => return Err(e.into()),
+                    };
+                    collect(&v, list, in_book, &mut out);
+                    page = v.get("nextPageToken").and_then(|t| t.as_str()).map(str::to_owned);
+                    if page.is_none() {
+                        break;
+                    }
+                }
+            }
+            Ok(Some(out))
+        })
+    }
+
     fn fetch_raw(&self, _account: &Account, message: &Message) -> BoxFuture<'_, Result<Vec<u8>, ProviderError>> {
         let fallback = crate::message_to_raw(message);
         let id = message.provider_id.clone();
@@ -214,9 +344,26 @@ impl MailProvider for GmailProvider {
         let index = Self::label_index(labels);
         Box::pin(async move {
             let mut out = Vec::with_capacity(ids.len());
-            for id in &ids {
-                if let Some(m) = self.fetch_message(&account, id, &index)? {
+            if ids.len() == 1 {
+                if let Some(m) = self.fetch_message(&account, &ids[0], &index)? {
                     out.push(m);
+                }
+                return Ok(out);
+            }
+            // One HTTP request per batch instead of one per message.
+            for chunk in ids.chunks(super::api::BATCH_SIZE) {
+                let paths: Vec<String> = chunk.iter().map(|id| format!("messages/{id}?format=full")).collect();
+                let results = self.client.batch_get(&paths)?;
+                for (id, result) in chunk.iter().zip(results) {
+                    match result {
+                        Ok(v) => {
+                            if let Some(m) = self.finish_message(message_from_json(&account, &v, &index), id) {
+                                out.push(m);
+                            }
+                        }
+                        Err(ApiError::NotFound) => {}
+                        Err(e) => return Err(e.into()),
+                    }
                 }
             }
             Ok(out)

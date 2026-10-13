@@ -236,7 +236,13 @@ fn is_data_table(block: &str) -> bool {
     let mut total = 0usize;
     let mut cells = 0usize;
     for row in &rows {
-        let n = row.matches("<td").count() + row.matches("<th").count();
+        // Spanning cells count for the columns they cover.
+        let mut n = 0usize;
+        for cell in row.split("<td").chain(row.split("<th")).skip(1) {
+            let tag = cell.split('>').next().unwrap_or("");
+            let span = tag.split("colspan=").nth(1).map(|v| v.trim_start_matches(['"', '\'']).chars().take_while(|c| c.is_ascii_digit()).collect::<String>()).and_then(|d| d.parse::<usize>().ok()).unwrap_or(1);
+            n += span.max(1);
+        }
         cell_counts.push(n);
         for cell in row.split("<td").chain(row.split("<th")).skip(1) {
             let text = html_to_text(cell.split_once('>').map(|(_, t)| t).unwrap_or(""));

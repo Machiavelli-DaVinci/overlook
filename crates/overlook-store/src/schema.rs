@@ -2,7 +2,7 @@
 
 use rusqlite::Connection;
 
-const MIGRATIONS: &[&str] = &[V1, V2, V3, V4, V5, V6, V7, V8];
+const MIGRATIONS: &[&str] = &[V1, V2, V3, V4, V5, V6, V7, V8, V9];
 
 pub fn migrate(conn: &Connection) -> rusqlite::Result<()> {
     let current: i64 = conn.query_row("PRAGMA user_version", [], |r| r.get(0))?;
@@ -240,5 +240,19 @@ BEGIN;
 ALTER TABLE events ADD COLUMN original_start INTEGER;
 ALTER TABLE events ADD COLUMN wants_conference INTEGER NOT NULL DEFAULT 0;
 CREATE INDEX events_series ON events(account_id, recurring_event_id);
+COMMIT;
+"#;
+
+const V9: &str = r#"
+BEGIN;
+CREATE TABLE contacts (
+    account_id TEXT NOT NULL REFERENCES accounts(id) ON DELETE CASCADE,
+    email TEXT NOT NULL,
+    name TEXT,
+    photo_url TEXT,
+    in_address_book INTEGER NOT NULL DEFAULT 0,
+    updated INTEGER NOT NULL,
+    PRIMARY KEY(account_id, email)
+);
 COMMIT;
 "#;

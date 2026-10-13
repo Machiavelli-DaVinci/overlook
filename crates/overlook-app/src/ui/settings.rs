@@ -10,6 +10,7 @@ use crate::theme::ActivePalette;
 use gpui_kit::base::{h_flex, v_flex};
 use gpui_kit::component::button::{Button, ButtonVariants};
 use gpui_kit::component::input::{Input, InputEvent, InputState, Textarea, TextareaState};
+use gpui_kit::component::menu::{DropdownMenu, PopupMenuItem};
 use gpui_kit::component::scroll::ScrollableElement;
 use gpui_kit::component::switch::Switch;
 use gpui_kit::component::Sizable;
@@ -55,7 +56,18 @@ pub struct SettingsState {
     /// Account shown on the Accounts page.
     pub account: AccountId,
     pub name_input: Entity<InputState>,
+    /// Body of the signature being edited.
     pub signature: Entity<TextareaState>,
+    pub signature_name: Entity<InputState>,
+    pub selected_signature: Option<String>,
+    /// Automatic replies, once loaded from the provider.
+    pub vacation: Option<VacationSettings>,
+    pub vacation_loading: bool,
+    pub vacation_note: Option<String>,
+    pub vacation_subject: Entity<InputState>,
+    pub vacation_body: Entity<TextareaState>,
+    pub vacation_start: Entity<InputState>,
+    pub vacation_end: Entity<InputState>,
     pub attachments_dir: Entity<InputState>,
     pub work_start: Entity<InputState>,
     pub work_end: Entity<InputState>,
@@ -76,6 +88,153 @@ impl MailWindow {
         self.account_prefs.get(id).cloned().unwrap_or_default()
     }
 
+    fn update_selected_signature(&mut self, account: &AccountId, change: impl FnOnce(&mut Signature)) {
+        let Some(id) = self.settings.as_ref().and_then(|s| s.selected_signature.clone()) else { return };
+        let mut p = self.account_prefs_for(account);
+        if let Some(s) = p.signatures.iter_mut().find(|s| s.id == id) {
+            change(s);
+        }
+        self.save_account_prefs(account, p);
+    }
+
+    fn select_signature(&mut self, account: &AccountId, id: Option<String>, window: &mut Window, cx: &mut Context<Self>) {
+        let p = self.account_prefs_for(account);
+        let sig = id.as_deref().and_then(|i| p.signature_by_id(i)).cloned().unwrap_or_default();
+        if let Some(state) = self.settings.as_mut() {
+            state.selected_signature = id;
+            let (name, body) = (state.signature_name.clone(), state.signature.clone());
+            name.update(cx, |s, cx| s.set_value(sig.name.clone(), window, cx));
+            body.update(cx, |s, cx| s.set_value(sig.body.clone(), window, cx));
+        }
+        cx.notify();
+    }
+
+    fn add_signature(&mut self, account: &AccountId, window: &mut Window, cx: &mut Context<Self>) {
+        let mut p = self.account_prefs_for(account);
+        let id = AccountPrefs::new_signature_id();
+        p.signatures.push(Signature { id: id.clone(), name: format!("Signature {}", p.signatures.len() + 1), body: String::new() });
+        if p.default_new.is_none() {
+            p.default_new = Some(id.clone());
+        }
+        if p.default_reply.is_none() {
+            p.default_reply = Some(id.clone());
+        }
+        self.save_account_prefs(account, p);
+        self.select_signature(account, Some(id), window, cx);
+        if let Some(state) = self.settings.as_ref() {
+            let name = state.signature_name.clone();
+            name.update(cx, |s, cx| {
+                s.focus(window, cx);
+                s.select_all(window, cx);
+            });
+        }
+    }
+
+    fn delete_signature(&mut self, account: &AccountId, window: &mut Window, cx: &mut Context<Self>) {
+        let Some(id) = self.settings.as_ref().and_then(|s| s.selected_signature.clone()) else { return };
+        let mut p = self.account_prefs_for(account);
+        p.signatures.retain(|s| s.id != id);
+        let p = p.normalized();
+        let next = p.signatures.first().map(|s| s.id.clone());
+        self.save_account_prefs(account, p);
+        self.select_signature(account, next, window, cx);
+    }
+
+    fn set_default_signature(&mut self, account: &AccountId, reply: bool, id: Option<String>, cx: &mut Context<Self>) {
+        let mut p = self.account_prefs_for(account);
+        if reply {
+            p.default_reply = id;
+        } else {
+            p.default_new = id;
+        }
+        self.save_account_prefs(account, p);
+        cx.notify();
+    }
+
+    fn load_vacation(&mut self, account: AccountId, window: &mut Window, cx: &mut Context<Self>) {
+        let Some(provider) = self.providers.get(&account).map(|p| p.mail.clone()).filter(|p| p.has_settings_access()) else { return };
+        let Some(acct) = self.accounts.iter().find(|a| a.id == account).cloned() else { return };
+        if let Some(state) = self.settings.as_mut() {
+            state.vacation_loading = true;
+        }
+        cx.spawn_in(window, async move |this, cx| {
+            let result = cx.background_spawn(async move { provider.fetch_vacation(&acct).await }).await;
+            let _ = this.update_in(cx, |this, window, cx| {
+                let Some(state) = this.settings.as_mut().filter(|s| s.account == account) else { return };
+                state.vacation_loading = false;
+                match result {
+                    Ok(Some(v)) => {
+                        let (subject, body, start, end) = (state.vacation_subject.clone(), state.vacation_body.clone(), state.vacation_start.clone(), state.vacation_end.clone());
+                        subject.update(cx, |s, cx| s.set_value(v.subject.clone(), window, cx));
+                        body.update(cx, |s, cx| s.set_value(v.body.clone(), window, cx));
+                        start.update(cx, |s, cx| s.set_value(v.start.map(|t| overlook_core::tz::local_date(t).to_string()).unwrap_or_default(), window, cx));
+                        end.update(cx, |s, cx| s.set_value(v.end.map(|t| overlook_core::tz::local_date(t).to_string()).unwrap_or_default(), window, cx));
+                        state.vacation = Some(v);
+                    }
+                    Ok(None) => state.vacation = None,
+                    Err(e) => state.vacation_note = Some(format!("Couldn’t load automatic replies: {e}")),
+                }
+                cx.notify();
+            });
+        })
+        .detach();
+    }
+
+    fn save_vacation(&mut self, account: AccountId, window: &mut Window, cx: &mut Context<Self>) {
+        let Some(state) = self.settings.as_ref() else { return };
+        let Some(mut v) = state.vacation.clone() else { return };
+        v.subject = state.vacation_subject.read(cx).value().trim().to_owned();
+        v.body = state.vacation_body.read(cx).value().trim().to_owned();
+        let parse = |s: &str| -> Result<Option<i64>, ()> {
+            let s = s.trim();
+            if s.is_empty() {
+                return Ok(None);
+            }
+            overlook_core::tz::parse_date(s).map(|d| Some(overlook_core::tz::date_start(d))).ok_or(())
+        };
+        let (Ok(start), Ok(end)) = (parse(&state.vacation_start.read(cx).value()), parse(&state.vacation_end.read(cx).value())) else {
+            if let Some(s) = self.settings.as_mut() {
+                s.vacation_note = Some("Enter dates as YYYY-MM-DD.".into());
+            }
+            cx.notify();
+            return;
+        };
+        v.start = start;
+        // Google treats the end as exclusive; the last day runs through midnight.
+        v.end = end.map(|e| overlook_core::tz::add_days(e, 1));
+        if v.enabled && v.body.is_empty() {
+            if let Some(s) = self.settings.as_mut() {
+                s.vacation_note = Some("Write the reply before turning it on.".into());
+            }
+            cx.notify();
+            return;
+        }
+        let Some(provider) = self.providers.get(&account).map(|p| p.mail.clone()) else { return };
+        let Some(acct) = self.accounts.iter().find(|a| a.id == account).cloned() else { return };
+        if let Some(s) = self.settings.as_mut() {
+            s.vacation_note = Some("Saving…".into());
+        }
+        cx.notify();
+        let saved = v.clone();
+        cx.spawn_in(window, async move |this, cx| {
+            let result = cx.background_spawn(async move { provider.set_vacation(&acct, &saved).await }).await;
+            let _ = this.update_in(cx, |this, window, cx| {
+                if let Some(s) = this.settings.as_mut().filter(|s| s.account == account) {
+                    match result {
+                        Ok(()) => {
+                            s.vacation = Some(v.clone());
+                            s.vacation_note = Some(if v.enabled { "Automatic replies are on.".into() } else { "Automatic replies are off.".into() });
+                        }
+                        Err(e) => s.vacation_note = Some(format!("Couldn’t save: {e}")),
+                    }
+                }
+                let _ = window;
+                cx.notify();
+            });
+        })
+        .detach();
+    }
+
     pub(crate) fn save_account_prefs(&mut self, id: &AccountId, prefs: AccountPrefs) {
         if let Err(e) = self.store.set_setting(&format!("account_prefs:{}", id.0), &prefs) {
             tracing::warn!("could not save account preferences: {e}");
@@ -92,7 +251,14 @@ impl MailWindow {
         let acct = self.accounts.iter().find(|a| a.id == account).cloned().unwrap_or_else(|| self.account.clone());
         let ap = self.account_prefs_for(&acct.id);
         let name_input = cx.new(|cx| InputState::new(window, cx).placeholder("Your name").default_value(acct.display_name.clone()));
-        let signature = cx.new(|cx| TextareaState::new(window, cx).placeholder("Jason Alexander\nLast Refuge").default_value(ap.signature.clone()));
+        let selected_signature = ap.default_new.clone().or_else(|| ap.signatures.first().map(|s| s.id.clone()));
+        let selected = selected_signature.as_deref().and_then(|id| ap.signature_by_id(id)).cloned().unwrap_or_default();
+        let signature = cx.new(|cx| TextareaState::new(window, cx).placeholder("Jason Alexander\nLast Refuge").default_value(selected.body.clone()));
+        let signature_name = cx.new(|cx| InputState::new(window, cx).placeholder("Signature name").default_value(selected.name.clone()));
+        let vacation_subject = cx.new(|cx| InputState::new(window, cx).placeholder("Out of office"));
+        let vacation_body = cx.new(|cx| TextareaState::new(window, cx).placeholder("I’m away until Monday and will reply when I’m back."));
+        let vacation_start = cx.new(|cx| InputState::new(window, cx).placeholder("First day, YYYY-MM-DD (optional)"));
+        let vacation_end = cx.new(|cx| InputState::new(window, cx).placeholder("Last day, YYYY-MM-DD (optional)"));
         let attachments_dir = cx.new(|cx| InputState::new(window, cx).placeholder("~/Downloads").default_value(self.prefs.attachments_dir.clone().unwrap_or_default()));
         let work_start = cx.new(|cx| InputState::new(window, cx).placeholder("8:00 AM").default_value(hour_text(self.prefs.work_start_hour)));
         let work_end = cx.new(|cx| InputState::new(window, cx).placeholder("6:00 PM").default_value(hour_text(self.prefs.work_end_hour)));
@@ -116,11 +282,18 @@ impl MailWindow {
             }
         }));
         let for_account = acct.id.clone();
-        subs.push(cx.subscribe_in(&signature, window, move |this, state, event: &InputEvent, _window, _cx| {
+        subs.push(cx.subscribe_in(&signature, window, move |this, state, event: &InputEvent, _window, cx| {
             if matches!(event, InputEvent::Change) {
-                let mut p = this.account_prefs_for(&for_account);
-                p.signature = state.read(_cx).value().to_string();
-                this.save_account_prefs(&for_account, p);
+                let body = state.read(cx).value().to_string();
+                this.update_selected_signature(&for_account, |s| s.body = body);
+            }
+        }));
+        let for_account = acct.id.clone();
+        subs.push(cx.subscribe_in(&signature_name, window, move |this, state, event: &InputEvent, _window, cx| {
+            if matches!(event, InputEvent::Change) {
+                let name = state.read(cx).value().trim().to_owned();
+                this.update_selected_signature(&for_account, |s| s.name = name);
+                cx.notify();
             }
         }));
         subs.push(cx.subscribe_in(&attachments_dir, window, |this, state, event: &InputEvent, _window, cx| {
@@ -147,7 +320,26 @@ impl MailWindow {
             }
         }));
 
-        self.settings = Some(SettingsState { page, account: acct.id, name_input, signature, attachments_dir, work_start, work_end, _subscriptions: subs });
+        self.settings = Some(SettingsState {
+            page,
+            account: acct.id.clone(),
+            name_input,
+            signature,
+            signature_name,
+            selected_signature,
+            vacation: None,
+            vacation_loading: false,
+            vacation_note: None,
+            vacation_subject,
+            vacation_body,
+            vacation_start,
+            vacation_end,
+            attachments_dir,
+            work_start,
+            work_end,
+            _subscriptions: subs,
+        });
+        self.load_vacation(acct.id, window, cx);
         cx.notify();
     }
 
@@ -309,34 +501,60 @@ impl MailWindow {
                     .child(Button::new("settings-sync").ghost().small().icon(icon("refresh-cw").size(px(14.))).label("Sync now").on_click(cx.listener(|this, _, window, cx| this.sync_now(window, cx))))
                     .into_any_element(),
             ))
-            .child(section("Signature", Some("Added to the end of your messages. Plain text for now; formatting arrives with the rich-text composer.")))
-            .child(div().rounded(px(8.)).border_1().border_color(p.divider).h(px(140.)).child(Textarea::new(&state.signature).h_full()))
-            .child(setting_row(
-                "Include in new messages",
-                "",
-                Switch::new("sign-new").checked(ap.sign_new_messages).on_click(cx.listener({
-                    let id = account.id.clone();
-                    move |this, checked: &bool, _w, cx| {
-                        let mut p = this.account_prefs_for(&id);
-                        p.sign_new_messages = *checked;
-                        this.save_account_prefs(&id, p);
-                        cx.notify();
-                    }
-                })).into_any_element(),
-            ))
-            .child(setting_row(
-                "Include in replies and forwards",
-                "",
-                Switch::new("sign-replies").checked(ap.sign_replies).on_click(cx.listener({
-                    let id = account.id.clone();
-                    move |this, checked: &bool, _w, cx| {
-                        let mut p = this.account_prefs_for(&id);
-                        p.sign_replies = *checked;
-                        this.save_account_prefs(&id, p);
-                        cx.notify();
-                    }
-                })).into_any_element(),
-            ))
+            .child(section("Signatures", Some("Added to the end of your messages. Written like the composer: **bold**, *italic*, links.")))
+            .child({
+                let acct_id = account.id.clone();
+                let selected = state.selected_signature.clone();
+                h_flex()
+                    .flex_wrap()
+                    .items_center()
+                    .gap(px(6.))
+                    .children(ap.signatures.iter().map(|s| {
+                        let id = s.id.clone();
+                        let acct_id = acct_id.clone();
+                        segment(SharedString::from(format!("sig-{}", s.id)), if s.name.trim().is_empty() { "Untitled".to_string() } else { s.name.clone() }, selected.as_deref() == Some(&s.id), &p)
+                            .on_click(cx.listener(move |this, _, window, cx| this.select_signature(&acct_id, Some(id.clone()), window, cx)))
+                    }))
+                    .child(Button::new("sig-add").ghost().xsmall().icon(icon("plus").size(px(13.))).label("Add").on_click(cx.listener({
+                        let acct_id = acct_id.clone();
+                        move |this, _, window, cx| this.add_signature(&acct_id, window, cx)
+                    })))
+                    .when(selected.is_some(), |r| {
+                        r.child(Button::new("sig-delete").ghost().xsmall().icon(icon("trash").size(px(13.)).text_color(p.error)).label("Delete").on_click(cx.listener({
+                            let acct_id = acct_id.clone();
+                            move |this, _, window, cx| this.delete_signature(&acct_id, window, cx)
+                        })))
+                    })
+            })
+            .when(state.selected_signature.is_some(), |d| {
+                d.child(setting_row("Name", "How this signature appears in the composer’s picker.", Input::new(&state.signature_name).w(px(280.)).into_any_element()))
+                    .child(div().rounded(px(8.)).border_1().border_color(p.divider).h(px(140.)).child(Textarea::new(&state.signature).h_full()))
+            })
+            .child(setting_row("Use for new messages", "", self.signature_picker("default-new", &account.id, false, cx)))
+            .child(setting_row("Use for replies and forwards", "", self.signature_picker("default-reply", &account.id, true, cx)))
+            .child(section("Automatic replies", Some("An out-of-office reply sent for you while it is on. Stored at Gmail, so it works even when Overlook is closed.")))
+            .children(self.render_vacation(state, &account, cx))
+            .child(section("Contacts", Some("Your Google Contacts and the people you have written to, for recipient suggestions and sender cards.")))
+            .child({
+                let has_access = self.providers.get(&account.id).is_some_and(|p| p.mail.has_contacts_access());
+                let count = self.store.contact_count(&account.id).unwrap_or(0);
+                let acct_id = account.id.clone();
+                let e = email.clone();
+                setting_row(
+                    &format!("{count} contact{}", if count == 1 { "" } else { "s" }),
+                    if has_access { "Refreshed once a day." } else if is_gmail { "Sign in again to let Overlook read your contacts." } else { "" },
+                    h_flex()
+                        .gap(px(6.))
+                        .when(!has_access && is_gmail, |r| r.child(Button::new("contacts-signin").small().label("Sign in again").on_click(cx.listener(move |this, _, window, cx| this.start_google_sign_in(Some(e.clone()), window, cx)))))
+                        .when(has_access, |r| {
+                            r.child(Button::new("contacts-sync").ghost().small().icon(icon("refresh-cw").size(px(14.))).label("Sync contacts now").on_click(cx.listener(move |this, _, window, cx| {
+                                let _ = this.store.set_setting(&crate::sync::contacts_synced_key(&acct_id), &0i64);
+                                this.sync_now(window, cx);
+                            })))
+                        })
+                        .into_any_element(),
+                )
+            })
             .child(section("Remove", None))
             .child(setting_row(
                 "Remove this account from this device",
@@ -616,6 +834,96 @@ fn hour_text(hour: u8) -> String {
         _ => (hour - 12, "PM"),
     };
     format!("{h12}:00 {suffix}")
+}
+
+impl MailWindow {
+    fn signature_picker(&self, id: &'static str, account: &AccountId, reply: bool, cx: &mut Context<Self>) -> AnyElement {
+        let ap = self.account_prefs_for(account);
+        let current = if reply { ap.default_reply.clone() } else { ap.default_new.clone() };
+        let label = current.as_deref().and_then(|i| ap.signature_by_id(i)).map(|s| s.name.clone()).unwrap_or_else(|| "None".into());
+        let choices: Vec<(Option<String>, String)> = std::iter::once((None, "None".to_string())).chain(ap.signatures.iter().map(|s| (Some(s.id.clone()), s.name.clone()))).collect();
+        let t = cx.entity().downgrade();
+        let account = account.clone();
+        Button::new(id)
+            .small()
+            .label(label)
+            .dropdown_caret(true)
+            .dropdown_menu(move |mut menu, _window, _cx| {
+                for (sid, name) in &choices {
+                    let t = t.clone();
+                    let sid = sid.clone();
+                    let account = account.clone();
+                    menu = menu.item(PopupMenuItem::new(name.clone()).checked(sid == current).on_click(move |_, _w, cx| {
+                        let _ = t.update(cx, |this, cx| this.set_default_signature(&account, reply, sid.clone(), cx));
+                    }));
+                }
+                menu
+            })
+            .into_any_element()
+    }
+
+    fn render_vacation(&self, state: &SettingsState, account: &Account, cx: &mut Context<Self>) -> Vec<AnyElement> {
+        let p = *cx.palette();
+        let has_access = self.providers.get(&account.id).is_some_and(|p| p.mail.has_settings_access());
+        if !has_access {
+            let e = account.email.clone();
+            let is_gmail = account.provider == ProviderKind::Gmail;
+            return vec![setting_row(
+                "Not available yet",
+                if is_gmail { "Sign in again to let Overlook manage automatic replies for this account." } else { "This account has no automatic replies." },
+                if is_gmail {
+                    Button::new("vacation-signin").small().label("Sign in again").on_click(cx.listener(move |this, _, window, cx| this.start_google_sign_in(Some(e.clone()), window, cx))).into_any_element()
+                } else {
+                    div().into_any_element()
+                },
+            )
+            .into_any_element()];
+        }
+        if state.vacation_loading {
+            return vec![div().text_size(px(12.)).text_color(p.muted).child("Loading…").into_any_element()];
+        }
+        let Some(v) = state.vacation.clone() else {
+            return vec![div().text_size(px(12.)).text_color(p.muted).child(state.vacation_note.clone().unwrap_or_else(|| "Automatic replies could not be loaded.".into())).into_any_element()];
+        };
+        let acct_id = account.id.clone();
+        vec![
+            setting_row(
+                "Send automatic replies",
+                "",
+                Switch::new("vacation-on").checked(v.enabled).on_click(cx.listener(|this, checked: &bool, _w, cx| {
+                    if let Some(v) = this.settings.as_mut().and_then(|s| s.vacation.as_mut()) {
+                        v.enabled = *checked;
+                    }
+                    cx.notify();
+                })).into_any_element(),
+            )
+            .into_any_element(),
+            setting_row("Subject", "", Input::new(&state.vacation_subject).w(px(320.)).into_any_element()).into_any_element(),
+            div().rounded(px(8.)).border_1().border_color(p.divider).h(px(120.)).child(Textarea::new(&state.vacation_body).h_full()).into_any_element(),
+            h_flex()
+                .gap(px(10.))
+                .child(div().flex_1().child(Input::new(&state.vacation_start)))
+                .child(div().flex_1().child(Input::new(&state.vacation_end)))
+                .into_any_element(),
+            setting_row(
+                "Only reply to people in my contacts",
+                "",
+                Switch::new("vacation-contacts").checked(v.contacts_only).on_click(cx.listener(|this, checked: &bool, _w, cx| {
+                    if let Some(v) = this.settings.as_mut().and_then(|s| s.vacation.as_mut()) {
+                        v.contacts_only = *checked;
+                    }
+                    cx.notify();
+                })).into_any_element(),
+            )
+            .into_any_element(),
+            h_flex()
+                .items_center()
+                .gap(px(10.))
+                .child(Button::new("vacation-save").primary().small().label("Save automatic replies").on_click(cx.listener(move |this, _, window, cx| this.save_vacation(acct_id.clone(), window, cx))))
+                .children(state.vacation_note.clone().map(|n| div().text_size(px(12.)).text_color(p.muted).child(n)))
+                .into_any_element(),
+        ]
+    }
 }
 
 fn section(title: &str, description: Option<&str>) -> Div {

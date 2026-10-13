@@ -173,11 +173,16 @@ pub const SCOPES: &[&str] = &[
     "https://www.googleapis.com/auth/gmail.send",
     "https://www.googleapis.com/auth/calendar.events",
     "https://www.googleapis.com/auth/calendar.readonly",
+    "https://www.googleapis.com/auth/contacts.readonly",
+    "https://www.googleapis.com/auth/contacts.other.readonly",
+    "https://www.googleapis.com/auth/gmail.settings.basic",
     "https://www.googleapis.com/auth/userinfo.email",
     "openid",
 ];
 
 pub const CALENDAR_SCOPE_MARKER: &str = "auth/calendar";
+pub const CONTACTS_SCOPE_MARKER: &str = "auth/contacts";
+pub const SETTINGS_SCOPE_MARKER: &str = "gmail.settings.basic";
 
 pub const AUTH_ENDPOINT: &str = "https://accounts.google.com/o/oauth2/v2/auth";
 pub const TOKEN_ENDPOINT: &str = "https://oauth2.googleapis.com/token";

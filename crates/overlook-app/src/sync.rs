@@ -45,6 +45,35 @@ fn calendar_token_key(calendar: &CalendarId) -> String {
     format!("cal_sync:{}", calendar.0)
 }
 
+pub fn contacts_synced_key(account: &AccountId) -> String {
+    format!("contacts_synced_at:{}", account.0)
+}
+
+/// Refreshes the address book once a day. Failures are logged and retried next time; they
+/// never affect the mail sync state.
+async fn sync_contacts(store: &Store, provider: &dyn MailProvider, account: &Account) {
+    const DAY: i64 = 24 * 3_600_000;
+    let key = contacts_synced_key(&account.id);
+    let last = store.setting::<i64>(&key).ok().flatten().unwrap_or(0);
+    if now() - last < DAY {
+        return;
+    }
+    match provider.fetch_contacts(account).await {
+        Ok(Some(contacts)) => {
+            if let Err(e) = store.replace_contacts(&account.id, &contacts) {
+                warn!("could not store contacts for {}: {e}", account.email);
+                return;
+            }
+            info!("synced {} contacts for {}", contacts.len(), account.email);
+            let _ = store.set_setting(&key, &now());
+        }
+        Ok(None) => {
+            let _ = store.set_setting(&key, &now());
+        }
+        Err(e) => warn!("contacts sync failed for {}: {e}", account.email),
+    }
+}
+
 /// Downloads calendars and events. Errors are recorded in the calendar status only; they
 /// never block mail.
 fn sync_calendar(store: &Store, provider: &dyn CalendarProvider, account: &Account, outcome: &mut SyncOutcome) {
@@ -297,6 +326,7 @@ pub async fn run_sync(store: Arc<Store>, provider: Arc<dyn MailProvider>, calend
     if let Some(cal) = &calendar {
         sync_calendar(&store, cal.as_ref(), &account, &mut outcome);
     }
+    sync_contacts(&store, provider.as_ref(), &account).await;
 
     let labels = store.labels(&acct).unwrap_or_default();
     let sent_label = labels.iter().find(|l| l.kind == LabelKind::Sent).map(|l| l.id.clone());

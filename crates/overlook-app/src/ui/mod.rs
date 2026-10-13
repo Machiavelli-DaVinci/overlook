@@ -71,6 +71,8 @@ actions!(
         ToggleRead,
         OpenSelected,
         SyncNow,
+        CalendarDeleteSelected,
+        CalendarEditSelected,
         FormatBold,
         FormatItalic,
         FormatStrike,
@@ -121,6 +123,8 @@ pub fn init(cx: &mut App) {
         KeyBinding::new("w", CalendarWeek, Some(CALENDAR_CONTEXT)),
         KeyBinding::new("a", CalendarAgenda, Some(CALENDAR_CONTEXT)),
         KeyBinding::new("m", CalendarMonth, Some(CALENDAR_CONTEXT)),
+        KeyBinding::new("delete", CalendarDeleteSelected, Some(CALENDAR_CONTEXT)),
+        KeyBinding::new("enter", CalendarEditSelected, Some(CALENDAR_CONTEXT)),
         KeyBinding::new("j", NextConversation, Some(LIST_CONTEXT)),
         KeyBinding::new("down", NextConversation, Some(LIST_CONTEXT)),
         KeyBinding::new("k", PrevConversation, Some(LIST_CONTEXT)),
@@ -154,6 +158,15 @@ pub enum AfterDownload {
     Inline,
     /// Show the image in the quick look overlay.
     QuickLook,
+}
+
+/// What the quick look overlay shows: one image, or the rendered pages of a PDF.
+#[derive(Clone, Debug)]
+pub struct QuickLook {
+    pub attachment: Attachment,
+    pub pages: Vec<PathBuf>,
+    pub rendering: bool,
+    pub error: Option<String>,
 }
 
 /// The server-side part of a search.
@@ -270,8 +283,13 @@ pub struct MailWindow {
     remote_allowed: BTreeSet<MessageId>,
     /// Messages whose quoted history is expanded.
     pub(crate) quotes_shown: BTreeSet<MessageId>,
-    /// An image attachment shown full size over the window.
-    pub(crate) quick_look: Option<Attachment>,
+    /// The message whose sender's contact card is open.
+    pub(crate) contact_card: Option<MessageId>,
+    /// An image or PDF attachment shown over the window.
+    pub(crate) quick_look: Option<QuickLook>,
+    /// First-page thumbnails of PDF attachments, rendered in the background.
+    pub(crate) pdf_thumbs: HashMap<AttachmentId, PathBuf>,
+    pub(crate) pdf_thumbs_pending: HashSet<AttachmentId>,
     /// Inline images already encoded as `data:` URLs, by attachment.
     pub(crate) inline_images: std::cell::RefCell<HashMap<AttachmentId, Option<String>>>,
 
@@ -307,6 +325,8 @@ pub struct MailWindow {
     pub(crate) reminders_enabled: bool,
     /// Reminders already shown this session: (event, minutes before).
     pub(crate) notified: HashSet<(EventId, i32)>,
+    /// Reminders put off from the toast: event → when to show it again.
+    pub(crate) snoozed_reminders: HashMap<EventId, i64>,
     pub(crate) prefs: Prefs,
     pub(crate) account_prefs: HashMap<AccountId, AccountPrefs>,
     pub(crate) settings: Option<SettingsState>,
@@ -381,7 +401,7 @@ impl MailWindow {
         let update_dismissed = store.setting::<String>("update.dismissed").ok().flatten();
         let account_prefs: HashMap<AccountId, AccountPrefs> = accounts
             .iter()
-            .map(|a| (a.id.clone(), store.setting::<AccountPrefs>(&format!("account_prefs:{}", a.id.0)).ok().flatten().unwrap_or_default()))
+            .map(|a| (a.id.clone(), store.setting::<AccountPrefs>(&format!("account_prefs:{}", a.id.0)).ok().flatten().unwrap_or_default().normalized()))
             .collect();
         let startup_module = match prefs.startup_module {
             StartupModule::Mail => Module::Mail,
@@ -428,6 +448,9 @@ impl MailWindow {
             remote_allowed: BTreeSet::new(),
             quotes_shown: BTreeSet::new(),
             quick_look: None,
+            contact_card: None,
+            pdf_thumbs: HashMap::new(),
+            pdf_thumbs_pending: HashSet::new(),
             inline_images: std::cell::RefCell::new(HashMap::new()),
             composer: None,
             appearance,
@@ -453,6 +476,7 @@ impl MailWindow {
             cal_drag: None,
             reminders_enabled,
             notified: HashSet::new(),
+            snoozed_reminders: HashMap::new(),
             update: UpdateState {
                 install: InstallKind::detect(),
                 latest: None,
@@ -511,6 +535,23 @@ impl MailWindow {
                     this.check_for_updates(false, window, cx);
                 }
             });
+        })
+        .detach();
+
+        // mailto: links handed over by later launches (or this one) open the composer.
+        cx.spawn_in(window, async move |this, cx| loop {
+            cx.background_executor().timer(Duration::from_millis(700)).await;
+            let alive = this.update_in(cx, |this, window, cx| {
+                for link in crate::single_instance::take() {
+                    if let Some(m) = overlook_core::mailto::parse(&link) {
+                        this.compose_mailto(m, window, cx);
+                        window.activate_window();
+                    }
+                }
+            });
+            if alive.is_err() {
+                break;
+            }
         })
         .detach();
 
@@ -932,14 +973,15 @@ impl MailWindow {
             .iter()
             .flat_map(|m| {
                 let has_cid = m.body.html.as_deref().is_some_and(|h| h.contains("cid:"));
-                m.attachments.iter().filter(move |a| (has_cid && a.is_inline_image()) || a.is_image()).cloned()
+                m.attachments.iter().filter(move |a| (has_cid && a.is_inline_image()) || a.is_image() || a.is_pdf()).cloned()
             })
-            .filter(|a| a.size_bytes <= INLINE_LIMIT && a.provider_id.is_some())
+            .filter(|a| a.size_bytes <= if a.is_pdf() { 2 * INLINE_LIMIT } else { INLINE_LIMIT } && a.provider_id.is_some())
             .filter(|a| !a.local_path.as_deref().map(PathBuf::from).is_some_and(|p| p.exists()))
             .collect();
         for att in wanted {
             self.download_attachment(att, AfterDownload::Inline, window, cx);
         }
+        self.prepare_pdf_thumbnails(window, cx);
     }
 
     fn search_results(&self) -> Vec<ConversationSummary> {
@@ -1025,21 +1067,77 @@ impl MailWindow {
 
     pub(crate) fn open_attachment(&mut self, attachment: Attachment, window: &mut Window, cx: &mut Context<Self>) {
         let downloaded = attachment.local_path.as_deref().map(PathBuf::from).filter(|p| p.exists());
-        if attachment.is_image() {
+        if attachment.is_image() || (attachment.is_pdf() && crate::pdf_preview::available()) {
             match downloaded {
-                Some(_) => {
-                    self.quick_look = Some(attachment);
-                    cx.notify();
-                }
+                Some(_) => self.show_quick_look(attachment, window, cx),
                 None => self.download_attachment(attachment, AfterDownload::QuickLook, window, cx),
             }
             return;
+        }
+        if attachment.is_pdf() && downloaded.is_some() {
+            window.push_notification(Notification::info("Install poppler (pdftoppm) to preview PDFs inside Overlook."), cx);
         }
         if let Some(path) = downloaded {
             cx.open_with_system(&path);
             return;
         }
         self.download_attachment(attachment, AfterDownload::Open, window, cx);
+    }
+
+    /// Opens the quick look for a downloaded image or PDF; PDF pages render in the background.
+    fn show_quick_look(&mut self, attachment: Attachment, window: &mut Window, cx: &mut Context<Self>) {
+        let Some(path) = attachment.local_path.as_deref().map(PathBuf::from) else { return };
+        if attachment.is_image() {
+            self.quick_look = Some(QuickLook { attachment, pages: vec![path], rendering: false, error: None });
+            cx.notify();
+            return;
+        }
+        let id = attachment.id.clone();
+        self.quick_look = Some(QuickLook { attachment, pages: Vec::new(), rendering: true, error: None });
+        cx.notify();
+        cx.spawn_in(window, async move |this, cx| {
+            let result = cx.background_spawn(async move { crate::pdf_preview::render_pages(&path) }).await;
+            let _ = this.update(cx, |this, cx| {
+                if let Some(ql) = this.quick_look.as_mut().filter(|q| q.attachment.id == id) {
+                    ql.rendering = false;
+                    match result {
+                        Ok(pages) if !pages.is_empty() => ql.pages = pages,
+                        Ok(_) => ql.error = Some("This PDF has no pages that could be rendered.".into()),
+                        Err(e) => ql.error = Some(format!("Couldn’t render the PDF: {e}")),
+                    }
+                    cx.notify();
+                }
+            });
+        })
+        .detach();
+    }
+
+    /// Renders first-page thumbnails for downloaded PDFs in the open conversation.
+    pub(crate) fn prepare_pdf_thumbnails(&mut self, window: &mut Window, cx: &mut Context<Self>) {
+        if !crate::pdf_preview::available() {
+            return;
+        }
+        let wanted: Vec<(AttachmentId, PathBuf)> = self
+            .thread
+            .iter()
+            .flat_map(|m| m.attachments.iter())
+            .filter(|a| a.is_pdf() && !self.pdf_thumbs.contains_key(&a.id) && !self.pdf_thumbs_pending.contains(&a.id))
+            .filter_map(|a| a.local_path.as_deref().map(PathBuf::from).filter(|p| p.exists()).map(|p| (a.id.clone(), p)))
+            .collect();
+        for (id, path) in wanted {
+            self.pdf_thumbs_pending.insert(id.clone());
+            cx.spawn_in(window, async move |this, cx| {
+                let result = cx.background_spawn(async move { crate::pdf_preview::render_thumbnail(&path) }).await;
+                let _ = this.update(cx, |this, cx| {
+                    this.pdf_thumbs_pending.remove(&id);
+                    if let Ok(thumb) = result {
+                        this.pdf_thumbs.insert(id, thumb);
+                        cx.notify();
+                    }
+                });
+            })
+            .detach();
+        }
     }
 
     /// The original message bytes, from the provider when it has them.
@@ -1178,12 +1276,12 @@ impl MailWindow {
                         match after {
                             AfterDownload::Open => cx.open_with_system(&path),
                             AfterDownload::SaveTo(target) => this.finish_save(&path, &target, window, cx),
-                            AfterDownload::Inline => {}
                             AfterDownload::QuickLook => {
                                 let mut a = attachment.clone();
                                 a.local_path = Some(path.to_string_lossy().into_owned());
-                                this.quick_look = Some(a);
+                                this.show_quick_look(a, window, cx);
                             }
+                            AfterDownload::Inline => this.prepare_pdf_thumbnails(window, cx),
                         }
                     }
                     Err(e) => window.push_notification(Notification::error(format!("Couldn’t download {}: {e}", attachment.filename)), cx),
@@ -1542,6 +1640,19 @@ impl MailWindow {
 
     // --------------------------------------------------------------- compose
 
+    /// Opens the composer from a `mailto:` link.
+    pub(crate) fn compose_mailto(&mut self, m: overlook_core::mailto::Mailto, window: &mut Window, cx: &mut Context<Self>) {
+        let mut draft = Draft::new(self.account.id.clone(), DraftKind::New, now());
+        draft.to = m.to;
+        draft.cc = m.cc;
+        draft.bcc = m.bcc;
+        draft.subject = m.subject;
+        draft.body_text = format!("{}{}", m.body, self.account_prefs_for(&self.account.id).signature_block(false));
+        self.set_module(Module::Mail, window, cx);
+        self.outbox_selected = None;
+        self.open_composer(draft, window, cx);
+    }
+
     pub(crate) fn compose_new(&mut self, window: &mut Window, cx: &mut Context<Self>) {
         let mut draft = Draft::new(self.account.id.clone(), DraftKind::New, now());
         draft.body_text = self.account_prefs_for(&self.account.id).signature_block(false);
@@ -1768,6 +1879,11 @@ impl MailWindow {
             self.close_settings(window, cx);
         } else if self.composer.is_some() {
             self.close_composer(window, cx);
+        } else if self.new_event.is_some() {
+            self.cancel_new_event(window, cx);
+        } else if self.cal_scope_prompt.is_some() {
+            self.cal_scope_prompt = None;
+            cx.notify();
         } else if !self.search_query.is_empty() {
             let input = self.search_input.clone();
             input.update(cx, |s, cx| s.set_value("", window, cx));
@@ -1929,6 +2045,22 @@ impl MailWindow {
             return cx.propagate();
         }
         self.set_cal_view(CalView::Agenda, cx);
+    }
+    fn on_cal_delete_selected(&mut self, _: &CalendarDeleteSelected, window: &mut Window, cx: &mut Context<Self>) {
+        if self.typing_in_event_editor(window, cx) || self.module != Module::Calendar {
+            return cx.propagate();
+        }
+        if let Some(id) = self.cal_selected.clone() {
+            self.request_delete_event(id, window, cx);
+        }
+    }
+    fn on_cal_edit_selected(&mut self, _: &CalendarEditSelected, window: &mut Window, cx: &mut Context<Self>) {
+        if self.typing_in_event_editor(window, cx) || self.module != Module::Calendar {
+            return cx.propagate();
+        }
+        if let Some(id) = self.cal_selected.clone() {
+            self.request_edit_event(id, window, cx);
+        }
     }
     fn on_cal_month(&mut self, _: &CalendarMonth, window: &mut Window, cx: &mut Context<Self>) {
         if self.typing_in_event_editor(window, cx) {
@@ -2402,6 +2534,8 @@ impl Render for MailWindow {
             .on_action(cx.listener(Self::on_cal_week))
             .on_action(cx.listener(Self::on_cal_agenda))
             .on_action(cx.listener(Self::on_cal_month))
+            .on_action(cx.listener(Self::on_cal_delete_selected))
+            .on_action(cx.listener(Self::on_cal_edit_selected))
             .on_action(cx.listener(Self::on_new_event))
             .on_action(cx.listener(Self::on_open_settings))
             .size_full()

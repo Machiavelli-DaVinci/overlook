@@ -250,6 +250,12 @@ fn parse_table_cell(
         width,
     };
     row.children.push(table_cell);
+    // Overlook patch: a spanning cell is followed by empty cells so the columns after it
+    // stay aligned (the content does not stretch, but nothing shifts left).
+    let span = attr_value(attrs, local_name!("colspan")).and_then(|v| v.trim().parse::<usize>().ok()).unwrap_or(1);
+    for _ in 1..span.min(16) {
+        row.children.push(node::TableCell { children: Paragraph::default(), width: None });
+    }
 }
 
 /// Trim text but leave at least one space.

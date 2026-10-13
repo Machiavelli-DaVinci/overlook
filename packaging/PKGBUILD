@@ -9,7 +9,7 @@ url="https://github.com/last-refuge/overlook"
 license=('LicenseRef-Proprietary')
 depends=('vulkan-icd-loader' 'libxkbcommon' 'libxkbcommon-x11' 'libxcb' 'wayland' 'fontconfig' 'freetype2' 'xdg-desktop-portal')
 makedepends=('git' 'rust')
-optdepends=('gnome-keyring: stores Gmail sign-in tokens' 'kwallet: alternative keyring' 'xdg-desktop-portal-gtk: Follow system theme and file dialogs on Hyprland')
+optdepends=('gnome-keyring: stores Gmail sign-in tokens' 'kwallet: alternative keyring' 'xdg-desktop-portal-gtk: Follow system theme and file dialogs on Hyprland' 'poppler: PDF previews inside Overlook')
 options=('!lto')
 
 prepare() {

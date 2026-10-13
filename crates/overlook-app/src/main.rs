@@ -4,6 +4,8 @@ mod assets;
 mod credentials;
 mod google_signin;
 mod notify;
+mod pdf_preview;
+mod single_instance;
 mod updater;
 mod providers;
 mod sync;
@@ -80,12 +82,19 @@ fn open_store() -> anyhow::Result<(Arc<Store>, Vec<Account>)> {
 fn main() {
     // Plain command-line conveniences; anything else starts the app.
     let args: Vec<String> = std::env::args().skip(1).collect();
+    let mailto = args.iter().find(|a| a.to_ascii_lowercase().starts_with("mailto:")).cloned();
+    if let Some(link) = &mailto {
+        // A running Overlook takes the link; this launch is done.
+        if single_instance::send(link) {
+            return;
+        }
+    }
     if args.iter().any(|a| a == "--version" || a == "-V") {
         println!("overlook {}", env!("CARGO_PKG_VERSION"));
         return;
     }
     if args.iter().any(|a| a == "--help" || a == "-h") {
-        println!("Overlook {} — a clear view of what matters.\n\nUsage: overlook [--version] [--help]\n\nEnvironment:\n  OVERLOOK_DATA_DIR      profile directory (default ~/.local/share/overlook)\n  OVERLOOK_CONFIG_DIR    directory holding google-oauth-client.json (default ~/.config/overlook)\n  OVERLOOK_SIGN_IN=gmail start the Google sign-in at launch\n  RUST_LOG=overlook=debug tracing output", env!("CARGO_PKG_VERSION"));
+        println!("Overlook {} — a clear view of what matters.\n\nUsage: overlook [mailto:…] [--version] [--help]\n\nEnvironment:\n  OVERLOOK_DATA_DIR      profile directory (default ~/.local/share/overlook)\n  OVERLOOK_CONFIG_DIR    directory holding google-oauth-client.json (default ~/.config/overlook)\n  OVERLOOK_SIGN_IN=gmail start the Google sign-in at launch\n  RUST_LOG=overlook=debug tracing output", env!("CARGO_PKG_VERSION"));
         return;
     }
     tracing_subscriber::fmt()
@@ -99,6 +108,10 @@ fn main() {
             std::process::exit(1);
         }
     };
+    single_instance::listen();
+    if let Some(link) = mailto {
+        single_instance::push(link);
+    }
     let provider = SampleProvider::new();
     // The sample account's connection is simulated. Start it connected when asked, so a
     // restart-while-offline test can be followed by a reconnect at launch.

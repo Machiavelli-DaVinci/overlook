@@ -120,6 +120,30 @@ pub trait MailProvider: Send + Sync {
     fn apply(&self, account: &Account, op: &PendingOperation, messages: &[Message], labels: &[Label]) -> BoxFuture<'_, Result<(), ProviderError>>;
 
     /// Downloads one attachment's bytes.
+    /// Whether automatic replies can be read and changed at the provider.
+    fn has_settings_access(&self) -> bool {
+        false
+    }
+
+    fn fetch_vacation(&self, _account: &Account) -> BoxFuture<'_, Result<Option<VacationSettings>, ProviderError>> {
+        Box::pin(async { Ok(None) })
+    }
+
+    fn set_vacation(&self, _account: &Account, _settings: &VacationSettings) -> BoxFuture<'_, Result<(), ProviderError>> {
+        Box::pin(async { Err(ProviderError::Rejected("this account cannot store automatic replies".into())) })
+    }
+
+    /// Whether the stored credentials allow reading contacts.
+    fn has_contacts_access(&self) -> bool {
+        false
+    }
+
+    /// The account's contacts: address book entries and people corresponded with. `None`
+    /// when the provider has no contacts, or the sign-in lacks the scope.
+    fn fetch_contacts(&self, _account: &Account) -> BoxFuture<'_, Result<Option<Vec<Contact>>, ProviderError>> {
+        Box::pin(async { Ok(None) })
+    }
+
     /// The message as RFC 822 bytes, for "Save as .eml" and "View source". The default
     /// rebuilds it from the stored headers and body.
     fn fetch_raw(&self, _account: &Account, message: &Message) -> BoxFuture<'_, Result<Vec<u8>, ProviderError>> {

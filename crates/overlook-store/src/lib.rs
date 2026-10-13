@@ -956,6 +956,74 @@ impl Store {
         })
     }
 
+    /// Replaces the account's contacts with the provider's list.
+    pub fn replace_contacts(&self, account: &AccountId, contacts: &[Contact]) -> Result<()> {
+        self.with_tx(|tx| {
+            tx.execute("DELETE FROM contacts WHERE account_id=?1", [&account.0])?;
+            for c in contacts {
+                tx.execute(
+                    "INSERT OR REPLACE INTO contacts(account_id, email, name, photo_url, in_address_book, updated) VALUES(?1,?2,?3,?4,?5,?6)",
+                    params![account.0, c.email.to_ascii_lowercase(), c.name, c.photo_url, c.in_address_book as i64, c.updated],
+                )?;
+            }
+            Ok(())
+        })
+    }
+
+    pub fn contact_count(&self, account: &AccountId) -> Result<usize> {
+        self.with_conn(|c| Ok(c.query_row("SELECT COUNT(*) FROM contacts WHERE account_id=?1", [&account.0], |r| r.get::<_, i64>(0))? as usize))
+    }
+
+    pub fn contact(&self, account: &AccountId, email: &str) -> Result<Option<Contact>> {
+        Ok(self.contacts_where(account, "AND email=?2", &email.to_ascii_lowercase(), 1)?.into_iter().next())
+    }
+
+    /// Contacts whose name or address starts with `prefix` (any word of the name), address
+    /// book entries first.
+    pub fn contacts_matching(&self, account: &AccountId, prefix: &str, limit: usize) -> Result<Vec<Contact>> {
+        let needle = prefix.trim().to_ascii_lowercase();
+        if needle.is_empty() {
+            return Ok(Vec::new());
+        }
+        let all = self.contacts_where(account, "", "", 5000)?;
+        let mut hits: Vec<Contact> = all
+            .into_iter()
+            .filter(|c| {
+                c.email.starts_with(&needle)
+                    || c.name.as_deref().is_some_and(|n| {
+                        let lower = n.to_ascii_lowercase();
+                        lower.starts_with(&needle) || lower.split_whitespace().any(|w| w.starts_with(&needle))
+                    })
+            })
+            .collect();
+        hits.sort_by(|a, b| b.in_address_book.cmp(&a.in_address_book).then_with(|| a.name.is_none().cmp(&b.name.is_none())).then_with(|| a.email.cmp(&b.email)));
+        hits.truncate(limit);
+        Ok(hits)
+    }
+
+    fn contacts_where(&self, account: &AccountId, clause: &str, arg: &str, limit: usize) -> Result<Vec<Contact>> {
+        self.with_conn(|c| {
+            let sql = format!("SELECT account_id, email, name, photo_url, in_address_book, updated FROM contacts WHERE account_id=?1 {clause} LIMIT {limit}");
+            let mut stmt = c.prepare(&sql)?;
+            let map = |r: &rusqlite::Row| {
+                Ok(Contact {
+                    account_id: AccountId(r.get(0)?),
+                    email: r.get(1)?,
+                    name: r.get(2)?,
+                    photo_url: r.get(3)?,
+                    in_address_book: r.get::<_, i64>(4)? != 0,
+                    updated: r.get(5)?,
+                })
+            };
+            let rows: Vec<Contact> = if clause.is_empty() {
+                stmt.query_map([&account.0], map)?.collect::<std::result::Result<Vec<_>, _>>()?
+            } else {
+                stmt.query_map(params![account.0, arg], map)?.collect::<std::result::Result<Vec<_>, _>>()?
+            };
+            Ok(rows)
+        })
+    }
+
     /// Addresses the user has corresponded with, most frequent first, for recipient
     /// autocomplete.
     pub fn known_recipients(&self, account: &AccountId, prefix: &str, limit: usize) -> Result<Vec<Address>> {

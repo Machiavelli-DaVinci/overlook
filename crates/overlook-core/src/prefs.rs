@@ -98,24 +98,69 @@ impl Default for Prefs {
     }
 }
 
+/// One named signature. The body is Markdown-flavoured text like the composer's.
+#[derive(Clone, Debug, PartialEq, Eq, Serialize, Deserialize, Default)]
+#[serde(default)]
+pub struct Signature {
+    pub id: String,
+    pub name: String,
+    pub body: String,
+}
+
 /// Per-account preferences.
 #[derive(Clone, Debug, PartialEq, Eq, Serialize, Deserialize, Default)]
 #[serde(default)]
 pub struct AccountPrefs {
-    /// Plain-text signature. Rich signatures arrive with rich-text composition.
+    /// The single signature of older versions; migrated into `signatures` by `normalized`.
     pub signature: String,
+    pub signatures: Vec<Signature>,
+    /// Signature ids used by default; `None` means no signature.
+    pub default_new: Option<String>,
+    pub default_reply: Option<String>,
     pub sign_new_messages: bool,
     pub sign_replies: bool,
 }
 
 impl AccountPrefs {
+    /// Brings older stored preferences up to date: the single signature becomes the first
+    /// named one, and the two "include" switches become the defaults.
+    pub fn normalized(mut self) -> Self {
+        if self.signatures.is_empty() && !self.signature.trim().is_empty() {
+            self.signatures.push(Signature { id: "default".into(), name: "Default".into(), body: std::mem::take(&mut self.signature) });
+            self.default_new = self.sign_new_messages.then(|| "default".to_string());
+            self.default_reply = self.sign_replies.then(|| "default".to_string());
+        }
+        self.sign_new_messages = true;
+        self.sign_replies = true;
+        let known = |id: &Option<String>| id.as_ref().is_some_and(|i| self.signatures.iter().any(|s| &s.id == i));
+        if !known(&self.default_new) {
+            self.default_new = None;
+        }
+        if !known(&self.default_reply) {
+            self.default_reply = None;
+        }
+        self
+    }
+
+    pub fn signature_by_id(&self, id: &str) -> Option<&Signature> {
+        self.signatures.iter().find(|s| s.id == id)
+    }
+
+    pub fn default_signature(&self, reply: bool) -> Option<&Signature> {
+        let id = if reply { self.default_reply.as_deref() } else { self.default_new.as_deref() };
+        id.and_then(|i| self.signature_by_id(i)).filter(|s| !s.body.trim().is_empty())
+    }
+
     /// Signature block to append to a body, or empty when none applies.
     pub fn signature_block(&self, reply: bool) -> String {
-        let wanted = if reply { self.sign_replies } else { self.sign_new_messages };
-        if !wanted || self.signature.trim().is_empty() {
-            return String::new();
+        match self.default_signature(reply) {
+            Some(s) => format!("\n\n{}", s.body.trim_end()),
+            None => String::new(),
         }
-        format!("\n\n{}", self.signature.trim_end())
+    }
+
+    pub fn new_signature_id() -> String {
+        format!("sig-{}", uuid::Uuid::new_v4().simple())
     }
 }
 
@@ -133,8 +178,13 @@ mod tests {
 
     #[test]
     fn signature_block_follows_toggles() {
-        let a = AccountPrefs { signature: "Jason\nLast Refuge  ".into(), sign_new_messages: true, sign_replies: false };
+        let a = AccountPrefs { signature: "Jason\nLast Refuge  ".into(), sign_new_messages: true, sign_replies: false, ..Default::default() }.normalized();
+        assert_eq!(a.signatures.len(), 1);
         assert_eq!(a.signature_block(false), "\n\nJason\nLast Refuge");
         assert_eq!(a.signature_block(true), "");
+        let mut b = a.clone();
+        b.signatures.push(Signature { id: "short".into(), name: "Short".into(), body: "J.".into() });
+        b.default_reply = Some("short".into());
+        assert_eq!(b.signature_block(true), "\n\nJ.");
     }
 }

@@ -128,3 +128,8 @@ Brand assets and the HTML design preview keep their existing maintenance command
   are listed in the roadmap doc.
 
 - v0.2.0 published 2026-10-12 (rich-text composer; online search, reader polish, image previews, data tables, recurring-series scopes, drag to move/resize, guests + Meet). Working version is now 0.2.1.
+
+- Batch 3 (2026-10-12): Gmail batch endpoint, PDF previews (pdftoppm), colspan alignment, contacts (People
+  API, schema v9), named signatures + automatic replies (gmail.settings.basic), mailto with single instance,
+  reminder snooze, calendar Enter/Delete/Escape, sup/sub glyphs. New OAuth scopes mean existing sign-ins show
+  "Sign in again" in Settings → Accounts for contacts and automatic replies until re-authorised.

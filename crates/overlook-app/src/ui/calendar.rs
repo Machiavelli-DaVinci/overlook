@@ -235,6 +235,17 @@ impl MailWindow {
                 if event.my_response() == Some(ResponseStatus::Declined) || event.is_working_location() {
                     continue;
                 }
+                // A snoozed reminder comes back once, when its time is up.
+                if let Some(until) = self.snoozed_reminders.get(&event.id).copied() {
+                    if now_ms < until {
+                        continue;
+                    }
+                    self.snoozed_reminders.remove(&event.id);
+                    if event.start > now_ms - 60_000 {
+                        self.fire_reminder(&event, now_ms, window, cx);
+                    }
+                    continue;
+                }
                 // Google reports no default for some calendars; 10 minutes is Google's own
                 // default and close to Outlook's 15, and reminders can be switched off.
                 let fallback = self.prefs.default_reminder_minutes as i32;
@@ -245,19 +256,39 @@ impl MailWindow {
                     let key = (event.id.clone(), minutes);
                     if fire_at <= now_ms && event.start > now_ms - 60_000 && !self.notified.contains(&key) {
                         self.notified.insert(key);
-                        let remaining = ((event.start - now_ms) / 60_000).max(0);
-                        let when = if remaining == 0 { "now".to_owned() } else { format!("in {remaining} min") };
-                        let title = event.display_title();
-                        let mut body = format!("{} · {} – {}", when, tz::format_clock(event.start), tz::format_clock(event.end));
-                        if let Some(l) = &event.location {
-                            body.push_str(&format!("\n{l}"));
-                        }
-                        crate::notify::desktop(title.clone(), body);
-                        window.push_notification(Notification::info(format!("{title} · {when}")), cx);
+                        self.fire_reminder(&event, now_ms, window, cx);
                     }
                 }
             }
         }
+    }
+
+    /// Shows one reminder: a desktop notification and an in-app toast with Snooze.
+    fn fire_reminder(&mut self, event: &Event, now_ms: i64, window: &mut Window, cx: &mut Context<Self>) {
+        let remaining = ((event.start - now_ms) / 60_000).max(0);
+        let when = if remaining == 0 { "now".to_owned() } else { format!("in {remaining} min") };
+        let title = event.display_title();
+        let mut body = format!("{} · {} – {}", when, tz::format_clock(event.start), tz::format_clock(event.end));
+        if let Some(l) = &event.location {
+            body.push_str(&format!("\n{l}"));
+        }
+        crate::notify::desktop(title.clone(), body);
+        let t = cx.entity().downgrade();
+        let id = event.id.clone();
+        window.push_notification(
+            Notification::info(format!("{title} · {when}")).action(move |_, _window, cx| {
+                let t = t.clone();
+                let id = id.clone();
+                let toast = cx.entity().downgrade();
+                Button::new("snooze-reminder").small().label("Snooze 5 min").on_click(move |_, window, cx| {
+                    let _ = t.update(cx, |this, _cx| {
+                        this.snoozed_reminders.insert(id.clone(), now() + 5 * 60_000);
+                    });
+                    let _ = toast.update(cx, |n, cx| n.dismiss(window, cx));
+                })
+            }),
+            cx,
+        );
     }
 
     pub(crate) fn start_edit_event(&mut self, id: EventId, window: &mut Window, cx: &mut Context<Self>) {

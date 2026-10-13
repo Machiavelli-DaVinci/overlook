@@ -35,11 +35,13 @@ and you can read, search, write, and file mail with no connection at all.
 - **Focused Inbox.** The Inbox splits into Focused and Other from Gmail's own hints, who you write to, and
   your choices: *Move to Other*, or *Always move messages from this sender*. Local, private, and reversible.
 - **Reading that respects you.** Received HTML is sanitized before it is rendered; scripts never run and remote
-  images are blocked until you ask. Data tables keep their columns. Image attachments show thumbnails and open
-  in a quick look; everything else opens with your system apps. Every message has Reply, Forward, Print, Save
+  images are blocked until you ask. Data tables keep their columns. Image and PDF attachments show thumbnails
+  and open in a quick look (PDFs through poppler's `pdftoppm`, which Omarchy ships); everything else opens with
+  your system apps. Every message has Reply, Forward, Print, Save
   as .eml and View source, and long threads expand or collapse in one click.
-- **Writing.** New, reply, reply all, forward, with autosave to the device, recipient suggestions from people
-  you have written to, attachments, and signatures per account. Formatting as you type: bold, italics, links,
+- **Writing.** New, reply, reply all, forward, with autosave to the device, recipient suggestions from your
+  Google Contacts and people you have written to, attachments, several named signatures per account with a
+  picker in the composer, and `mailto:` links from other apps. Formatting as you type: bold, italics, links,
   lists, quotes and code, styled live in the editor with the marks still visible, a Preview of exactly what
   recipients get, and the quoted original kept out of your way below the reply.
 - **A calendar, not an afterthought.** Day, Week, Month, and Agenda. Invitations with Accept, Tentative, and
@@ -54,7 +56,8 @@ and you can read, search, write, and file mail with no connection at all.
 - **Two themes, done well.** Light and Dark, with *Follow system*. Bundled Inter and Source Serif 4 so it
   looks the same on every machine. Keyboard shortcuts you already know from Outlook.
 - **Settings that do things.** Accounts and signatures, notifications, sync interval, mark-as-read timing,
-  remote images, download size, working hours, reminders, and more. Every control takes effect immediately.
+  remote images, download size, working hours, reminders, automatic replies (out of office), and more. Every
+  control takes effect immediately.
 
 <p align="center">
   <img src="docs/screenshots/calendar-week-light.png" alt="Overlook calendar week view" width="920">
@@ -128,7 +131,8 @@ client that belongs to you. Nothing passes through a Last Refuge server.
 1. In [Google Cloud](https://console.cloud.google.com), create a project, enable the **Gmail API** and the
    **Google Calendar API**.
 2. Configure the consent screen (External, Testing), add yourself as a test user, and add these scopes:
-   `gmail.modify`, `gmail.send`, `calendar.events`, `calendar.readonly`, `openid`, `userinfo.email`.
+   `gmail.modify`, `gmail.send`, `gmail.settings.basic`, `calendar.events`, `calendar.readonly`,
+   `contacts.readonly`, `contacts.other.readonly`, `openid`, `userinfo.email`.
 3. Create an OAuth client of type **Desktop app** and download its JSON.
 4. Save it as `~/.config/overlook/google-oauth-client.json`.
 5. In Overlook, open the account menu at the bottom of the sidebar → **Add Gmail account…** and sign in in
@@ -156,6 +160,7 @@ in Google Cloud lifts that. The [native app guide](llm-docs/overlook-native-app.
 | <kbd>Ctrl</kbd>+<kbd>1</kbd> / <kbd>Ctrl</kbd>+<kbd>2</kbd> | Mail / Calendar |
 | <kbd>Ctrl</kbd>+<kbd>Shift</kbd>+<kbd>A</kbd> | New event |
 | <kbd>←</kbd> <kbd>→</kbd> <kbd>T</kbd> <kbd>D</kbd> <kbd>W</kbd> <kbd>M</kbd> <kbd>A</kbd> | Calendar: move, today, day, week, month, agenda |
+| <kbd>Enter</kbd> / <kbd>Delete</kbd> | Calendar: edit / delete the selected event |
 | <kbd>Ctrl</kbd>+<kbd>,</kbd> | Settings |
 | <kbd>Esc</kbd> | Close composer or settings, clear search |
 

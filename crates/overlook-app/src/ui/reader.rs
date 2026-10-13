@@ -423,7 +423,21 @@ impl MailWindow {
                         v_flex()
                             .flex_1()
                             .min_w_0()
-                            .child(div().text_size(px(14.)).font_weight(FontWeight::SEMIBOLD).child(who.display_name()))
+                            .child({
+                                let card_id = m.id.clone();
+                                div()
+                                    .id(SharedString::from(format!("sender-{}", m.id)))
+                                    .text_size(px(14.))
+                                    .font_weight(FontWeight::SEMIBOLD)
+                                    .cursor_pointer()
+                                    .hover(|d| d.text_color(p.accent))
+                                    .child(who.display_name())
+                                    .on_click(cx.listener(move |this, _, _w, cx| {
+                                        cx.stop_propagation();
+                                        this.contact_card = if this.contact_card.as_ref() == Some(&card_id) { None } else { Some(card_id.clone()) };
+                                        cx.notify();
+                                    }))
+                            })
                             .child(div().truncate().text_size(px(12.)).text_color(p.muted).child(to_line)),
                     )
                     .child(
@@ -460,6 +474,7 @@ impl MailWindow {
                             }),
                     ),
             )
+            .when(self.contact_card.as_ref() == Some(&m.id), |d| d.child(self.render_contact_card(&who, cx)))
             .when(!m.body.is_cached(), |d| {
                 d.child(
                     div()
@@ -601,12 +616,97 @@ impl MailWindow {
         Some(url)
     }
 
+    /// Who a sender is: address book entry or correspondent, with the two things one does
+    /// next: write to them, or find everything they sent.
+    fn render_contact_card(&self, who: &Address, cx: &mut Context<Self>) -> Div {
+        let p = *cx.palette();
+        let contact = self.store.contact(&self.account.id, &who.email).ok().flatten();
+        let name = contact.as_ref().and_then(|c| c.name.clone()).or_else(|| who.name.clone()).unwrap_or_else(|| who.email.clone());
+        let source = match &contact {
+            Some(c) if c.in_address_book => "In your Google Contacts",
+            Some(_) => "Someone you have corresponded with",
+            None => "Not in your contacts",
+        };
+        let email = who.email.clone();
+        let compose_to = who.clone();
+        let search_from = format!("from:{}", who.email);
+        h_flex()
+            .items_center()
+            .gap(px(14.))
+            .px(px(14.))
+            .py(px(12.))
+            .rounded(px(10.))
+            .bg(p.chip)
+            .border_1()
+            .border_color(p.divider)
+            .child(match contact.as_ref().and_then(|c| c.photo_url.clone()) {
+                Some(url) => div().size(px(44.)).rounded_full().overflow_hidden().bg(p.avatar).child(img(SharedUri::from(url)).size_full().object_fit(ObjectFit::Cover)).into_any_element(),
+                None => avatar(who, 44., &p).into_any_element(),
+            })
+            .child(
+                v_flex()
+                    .flex_1()
+                    .min_w_0()
+                    .child(div().text_size(px(14.)).font_weight(FontWeight::SEMIBOLD).child(name))
+                    .child(div().text_size(px(12.)).text_color(p.muted).child(email))
+                    .child(div().text_size(px(11.)).text_color(p.muted).child(source)),
+            )
+            .child(Button::new("card-compose").small().icon(icon("pen-line").size(px(14.))).label("New message").on_click(cx.listener(move |this, _, window, cx| {
+                this.compose_new(window, cx);
+                if let Some(c) = this.composer.as_ref() {
+                    let to = c.to.clone();
+                    let header = compose_to.to_header();
+                    to.update(cx, |s, cx| s.set_value(header, window, cx));
+                }
+                this.sync_composer_fields(cx);
+            })))
+            .child(Button::new("card-search").ghost().small().icon(icon("search").size(px(14.))).label("Mail from them").on_click(cx.listener(move |this, _, window, cx| {
+                let input = this.search_input.clone();
+                let q = search_from.clone();
+                input.update(cx, |s, cx| s.set_value(q.clone(), window, cx));
+                this.set_search(q, window, cx);
+            })))
+    }
+
     /// The image attachment shown over the window, with Open and Save.
     pub(super) fn render_quick_look(&self, cx: &mut Context<Self>) -> AnyElement {
-        let Some(a) = self.quick_look.clone() else { return div().into_any_element() };
-        let Some(path) = a.local_path.as_deref().map(std::path::PathBuf::from) else { return div().into_any_element() };
+        let Some(ql) = self.quick_look.clone() else { return div().into_any_element() };
+        let a = ql.attachment.clone();
         let open = a.clone();
         let save = a.clone();
+        let is_pdf = a.is_pdf();
+        let page_count = ql.pages.len();
+        let content: AnyElement = if ql.rendering {
+            div().text_color(gpui_kit::white()).text_size(px(14.)).child("Rendering pages…").into_any_element()
+        } else if let Some(e) = &ql.error {
+            div().text_color(gpui_kit::white()).text_size(px(14.)).child(e.clone()).into_any_element()
+        } else if is_pdf {
+            div()
+                .id("quick-look-pages")
+                .size_full()
+                .overflow_y_scroll()
+                .flex()
+                .flex_col()
+                .items_center()
+                .gap(px(16.))
+                .children(ql.pages.iter().enumerate().map(|(i, page)| {
+                    div()
+                        .w(px(900.))
+                        .max_w_full()
+                        .bg(gpui_kit::white())
+                        .rounded(px(4.))
+                        .shadow_lg()
+                        .child(img(page.clone()).w_full().object_fit(ObjectFit::Contain))
+                        .id(SharedString::from(format!("pdf-page-{i}")))
+                }))
+                .when(page_count >= crate::pdf_preview::MAX_PAGES, |d| d.child(div().text_color(gpui_kit::white()).text_size(px(12.)).opacity(0.7).child(format!("Showing the first {page_count} pages. Open the file for the rest."))))
+                .into_any_element()
+        } else {
+            match ql.pages.first() {
+                Some(path) => img(path.clone()).max_w_full().max_h_full().object_fit(ObjectFit::Contain).rounded(px(6.)).into_any_element(),
+                None => div().into_any_element(),
+            }
+        };
         let mut backdrop: Hsla = gpui_kit::black();
         backdrop.a = 0.86;
         div()
@@ -627,9 +727,9 @@ impl MailWindow {
                     .px(px(20.))
                     .h(px(52.))
                     .text_color(gpui_kit::white())
-                    .child(icon("image").size(px(16.)).text_color(gpui_kit::white()))
+                    .child(icon(if is_pdf { "file-text" } else { "image" }).size(px(16.)).text_color(gpui_kit::white()))
                     .child(div().flex_1().truncate().text_size(px(14.)).font_weight(FontWeight::MEDIUM).child(a.filename.clone()))
-                    .child(div().text_size(px(12.)).opacity(0.7).child(a.human_size()))
+                    .child(div().text_size(px(12.)).opacity(0.7).child(if is_pdf && page_count > 0 { format!("{} · {} page{}", a.human_size(), page_count, if page_count == 1 { "" } else { "s" }) } else { a.human_size() }))
                     .child(Button::new("ql-open").ghost().small().icon(icon("external-link").size(px(15.))).label("Open").on_click(cx.listener(move |_this, _, _w, cx| {
                         cx.stop_propagation();
                         if let Some(path) = open.local_path.as_deref() {
@@ -653,7 +753,7 @@ impl MailWindow {
                     .flex()
                     .items_center()
                     .justify_center()
-                    .child(img(path).max_w_full().max_h_full().object_fit(ObjectFit::Contain).rounded(px(6.))),
+                    .child(content),
             )
             .into_any_element()
     }
@@ -663,7 +763,12 @@ impl MailWindow {
         let downloading = self.downloading.contains(&a.id);
         let open = a.clone();
         let save = a.clone();
-        attachment_card(a, &p, downloading)
+        let thumb = if a.is_image() {
+            a.local_path.as_deref().map(std::path::PathBuf::from).filter(|p| p.exists())
+        } else {
+            self.pdf_thumbs.get(&a.id).cloned()
+        };
+        attachment_card(a, &p, downloading, thumb)
             .id(SharedString::from(format!("att-{}", a.id)))
             .cursor_pointer()
             .hover(|d| d.bg(p.hover))
@@ -830,13 +935,12 @@ fn toolbar_button(
         .on_click(on_click)
 }
 
-fn attachment_card(a: &Attachment, p: &crate::theme::Palette, downloading: bool) -> Div {
+fn attachment_card(a: &Attachment, p: &crate::theme::Palette, downloading: bool, thumbnail: Option<std::path::PathBuf>) -> Div {
     let badge_bg = match a.badge().as_str() {
         "PDF" => (c(0xFBE9E7, p), c(0xA13E37, p)),
         "FIG" | "PNG" | "JPG" | "SVG" => (c(0xEEE8FA, p), c(0x6E55B7, p)),
         _ => (p.chip, p.muted),
     };
-    let thumbnail = a.is_image().then(|| a.local_path.as_deref().map(std::path::PathBuf::from).filter(|p| p.exists())).flatten();
     h_flex()
         .items_center()
         .gap(px(12.))
@@ -874,7 +978,7 @@ fn attachment_card(a: &Attachment, p: &crate::theme::Palette, downloading: bool)
                         .child(if downloading {
                             format!("{} · Downloading…", a.human_size())
                         } else if a.is_downloaded() {
-                            format!("{} · {}", a.human_size(), if a.is_image() { "Preview" } else { "Open" })
+                            format!("{} · {}", a.human_size(), if a.is_image() || (a.is_pdf() && crate::pdf_preview::available()) { "Preview" } else { "Open" })
                         } else {
                             format!("{} · Click to download", a.human_size())
                         }),
