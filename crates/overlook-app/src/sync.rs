@@ -399,12 +399,12 @@ pub async fn run_sync(store: Arc<Store>, provider: Arc<dyn MailProvider>, calend
                         Some((e, c)) => cal.create_event(&account, &c, e).await.and_then(|created| store.upsert_events(&[created]).map_err(|e| ProviderError::Temporary(e.to_string()))),
                         None => Ok(()),
                     },
-                    OperationKind::UpdateEvent { .. } => match event.as_ref().and_then(|e| find_calendar(&e.calendar_id).map(|c| (e, c))) {
-                        Some((e, c)) => cal.update_event(&account, &c, e).await.and_then(|updated| store.upsert_events(&[updated]).map_err(|e| ProviderError::Temporary(e.to_string()))),
+                    OperationKind::UpdateEvent { scope, .. } => match event.as_ref().and_then(|e| find_calendar(&e.calendar_id).map(|c| (e, c))) {
+                        Some((e, c)) => cal.update_event_scoped(&account, &c, e, *scope).await.and_then(|updated| store.upsert_events(&[updated]).map_err(|e| ProviderError::Temporary(e.to_string()))),
                         None => Ok(()),
                     },
-                    OperationKind::DeleteEvent { calendar_id, provider_id, .. } => match (find_calendar(calendar_id), provider_id) {
-                        (Some(c), Some(pid)) => cal.delete_event(&account, &c, pid).await,
+                    OperationKind::DeleteEvent { calendar_id, provider_id, scope, recurring_event_id, original_start, .. } => match (find_calendar(calendar_id), provider_id) {
+                        (Some(c), Some(pid)) => cal.delete_event_scoped(&account, &c, pid, *scope, recurring_event_id.as_deref(), *original_start).await,
                         _ => Ok(()),
                     },
                     _ => Ok(()),

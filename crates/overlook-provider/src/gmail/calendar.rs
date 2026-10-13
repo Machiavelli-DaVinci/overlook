@@ -126,6 +126,8 @@ pub fn event_from_json(account: &Account, calendar: &Calendar, v: &Value) -> Opt
             event_type: None,
             color: None,
             reminders: None,
+            original_start: None,
+            wants_conference: false,
             pending: false,
         });
     }
@@ -192,6 +194,8 @@ pub fn event_from_json(account: &Account, calendar: &Calendar, v: &Value) -> Opt
         html_link: v.get("htmlLink").and_then(|s| s.as_str()).map(str::to_owned),
         conference_url,
         recurring_event_id: v.get("recurringEventId").and_then(|s| s.as_str()).map(str::to_owned),
+        original_start: parse_when(v.get("originalStartTime")).map(|(t, _)| t),
+        wants_conference: false,
         updated: v.get("updated").and_then(|s| s.as_str()).and_then(tz::parse_rfc3339).unwrap_or(0),
         event_type: v.get("eventType").and_then(|t| t.as_str()).map(|t| match t {
             "workingLocation" => "working-location".to_owned(),
@@ -231,7 +235,41 @@ pub fn event_to_json(event: &Event) -> Value {
     if let Some(r) = &event.reminders {
         body["reminders"] = json!({ "useDefault": false, "overrides": r.iter().map(|m| json!({"method": "popup", "minutes": m})).collect::<Vec<_>>() });
     }
+    if event.wants_conference && event.conference_url.is_none() {
+        body["conferenceData"] = json!({ "createRequest": { "requestId": format!("ovl-{}", event.id.0.replace([':', '/', '@', '.'], "-")), "conferenceSolutionKey": { "type": "hangoutsMeet" } } });
+    }
     body
+}
+
+/// Recurrence lines with every RRULE ended at `until` (COUNT dropped, since it no longer
+/// adds up). EXDATE/RDATE lines are kept.
+pub fn recurrence_until(recurrence: &[String], until: Timestamp) -> Vec<String> {
+    let stamp = tz::utc_basic(until);
+    recurrence
+        .iter()
+        .map(|line| {
+            if !line.to_ascii_uppercase().starts_with("RRULE:") {
+                return line.clone();
+            }
+            let parts: Vec<&str> = line[6..].split(';').filter(|p| !p.to_ascii_uppercase().starts_with("UNTIL=") && !p.to_ascii_uppercase().starts_with("COUNT=")).collect();
+            format!("RRULE:{};UNTIL={stamp}", parts.join(";"))
+        })
+        .collect()
+}
+
+/// Recurrence lines for the new series after a split: COUNT dropped (it belonged to the
+/// original run), UNTIL kept.
+pub fn recurrence_for_split(recurrence: &[String]) -> Vec<String> {
+    recurrence
+        .iter()
+        .map(|line| {
+            if !line.to_ascii_uppercase().starts_with("RRULE:") {
+                return line.clone();
+            }
+            let parts: Vec<&str> = line[6..].split(';').filter(|p| !p.to_ascii_uppercase().starts_with("COUNT=")).collect();
+            format!("RRULE:{}", parts.join(";"))
+        })
+        .collect()
 }
 
 fn attendee_to_json(a: &Attendee) -> Value {
@@ -347,7 +385,7 @@ impl CalendarProvider for GoogleCalendarProvider {
             if let Some(pid) = &event.provider_id {
                 body["id"] = Value::String(pid.0.clone());
             }
-            let url = Self::events_url(&calendar, "?sendUpdates=all");
+            let url = Self::events_url(&calendar, "?sendUpdates=all&conferenceDataVersion=1");
             let v = match self.client.post_url(&url, &body) {
                 Ok(v) => v,
                 // Already created by an earlier attempt: fetch it instead of duplicating.
@@ -367,7 +405,7 @@ impl CalendarProvider for GoogleCalendarProvider {
         let event = event.clone();
         Box::pin(async move {
             let Some(pid) = event.provider_id.clone() else { return Err(ProviderError::Rejected("event has no Google id".into())) };
-            let url = Self::events_url(&calendar, &format!("/{}?sendUpdates=all", url_encode(&pid.0)));
+            let url = Self::events_url(&calendar, &format!("/{}?sendUpdates=all&conferenceDataVersion=1", url_encode(&pid.0)));
             let v = self.client.patch_url(&url, &event_to_json(&event))?;
             event_from_json(&account, &calendar, &v).ok_or_else(|| ProviderError::Rejected("Google returned an unreadable event".into()))
         })
@@ -384,6 +422,112 @@ impl CalendarProvider for GoogleCalendarProvider {
             }
         })
     }
+
+    fn update_event_scoped(&self, account: &Account, calendar: &Calendar, event: &Event, scope: RecurrenceScope) -> BoxFuture<'_, Result<Event, ProviderError>> {
+        let (Some(master_id), true) = (event.recurring_event_id.clone(), scope != RecurrenceScope::This) else {
+            return self.update_event(account, calendar, event);
+        };
+        let account = account.clone();
+        let calendar = calendar.clone();
+        let event = event.clone();
+        Box::pin(async move {
+            let master_url = Self::events_url(&calendar, &format!("/{}", url_encode(&master_id)));
+            let master = self.client.get_url(&master_url)?;
+            let recurrence: Vec<String> = master.get("recurrence").and_then(|r| r.as_array()).map(|a| a.iter().filter_map(|l| l.as_str().map(str::to_owned)).collect()).unwrap_or_default();
+            // Texts and settings come from the edited occurrence; times keep the series'
+            // own schedule shifted by however much this occurrence moved.
+            let delta = event.start - event.split_point();
+            let duration = event.end - event.start;
+            let mut body = event_to_json(&event);
+            match scope {
+                RecurrenceScope::All => {
+                    let (master_start, _) = parse_when(master.get("start")).unwrap_or((event.start, event.all_day));
+                    let start = master_start + delta;
+                    let shifted = Event { start, end: start + duration, ..event.clone() };
+                    let when = event_to_json(&shifted);
+                    body["start"] = when["start"].clone();
+                    body["end"] = when["end"].clone();
+                    let url = Self::events_url(&calendar, &format!("/{}?sendUpdates=all&conferenceDataVersion=1", url_encode(&master_id)));
+                    self.client.patch_url(&url, &body)?;
+                }
+                RecurrenceScope::Following => {
+                    // End the old series just before this occurrence, then start a new one here.
+                    let until = recurrence_until(&recurrence, event.split_point() - 1_000);
+                    let url = Self::events_url(&calendar, &format!("/{}?sendUpdates=all", url_encode(&master_id)));
+                    self.client.patch_url(&url, &json!({ "recurrence": until }))?;
+                    body["recurrence"] = json!(recurrence_for_split(&recurrence));
+                    body.as_object_mut().map(|o| o.remove("id"));
+                    let url = Self::events_url(&calendar, "?sendUpdates=all&conferenceDataVersion=1");
+                    self.client.post_url(&url, &body)?;
+                }
+                RecurrenceScope::This => unreachable!(),
+            }
+            // The occurrence itself: the next incremental sync brings every instance back
+            // from Google; until then the local copy stands.
+            let _ = account;
+            Ok(Event { pending: false, ..event })
+        })
+    }
+
+    fn delete_event_scoped(
+        &self,
+        account: &Account,
+        calendar: &Calendar,
+        provider_id: &ProviderId,
+        scope: RecurrenceScope,
+        recurring_event_id: Option<&str>,
+        split_at: Option<Timestamp>,
+    ) -> BoxFuture<'_, Result<(), ProviderError>> {
+        let (Some(master_id), true) = (recurring_event_id.map(str::to_owned), scope != RecurrenceScope::This) else {
+            return self.delete_event(account, calendar, provider_id);
+        };
+        let calendar = calendar.clone();
+        Box::pin(async move {
+            match scope {
+                RecurrenceScope::All => {
+                    let url = Self::events_url(&calendar, &format!("/{}?sendUpdates=all", url_encode(&master_id)));
+                    match self.client.delete_url(&url) {
+                        Ok(_) | Err(ApiError::NotFound) | Err(ApiError::Gone) => Ok(()),
+                        Err(e) => Err(e.into()),
+                    }
+                }
+                RecurrenceScope::Following => {
+                    let master_url = Self::events_url(&calendar, &format!("/{}", url_encode(&master_id)));
+                    let master = self.client.get_url(&master_url)?;
+                    let recurrence: Vec<String> = master.get("recurrence").and_then(|r| r.as_array()).map(|a| a.iter().filter_map(|l| l.as_str().map(str::to_owned)).collect()).unwrap_or_default();
+                    let split = split_at.unwrap_or(overlook_core::time::now());
+                    let url = Self::events_url(&calendar, &format!("/{}?sendUpdates=all", url_encode(&master_id)));
+                    self.client.patch_url(&url, &json!({ "recurrence": recurrence_until(&recurrence, split - 1_000) }))?;
+                    Ok(())
+                }
+                RecurrenceScope::This => unreachable!(),
+            }
+        })
+    }
+
+    fn free_busy(&self, _account: &Account, emails: &[String], start: Timestamp, end: Timestamp) -> BoxFuture<'_, Result<Vec<(String, Option<bool>)>, ProviderError>> {
+        let emails = emails.to_vec();
+        Box::pin(async move {
+            if emails.is_empty() {
+                return Ok(Vec::new());
+            }
+            let body = json!({
+                "timeMin": tz::to_rfc3339(start),
+                "timeMax": tz::to_rfc3339(end),
+                "items": emails.iter().map(|e| json!({ "id": e })).collect::<Vec<_>>(),
+            });
+            let v = self.client.post_url(&format!("{CALENDAR_BASE}/freeBusy"), &body)?;
+            Ok(emails
+                .into_iter()
+                .map(|e| {
+                    let entry = v.get("calendars").and_then(|c| c.get(&e));
+                    let known = entry.is_some_and(|c| c.get("errors").is_none());
+                    let busy = entry.and_then(|c| c.get("busy")).and_then(|b| b.as_array()).is_some_and(|b| !b.is_empty());
+                    (e, known.then_some(busy))
+                })
+                .collect())
+        })
+    }
 }
 
 #[cfg(test)]
@@ -392,6 +536,30 @@ mod tests {
 
     fn account() -> Account {
         Account { id: AccountId::from("g1"), provider: ProviderKind::Gmail, display_name: "Jason".into(), email: "jason@example.com".into(), created_at: 0 }
+    }
+
+    #[test]
+    fn recurrence_rules_end_and_split_cleanly() {
+        let rec = vec!["RRULE:FREQ=WEEKLY;COUNT=10;BYDAY=TU".to_string(), "EXDATE;TZID=America/Phoenix:20261020T090000".to_string()];
+        let until = recurrence_until(&rec, 1_792_000_000_000);
+        assert!(until[0].starts_with("RRULE:FREQ=WEEKLY;BYDAY=TU;UNTIL=2026"), "{}", until[0]);
+        assert!(until[0].ends_with('Z') && !until[0].contains("COUNT"));
+        assert_eq!(until[1], rec[1]);
+        let split = recurrence_for_split(&["RRULE:FREQ=DAILY;COUNT=5;UNTIL=20270101T000000Z".to_string()]);
+        assert_eq!(split, vec!["RRULE:FREQ=DAILY;UNTIL=20270101T000000Z".to_string()]);
+    }
+
+    #[test]
+    fn conference_request_only_when_asked() {
+        let mut e = Event {
+            id: EventId::from("c:1"), account_id: AccountId::from("a"), calendar_id: CalendarId::from("c"), provider_id: None, ical_uid: None,
+            summary: "x".into(), description: None, location: None, start: 0, end: 3_600_000, all_day: false, status: EventStatus::Confirmed,
+            organizer: None, attendees: vec![], html_link: None, conference_url: None, recurring_event_id: None, updated: 0, event_type: None,
+            color: None, reminders: None, original_start: None, wants_conference: false, pending: false,
+        };
+        assert!(event_to_json(&e).get("conferenceData").is_none());
+        e.wants_conference = true;
+        assert_eq!(event_to_json(&e)["conferenceData"]["createRequest"]["conferenceSolutionKey"]["type"], "hangoutsMeet");
     }
 
     #[test]

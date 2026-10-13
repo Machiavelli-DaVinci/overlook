@@ -120,3 +120,9 @@ Brand assets and the HTML design preview keep their existing maintenance command
   editor with live styling (`ui/mail_highlight.rs`), toolbar, shortcuts, preview, list continuation;
   `overlook_core::compose` renders HTML + text; `Draft.include_quote` (schema v7) replaces inline
   quoting; MIME is multipart/alternative. First item of roadmap phase 1 done.
+
+- Batch 2 (2026-10-12): online search, reader polish (expand all, per-message menu with print/.eml/source),
+  image thumbnails + quick look, data tables kept, recurring-series scopes, drag to move/resize, guests with
+  free/busy and Google Meet. Schema v8 (`original_start`, `wants_conference`). Drag and the scope prompt were
+  verified by build and unit tests only; no pointer automation was available to click them. Deferred items
+  are listed in the roadmap doc.

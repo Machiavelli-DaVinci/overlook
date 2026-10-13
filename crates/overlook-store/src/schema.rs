@@ -2,7 +2,7 @@
 
 use rusqlite::Connection;
 
-const MIGRATIONS: &[&str] = &[V1, V2, V3, V4, V5, V6, V7];
+const MIGRATIONS: &[&str] = &[V1, V2, V3, V4, V5, V6, V7, V8];
 
 pub fn migrate(conn: &Connection) -> rusqlite::Result<()> {
     let current: i64 = conn.query_row("PRAGMA user_version", [], |r| r.get(0))?;
@@ -232,5 +232,13 @@ COMMIT;
 const V7: &str = r#"
 BEGIN;
 ALTER TABLE drafts ADD COLUMN include_quote INTEGER NOT NULL DEFAULT 0;
+COMMIT;
+"#;
+
+const V8: &str = r#"
+BEGIN;
+ALTER TABLE events ADD COLUMN original_start INTEGER;
+ALTER TABLE events ADD COLUMN wants_conference INTEGER NOT NULL DEFAULT 0;
+CREATE INDEX events_series ON events(account_id, recurring_event_id);
 COMMIT;
 "#;

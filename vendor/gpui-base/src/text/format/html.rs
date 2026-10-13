@@ -222,10 +222,7 @@ fn parse_table_row(table: &mut Table, node: &Rc<Node>) {
                 ref attrs,
                 ..
             } if name.local == local_name!("td") || name.local == local_name!("th") => {
-                if child.children.borrow().is_empty() {
-                    continue;
-                }
-
+                // Overlook patch: an empty cell still occupies its column.
                 count += 1;
                 parse_table_cell(&mut row, child, attrs);
             }

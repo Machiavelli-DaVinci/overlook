@@ -120,6 +120,19 @@ pub trait MailProvider: Send + Sync {
     fn apply(&self, account: &Account, op: &PendingOperation, messages: &[Message], labels: &[Label]) -> BoxFuture<'_, Result<(), ProviderError>>;
 
     /// Downloads one attachment's bytes.
+    /// The message as RFC 822 bytes, for "Save as .eml" and "View source". The default
+    /// rebuilds it from the stored headers and body.
+    fn fetch_raw(&self, _account: &Account, message: &Message) -> BoxFuture<'_, Result<Vec<u8>, ProviderError>> {
+        let bytes = message_to_raw(message);
+        Box::pin(async move { Ok(bytes) })
+    }
+
+    /// Searches the whole mailbox at the provider. Returns provider ids, newest first.
+    /// The default has no server-side search.
+    fn search(&self, _account: &Account, _query: &str, _limit: usize) -> BoxFuture<'_, Result<Vec<ProviderId>, ProviderError>> {
+        Box::pin(async { Ok(Vec::new()) })
+    }
+
     fn fetch_attachment(&self, _account: &Account, _message: &Message, _attachment: &Attachment) -> BoxFuture<'_, Result<Vec<u8>, ProviderError>> {
         Box::pin(async { Err(ProviderError::Rejected("this account cannot download attachments".into())) })
     }
@@ -145,4 +158,35 @@ pub fn backoff_seconds(attempt: u32) -> u64 {
         4 => 60,
         _ => 300,
     }
+}
+
+/// Rebuilds an RFC 822 message from what is stored locally. Used when the provider cannot
+/// hand back the original bytes.
+pub fn message_to_raw(message: &Message) -> Vec<u8> {
+    use lettre::message::header::ContentType;
+    use lettre::message::{Mailbox, MultiPart};
+    let mailbox = |a: &Address| -> Option<Mailbox> { a.email.parse().ok().map(|e| Mailbox::new(a.name.clone(), e)) };
+    let mut builder = lettre::Message::builder().subject(message.subject.clone()).date(std::time::UNIX_EPOCH + std::time::Duration::from_millis(message.date.max(0) as u64));
+    if let Some(from) = mailbox(&message.from) {
+        builder = builder.from(from);
+    }
+    for a in &message.to {
+        if let Some(m) = mailbox(a) {
+            builder = builder.to(m);
+        }
+    }
+    for a in &message.cc {
+        if let Some(m) = mailbox(a) {
+            builder = builder.cc(m);
+        }
+    }
+    if let Some(id) = &message.rfc_message_id {
+        builder = builder.message_id(Some(id.clone()));
+    }
+    let text = message.body.text.clone().unwrap_or_else(|| message.snippet.clone());
+    let built = match &message.body.html {
+        Some(html) => builder.multipart(MultiPart::alternative_plain_html(text, html.clone())),
+        None => builder.header(ContentType::TEXT_PLAIN).body(text),
+    };
+    built.map(|m| m.formatted()).unwrap_or_else(|_| format!("Subject: {}\n\n{}", message.subject, message.body.text.clone().unwrap_or_default()).into_bytes())
 }

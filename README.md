@@ -35,14 +35,18 @@ and you can read, search, write, and file mail with no connection at all.
 - **Focused Inbox.** The Inbox splits into Focused and Other from Gmail's own hints, who you write to, and
   your choices: *Move to Other*, or *Always move messages from this sender*. Local, private, and reversible.
 - **Reading that respects you.** Received HTML is sanitized before it is rendered; scripts never run and remote
-  images are blocked until you ask. Attachments download on click and open with your system apps.
+  images are blocked until you ask. Data tables keep their columns. Image attachments show thumbnails and open
+  in a quick look; everything else opens with your system apps. Every message has Reply, Forward, Print, Save
+  as .eml and View source, and long threads expand or collapse in one click.
 - **Writing.** New, reply, reply all, forward, with autosave to the device, recipient suggestions from people
   you have written to, attachments, and signatures per account. Formatting as you type: bold, italics, links,
   lists, quotes and code, styled live in the editor with the marks still visible, a Preview of exactly what
   recipients get, and the quoted original kept out of your way below the reply.
 - **A calendar, not an afterthought.** Day, Week, Month, and Agenda. Invitations with Accept, Tentative, and
-  Decline, from the calendar or from the email itself. Create, edit, and delete events. Reminders as desktop
-  notifications. Working hours shaded. Google's event colors.
+  Decline, from the calendar or from the email itself. Create, edit, and delete events, drag them to move or
+  resize, edit one occurrence of a repeating event or the whole series, invite guests and check whether they
+  are free, add a Google Meet link. Reminders as desktop notifications. Working hours shaded. Google's event
+  colors.
 - **Offline, properly.** Archive, star, move, reply, and send while disconnected; everything is queued in order
   and replayed when you are back. A visible Outbox says *Waiting for connection*; *Sent* appears only after
   Gmail accepts the message, and a dropped connection mid-send is reconciled before any retry so nothing is
@@ -144,7 +148,7 @@ in Google Cloud lifts that. The [native app guide](llm-docs/overlook-native-app.
 | <kbd>Ctrl</kbd>+<kbd>B</kbd> / <kbd>I</kbd> / <kbd>K</kbd> | Bold / italic / link while writing |
 | <kbd>Ctrl</kbd>+<kbd>Shift</kbd>+<kbd>8</kbd> / <kbd>7</kbd> / <kbd>9</kbd> | Bulleted list / numbered list / quote |
 | <kbd>Ctrl</kbd>+<kbd>Shift</kbd>+<kbd>P</kbd> | Preview the message |
-| <kbd>Ctrl</kbd>+<kbd>E</kbd> | Search |
+| <kbd>Ctrl</kbd>+<kbd>E</kbd> | Search this device, then Gmail |
 | <kbd>J</kbd> / <kbd>K</kbd> | Next / previous conversation |
 | <kbd>E</kbd> | Archive, or Move to Inbox when already archived |
 | <kbd>Delete</kbd> | Move to Trash |

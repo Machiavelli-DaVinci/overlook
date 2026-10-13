@@ -136,6 +136,18 @@ pub fn flatten_tables(html: &str) -> String {
             .take_while(|c| c.is_ascii_alphanumeric())
             .collect();
         let closing = lower.starts_with("</");
+        if name == "table" && !closing {
+            // A real data table (headers, or a consistent small grid of short cells) is kept
+            // for the view's table layout; layout tables fall through and are flattened.
+            if let Some(block_len) = table_block_len(tag_rest) {
+                let block = &tag_rest[..block_len];
+                if is_data_table(block) {
+                    out.push_str(block);
+                    rest = &tag_rest[block_len..];
+                    continue;
+                }
+            }
+        }
         match name.as_str() {
             "table" | "tbody" | "thead" | "tfoot" | "caption" => {
                 if name == "caption" {
@@ -176,6 +188,69 @@ pub fn flatten_tables(html: &str) -> String {
     }
     out.push_str(rest);
     out
+}
+
+/// Length of the `<table …>…</table>` element starting at `s`, nesting-aware.
+fn table_block_len(s: &str) -> Option<usize> {
+    let lower = s.to_ascii_lowercase();
+    let mut depth = 0usize;
+    let mut i = 0;
+    while let Some(off) = lower[i..].find("<table").or_else(|| lower[i..].find("</table")).map(|o| o) {
+        // Take whichever comes first.
+        let open = lower[i..].find("<table").map(|o| i + o);
+        let close = lower[i..].find("</table").map(|o| i + o);
+        let _ = off;
+        let (pos, is_open) = match (open, close) {
+            (Some(o), Some(c)) if o < c => (o, true),
+            (_, Some(c)) => (c, false),
+            (Some(o), None) => (o, true),
+            (None, None) => return None,
+        };
+        let end = lower[pos..].find('>').map(|e| pos + e + 1)?;
+        if is_open {
+            depth += 1;
+        } else {
+            depth = depth.checked_sub(1)?;
+            if depth == 0 {
+                return Some(end);
+            }
+        }
+        i = end;
+    }
+    None
+}
+
+/// Whether a table carries data rather than layout: it has header cells, or it is a small
+/// consistent grid of short texts with no nested tables or images.
+fn is_data_table(block: &str) -> bool {
+    let lower = block.to_ascii_lowercase();
+    if lower.matches("<table").count() > 1 || lower.contains("<img") {
+        return false;
+    }
+    let rows: Vec<&str> = lower.split("<tr").skip(1).collect();
+    if rows.len() < 2 {
+        return false;
+    }
+    let mut cell_counts = Vec::new();
+    let mut longest = 0usize;
+    let mut total = 0usize;
+    let mut cells = 0usize;
+    for row in &rows {
+        let n = row.matches("<td").count() + row.matches("<th").count();
+        cell_counts.push(n);
+        for cell in row.split("<td").chain(row.split("<th")).skip(1) {
+            let text = html_to_text(cell.split_once('>').map(|(_, t)| t).unwrap_or(""));
+            let len = text.trim().chars().count();
+            longest = longest.max(len);
+            total += len;
+            cells += 1;
+        }
+    }
+    let has_header = lower.contains("<th");
+    let first = cell_counts[0];
+    let consistent = first >= 2 && first <= 8 && cell_counts.iter().all(|&n| n == first || n == 0);
+    let short = cells > 0 && longest <= 160 && total / cells <= 60;
+    (has_header && consistent) || (consistent && short)
 }
 
 fn count_remote(html: &str) -> usize {
@@ -455,16 +530,27 @@ mod tests {
 
     #[test]
     fn tables_become_rows_with_gaps() {
+        // A header row makes it a data table, kept for the view's grid layout.
         let s = sanitize_html(
             "<table><tr><th>Area</th><th>Done</th></tr><tr><td>Design</td><td>5</td></tr></table>",
             RemoteContent::Blocked,
         );
-        assert_eq!(
-            s.html,
-            "<div><strong>Area</strong>\u{a0}\u{a0}\u{a0}\u{a0}<strong>Done</strong></div><div>Design\u{a0}\u{a0}\u{a0}\u{a0}5</div>"
-        );
-        let nested = sanitize_html("<table><tr><td><p>Hello</p><table><tr><td>a</td><td>b</td></tr></table></td></tr></table>", RemoteContent::Blocked);
-        assert_eq!(nested.html, "<div><p>Hello</p><div>a\u{a0}\u{a0}\u{a0}\u{a0}b</div></div>");
+        assert!(s.html.starts_with("<table>") && s.html.contains("<th>Area</th>"), "{}", s.html);
+        // Layout tables (nested, long prose) become block flow with gaps between cells.
+        let nested = sanitize_html("<table><tr><td><p>Hello there, this is a long paragraph of newsletter copy that runs on well past the length of any data cell and keeps going.</p><table><tr><td><p>Another long paragraph of copy inside the nested layout table that is also far too long for a data cell.</p></td><td>b</td></tr></table></td></tr></table>", RemoteContent::Blocked);
+        assert!(!nested.html.contains("<table"), "{}", nested.html);
+        assert!(nested.html.contains("<p>Hello there") && nested.html.contains("\u{a0}\u{a0}\u{a0}\u{a0}b"), "{}", nested.html);
+    }
+
+    #[test]
+    fn data_tables_are_kept_and_layout_tables_flattened() {
+        let invoice = r#"<table border="1"><thead><tr><th>Item</th><th>Qty</th></tr></thead><tbody><tr><td>Lamp</td><td>2</td></tr><tr><td>Cable</td><td>1</td></tr></tbody></table>"#;
+        let s = sanitize_html(invoice, RemoteContent::Blocked);
+        assert!(s.html.contains("<table") && s.html.contains("<th>Item</th>"), "{}", s.html);
+        let layout = r#"<table width="600"><tr><td><p>A long paragraph of newsletter copy that goes on and on and on and on and on and on, well past the length any data cell would ever have in a real table of figures.</p><table><tr><td>inner</td></tr></table></td></tr></table>"#;
+        let s = sanitize_html(layout, RemoteContent::Blocked);
+        assert!(!s.html.contains("<table"), "{}", s.html);
+        assert!(s.html.contains("inner"));
     }
 
     #[test]

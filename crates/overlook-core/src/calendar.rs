@@ -107,6 +107,13 @@ pub struct Event {
     pub color: Option<String>,
     /// Popup reminders in minutes before the start. `None` means use the calendar default.
     pub reminders: Option<Vec<i32>>,
+    /// For an instance of a recurring event: when it was originally scheduled, before any
+    /// move of this one occurrence. Splitting a series happens at this point.
+    #[serde(default)]
+    pub original_start: Option<Timestamp>,
+    /// Ask the provider to attach a video conference (Google Meet) when this is saved.
+    #[serde(default)]
+    pub wants_conference: bool,
     /// Set while a local change (RSVP, edit) is waiting to reach the provider.
     pub pending: bool,
 }
@@ -193,5 +200,37 @@ mod tests {
         let id = new_provider_event_id();
         assert_eq!(id.len(), 26);
         assert!(id.chars().all(|c| matches!(c, '0'..='9' | 'a'..='v')));
+    }
+}
+
+/// Which occurrences of a recurring event a change applies to.
+#[derive(Clone, Copy, Debug, PartialEq, Eq, Serialize, Deserialize, Default)]
+#[serde(rename_all = "kebab-case")]
+pub enum RecurrenceScope {
+    #[default]
+    This,
+    Following,
+    All,
+}
+
+impl RecurrenceScope {
+    pub fn label(self) -> &'static str {
+        match self {
+            RecurrenceScope::This => "This event",
+            RecurrenceScope::Following => "This and following events",
+            RecurrenceScope::All => "All events",
+        }
+    }
+}
+
+impl Event {
+    /// Whether this is one occurrence of a repeating event.
+    pub fn is_recurring_instance(&self) -> bool {
+        self.recurring_event_id.is_some()
+    }
+
+    /// The moment a "this and following" split happens at.
+    pub fn split_point(&self) -> Timestamp {
+        self.original_start.unwrap_or(self.start)
     }
 }

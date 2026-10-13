@@ -190,6 +190,24 @@ impl MailProvider for GmailProvider {
         })
     }
 
+    fn fetch_raw(&self, _account: &Account, message: &Message) -> BoxFuture<'_, Result<Vec<u8>, ProviderError>> {
+        let fallback = crate::message_to_raw(message);
+        let id = message.provider_id.clone();
+        Box::pin(async move {
+            let Some(id) = id else { return Ok(fallback) };
+            let v = self.client.get(&format!("messages/{}", id.0), &[("format", "raw")])?;
+            Ok(v.get("raw").and_then(|r| r.as_str()).map(mapping::base64url_decode).filter(|b| !b.is_empty()).unwrap_or(fallback))
+        })
+    }
+
+    fn search(&self, _account: &Account, query: &str, limit: usize) -> BoxFuture<'_, Result<Vec<ProviderId>, ProviderError>> {
+        let query = query.to_owned();
+        Box::pin(async move {
+            let ids = self.list_ids(&query, limit)?;
+            Ok(ids.into_iter().map(ProviderId).collect())
+        })
+    }
+
     fn fetch_messages(&self, account: &Account, ids: &[ProviderId], labels: &[Label]) -> BoxFuture<'_, Result<Vec<Message>, ProviderError>> {
         let account = account.clone();
         let ids: Vec<String> = ids.iter().map(|p| p.0.clone()).collect();

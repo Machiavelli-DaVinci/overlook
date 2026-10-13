@@ -241,6 +241,16 @@ impl Attachment {
         self.content_id.is_some() && self.mime_type.starts_with("image/")
     }
 
+    /// An image the reader can show itself (thumbnail and quick look).
+    pub fn is_image(&self) -> bool {
+        let mime = self.mime_type.split(';').next().unwrap_or("").trim().to_ascii_lowercase();
+        if matches!(mime.as_str(), "image/png" | "image/jpeg" | "image/jpg" | "image/gif" | "image/webp" | "image/bmp") {
+            return true;
+        }
+        let ext = self.filename.rsplit('.').next().unwrap_or("").to_ascii_lowercase();
+        matches!(ext.as_str(), "png" | "jpg" | "jpeg" | "gif" | "webp" | "bmp")
+    }
+
     pub fn is_downloaded(&self) -> bool {
         self.local_path.is_some()
     }

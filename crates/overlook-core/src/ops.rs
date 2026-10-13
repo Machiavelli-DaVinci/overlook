@@ -28,10 +28,25 @@ pub enum OperationKind {
     RespondToEvent { event_id: EventId, response: crate::calendar::ResponseStatus },
     /// Create an event that exists locally.
     CreateEvent { event_id: EventId },
-    /// Push local edits of an event.
-    UpdateEvent { event_id: EventId },
-    /// Delete an event (provider id kept so the row can already be gone locally).
-    DeleteEvent { event_id: EventId, calendar_id: CalendarId, provider_id: Option<ProviderId> },
+    /// Push local edits of an event; `scope` widens it to the series.
+    UpdateEvent {
+        event_id: EventId,
+        #[serde(default)]
+        scope: crate::calendar::RecurrenceScope,
+    },
+    /// Delete an event (provider id kept so the row can already be gone locally). For a
+    /// series the master id and the split point travel with the operation.
+    DeleteEvent {
+        event_id: EventId,
+        calendar_id: CalendarId,
+        provider_id: Option<ProviderId>,
+        #[serde(default)]
+        scope: crate::calendar::RecurrenceScope,
+        #[serde(default)]
+        recurring_event_id: Option<String>,
+        #[serde(default)]
+        original_start: Option<Timestamp>,
+    },
 }
 
 impl OperationKind {
@@ -67,7 +82,7 @@ impl OperationKind {
 
     pub fn event_id(&self) -> Option<&EventId> {
         match self {
-            OperationKind::RespondToEvent { event_id, .. } | OperationKind::CreateEvent { event_id } | OperationKind::UpdateEvent { event_id } | OperationKind::DeleteEvent { event_id, .. } => Some(event_id),
+            OperationKind::RespondToEvent { event_id, .. } | OperationKind::CreateEvent { event_id } | OperationKind::UpdateEvent { event_id, .. } | OperationKind::DeleteEvent { event_id, .. } => Some(event_id),
             _ => None,
         }
     }

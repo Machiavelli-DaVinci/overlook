@@ -583,15 +583,76 @@ impl Store {
 
     /// Removes an event locally and queues its deletion.
     pub fn delete_event_locally(&self, account: &AccountId, event: &Event) -> Result<PendingOperation> {
+        self.delete_event_locally_scoped(account, event, RecurrenceScope::This)
+    }
+
+    /// The local occurrences of `event`'s series that `scope` covers, `event` included.
+    fn series_members_tx(tx: &Connection, account: &AccountId, event: &Event, scope: RecurrenceScope) -> Result<Vec<Event>> {
+        let Some(master) = event.recurring_event_id.as_deref().filter(|_| scope != RecurrenceScope::This) else { return Ok(vec![event.clone()]) };
+        let mut members = load_events(tx, "WHERE e.account_id=?1 AND e.recurring_event_id=?2 ORDER BY e.start", params![account.0, master])?;
+        if scope == RecurrenceScope::Following {
+            let split = event.split_point();
+            members.retain(|m| m.id == event.id || m.split_point() >= split);
+        }
+        if !members.iter().any(|m| m.id == event.id) {
+            members.push(event.clone());
+        }
+        Ok(members)
+    }
+
+    /// Removes an event, or the part of its series `scope` names, and queues one deletion.
+    pub fn delete_event_locally_scoped(&self, account: &AccountId, event: &Event, scope: RecurrenceScope) -> Result<PendingOperation> {
         let ts = now();
         self.with_tx(|tx| {
-            tx.execute("DELETE FROM events WHERE id=?1", [&event.id.0])?;
+            for member in Self::series_members_tx(tx, account, event, scope)? {
+                tx.execute("DELETE FROM events WHERE id=?1", [&member.id.0])?;
+            }
             insert_operation_tx(
                 tx,
                 account,
-                OperationKind::DeleteEvent { event_id: event.id.clone(), calendar_id: event.calendar_id.clone(), provider_id: event.provider_id.clone() },
+                OperationKind::DeleteEvent {
+                    event_id: event.id.clone(),
+                    calendar_id: event.calendar_id.clone(),
+                    provider_id: event.provider_id.clone(),
+                    scope,
+                    recurring_event_id: event.recurring_event_id.clone(),
+                    original_start: Some(event.split_point()),
+                },
                 ts,
             )
+        })
+    }
+
+    /// Saves an edited occurrence and, for a wider scope, applies the same edit to the other
+    /// local occurrences the scope covers: texts and settings as given, times shifted by the
+    /// same amount, with the duration of the edited one. One operation carries the scope.
+    pub fn apply_series_change(&self, account: &AccountId, event: &Event, scope: RecurrenceScope) -> Result<PendingOperation> {
+        let ts = now();
+        let before = self.event(&event.id)?;
+        let delta = before.as_ref().map(|b| event.start - b.start).unwrap_or(0);
+        let duration = event.end - event.start;
+        self.with_tx(|tx| {
+            let members = before.as_ref().map(|b| Self::series_members_tx(tx, account, b, scope)).transpose()?.unwrap_or_default();
+            for member in members {
+                if member.id == event.id {
+                    continue;
+                }
+                let mut m = member;
+                m.summary = event.summary.clone();
+                m.description = event.description.clone();
+                m.location = event.location.clone();
+                m.color = event.color.clone();
+                m.reminders = event.reminders.clone();
+                m.attendees = event.attendees.clone();
+                m.wants_conference = event.wants_conference;
+                m.start += delta;
+                m.end = m.start + duration;
+                m.all_day = event.all_day;
+                m.updated = ts;
+                upsert_event_tx(tx, &m)?;
+            }
+            upsert_event_tx(tx, event)?;
+            insert_operation_tx(tx, account, OperationKind::UpdateEvent { event_id: event.id.clone(), scope }, ts)
         })
     }
 
@@ -1022,13 +1083,14 @@ fn upsert_message_tx(tx: &Connection, m: &Message) -> Result<()> {
 fn upsert_event_tx(tx: &Connection, e: &Event) -> Result<()> {
     tx.execute(
         "INSERT INTO events(id, account_id, calendar_id, provider_id, ical_uid, summary, description, location, start, end, all_day, status,
-            organizer_json, attendees_json, html_link, conference_url, recurring_event_id, updated, event_type, color, reminders_json)
-         VALUES(?1,?2,?3,?4,?5,?6,?7,?8,?9,?10,?11,?12,?13,?14,?15,?16,?17,?18,?19,?20,?21)
+            organizer_json, attendees_json, html_link, conference_url, recurring_event_id, updated, event_type, color, reminders_json, original_start, wants_conference)
+         VALUES(?1,?2,?3,?4,?5,?6,?7,?8,?9,?10,?11,?12,?13,?14,?15,?16,?17,?18,?19,?20,?21,?22,?23)
          ON CONFLICT(id) DO UPDATE SET calendar_id=excluded.calendar_id, provider_id=excluded.provider_id, ical_uid=excluded.ical_uid,
             summary=excluded.summary, description=excluded.description, location=excluded.location, start=excluded.start, end=excluded.end,
             all_day=excluded.all_day, status=excluded.status, organizer_json=excluded.organizer_json, attendees_json=excluded.attendees_json,
             html_link=excluded.html_link, conference_url=excluded.conference_url, recurring_event_id=excluded.recurring_event_id, updated=excluded.updated,
-            event_type=excluded.event_type, color=excluded.color, reminders_json=excluded.reminders_json",
+            event_type=excluded.event_type, color=excluded.color, reminders_json=excluded.reminders_json,
+            original_start=excluded.original_start, wants_conference=excluded.wants_conference",
         params![
             e.id.0,
             e.account_id.0,
@@ -1051,6 +1113,8 @@ fn upsert_event_tx(tx: &Connection, e: &Event) -> Result<()> {
             e.event_type,
             e.color,
             e.reminders.as_ref().map(serde_json::to_string).transpose()?,
+            e.original_start,
+            e.wants_conference,
         ],
     )?;
     Ok(())
@@ -1059,7 +1123,8 @@ fn upsert_event_tx(tx: &Connection, e: &Event) -> Result<()> {
 fn load_events(c: &Connection, clause: &str, args: impl rusqlite::Params) -> Result<Vec<Event>> {
     let sql = format!(
         "SELECT e.id, e.account_id, e.calendar_id, e.provider_id, e.ical_uid, e.summary, e.description, e.location, e.start, e.end, e.all_day, e.status,
-                e.organizer_json, e.attendees_json, e.html_link, e.conference_url, e.recurring_event_id, e.updated, e.event_type, e.color, e.reminders_json FROM events e {clause}"
+                e.organizer_json, e.attendees_json, e.html_link, e.conference_url, e.recurring_event_id, e.updated, e.event_type, e.color, e.reminders_json,
+                e.original_start, e.wants_conference FROM events e {clause}"
     );
     let mut stmt = c.prepare(&sql)?;
     let rows = stmt.query_map(args, |r| {
@@ -1085,11 +1150,12 @@ fn load_events(c: &Connection, clause: &str, args: impl rusqlite::Params) -> Res
             r.get::<_, Option<String>>(18)?,
             r.get::<_, Option<String>>(19)?,
             r.get::<_, Option<String>>(20)?,
+            (r.get::<_, Option<i64>>(21)?, r.get::<_, i64>(22)? != 0),
         ))
     })?;
     let mut out = Vec::new();
     for row in rows {
-        let (id, account, calendar, provider, ical, summary, description, location, start, end, all_day, status, organizer, attendees, link, conf, recurring, updated, event_type, color, reminders) = row?;
+        let (id, account, calendar, provider, ical, summary, description, location, start, end, all_day, status, organizer, attendees, link, conf, recurring, updated, event_type, color, reminders, (original_start, wants_conference)) = row?;
         out.push(Event {
             id: EventId(id),
             account_id: AccountId(account),
@@ -1112,6 +1178,8 @@ fn load_events(c: &Connection, clause: &str, args: impl rusqlite::Params) -> Res
             event_type,
             color,
             reminders: reminders.as_deref().map(serde_json::from_str).transpose()?,
+            original_start,
+            wants_conference,
             pending: false,
         });
     }
@@ -1722,6 +1790,39 @@ mod tests {
     }
 
     #[test]
+    fn series_edits_and_deletes_follow_the_scope() {
+        let store = Store::open_in_memory().unwrap();
+        let acct = AccountId::from("acct");
+        store.upsert_account(&Account { id: acct.clone(), provider: ProviderKind::Sample, display_name: "Me".into(), email: "me@example.com".into(), created_at: 0 }).unwrap();
+        let cal = Calendar { id: CalendarId::from("acct:cal"), account_id: acct.clone(), provider_id: None, name: "Cal".into(), color: None, is_primary: true, can_edit: true, visible: true, sort_order: 0, default_reminders: vec![] };
+        store.replace_calendars(&acct, &[cal.clone()]).unwrap();
+        let day = 86_400_000;
+        let instance = |n: i64| Event {
+            id: EventId(format!("acct:cal:m_{n}")), account_id: acct.clone(), calendar_id: cal.id.clone(), provider_id: Some(ProviderId(format!("m_{n}"))), ical_uid: None,
+            summary: "Standup".into(), description: None, location: None, start: n * day + 9 * 3_600_000, end: n * day + 9 * 3_600_000 + 1_800_000, all_day: false,
+            status: EventStatus::Confirmed, organizer: None, attendees: vec![], html_link: None, conference_url: None, recurring_event_id: Some("m".into()), updated: 0,
+            event_type: None, color: None, reminders: None, original_start: Some(n * day + 9 * 3_600_000), wants_conference: false, pending: false,
+        };
+        store.upsert_events(&[instance(1), instance(2), instance(3), instance(4)]).unwrap();
+        // Rename and shift the third one by an hour, for it and everything after.
+        let mut edited = instance(3);
+        edited.summary = "Sync".into();
+        edited.start += 3_600_000;
+        edited.end += 3_600_000;
+        let op = store.apply_series_change(&acct, &edited, RecurrenceScope::Following).unwrap();
+        assert!(matches!(op.kind, OperationKind::UpdateEvent { scope: RecurrenceScope::Following, .. }));
+        let all = store.events_between(&acct, 0, 10 * day).unwrap();
+        let by = |n: i64| all.iter().find(|e| e.provider_id.as_ref().unwrap().0 == format!("m_{n}")).unwrap().clone();
+        assert_eq!(by(2).summary, "Standup");
+        assert_eq!(by(4).summary, "Sync");
+        assert_eq!(by(4).start, instance(4).start + 3_600_000);
+        // Delete all: every occurrence goes, one operation carries the series id.
+        let op = store.delete_event_locally_scoped(&acct, &by(2), RecurrenceScope::All).unwrap();
+        assert!(matches!(op.kind, OperationKind::DeleteEvent { scope: RecurrenceScope::All, recurring_event_id: Some(_), .. }));
+        assert!(store.events_between(&acct, 0, 10 * day).unwrap().is_empty());
+    }
+
+    #[test]
     fn calendar_round_trip_and_pending_flags() {
         let store = Store::open_in_memory().unwrap();
         seeded(&store);
@@ -1767,6 +1868,8 @@ mod tests {
             event_type: None,
             color: None,
             reminders: None,
+            original_start: None,
+            wants_conference: false,
             pending: false,
         };
         store.upsert_events(&[event.clone()]).unwrap();

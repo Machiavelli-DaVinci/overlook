@@ -152,6 +152,18 @@ pub enum AfterDownload {
     SaveTo(PathBuf),
     /// An inline image: the reader picks it up on the next render.
     Inline,
+    /// Show the image in the quick look overlay.
+    QuickLook,
+}
+
+/// The server-side part of a search.
+#[derive(Clone, Debug, PartialEq, Eq)]
+pub enum OnlineSearch {
+    Idle,
+    Searching,
+    Done { added: usize },
+    Offline,
+    Failed(String),
 }
 
 /// A conversation being dragged from the list onto the sidebar.
@@ -240,6 +252,9 @@ pub struct MailWindow {
     search_input: Entity<InputState>,
     search_query: String,
     search_coverage: String,
+    /// The server-side half of a search: bumped per query so stale results are dropped.
+    search_generation: u64,
+    online_search: OnlineSearch,
 
     labels: Vec<Label>,
     conversations: Vec<ConversationSummary>,
@@ -255,6 +270,8 @@ pub struct MailWindow {
     remote_allowed: BTreeSet<MessageId>,
     /// Messages whose quoted history is expanded.
     pub(crate) quotes_shown: BTreeSet<MessageId>,
+    /// An image attachment shown full size over the window.
+    pub(crate) quick_look: Option<Attachment>,
     /// Inline images already encoded as `data:` URLs, by attachment.
     pub(crate) inline_images: std::cell::RefCell<HashMap<AttachmentId, Option<String>>>,
 
@@ -283,6 +300,10 @@ pub struct MailWindow {
     pub(crate) cal_scrolled_for: std::cell::Cell<Option<(CalView, i64)>>,
     pub(crate) cal_focus: FocusHandle,
     pub(crate) new_event: Option<NewEvent>,
+    /// "This event / this and following / all" question pending for a repeating event.
+    pub(crate) cal_scope_prompt: Option<calendar::ScopePrompt>,
+    /// An event being dragged in the time grid.
+    pub(crate) cal_drag: Option<calendar::CalDrag>,
     pub(crate) reminders_enabled: bool,
     /// Reminders already shown this session: (event, minutes before).
     pub(crate) notified: HashSet<(EventId, i32)>,
@@ -392,6 +413,8 @@ impl MailWindow {
             search_input,
             search_query: String::new(),
             search_coverage: String::new(),
+            search_generation: 0,
+            online_search: OnlineSearch::Idle,
             labels: Vec::new(),
             conversations: Vec::new(),
             counts: HashMap::new(),
@@ -404,6 +427,7 @@ impl MailWindow {
             expanded: BTreeSet::new(),
             remote_allowed: BTreeSet::new(),
             quotes_shown: BTreeSet::new(),
+            quick_look: None,
             inline_images: std::cell::RefCell::new(HashMap::new()),
             composer: None,
             appearance,
@@ -425,6 +449,8 @@ impl MailWindow {
             cal_scrolled_for: std::cell::Cell::new(None),
             cal_focus: cx.focus_handle(),
             new_event: None,
+            cal_scope_prompt: None,
+            cal_drag: None,
             reminders_enabled,
             notified: HashSet::new(),
             update: UpdateState {
@@ -854,7 +880,7 @@ impl MailWindow {
         } else {
             self.search_results()
         };
-        self.search_coverage = self.store.search_coverage(&acct).map(|c| c.sentence()).unwrap_or_default();
+        self.search_coverage = self.search_coverage_line(&acct);
         let mut counts = HashMap::new();
         for view in [MailboxView::Kind(LabelKind::Inbox), MailboxView::Kind(LabelKind::Starred)]
             .into_iter()
@@ -900,12 +926,15 @@ impl MailWindow {
     /// Downloads the inline images of the open conversation that are not cached yet.
     fn fetch_inline_images(&mut self, window: &mut Window, cx: &mut Context<Self>) {
         const INLINE_LIMIT: u64 = 4 * 1024 * 1024;
+        // Inline images the body references, and attached images for their thumbnails.
         let wanted: Vec<Attachment> = self
             .thread
             .iter()
-            .filter(|m| m.body.html.as_deref().is_some_and(|h| h.contains("cid:")))
-            .flat_map(|m| m.attachments.iter().cloned())
-            .filter(|a| a.is_inline_image() && a.size_bytes <= INLINE_LIMIT && a.provider_id.is_some())
+            .flat_map(|m| {
+                let has_cid = m.body.html.as_deref().is_some_and(|h| h.contains("cid:"));
+                m.attachments.iter().filter(move |a| (has_cid && a.is_inline_image()) || a.is_image()).cloned()
+            })
+            .filter(|a| a.size_bytes <= INLINE_LIMIT && a.provider_id.is_some())
             .filter(|a| !a.local_path.as_deref().map(PathBuf::from).is_some_and(|p| p.exists()))
             .collect();
         for att in wanted {
@@ -995,11 +1024,95 @@ impl MailWindow {
     // -------------------------------------------------------------- attachments
 
     pub(crate) fn open_attachment(&mut self, attachment: Attachment, window: &mut Window, cx: &mut Context<Self>) {
-        if let Some(path) = attachment.local_path.as_deref().map(PathBuf::from).filter(|p| p.exists()) {
+        let downloaded = attachment.local_path.as_deref().map(PathBuf::from).filter(|p| p.exists());
+        if attachment.is_image() {
+            match downloaded {
+                Some(_) => {
+                    self.quick_look = Some(attachment);
+                    cx.notify();
+                }
+                None => self.download_attachment(attachment, AfterDownload::QuickLook, window, cx),
+            }
+            return;
+        }
+        if let Some(path) = downloaded {
             cx.open_with_system(&path);
             return;
         }
         self.download_attachment(attachment, AfterDownload::Open, window, cx);
+    }
+
+    /// The original message bytes, from the provider when it has them.
+    fn with_raw_message(&mut self, message: Message, window: &mut Window, cx: &mut Context<Self>, then: impl FnOnce(&mut Self, Vec<u8>, &mut Window, &mut Context<Self>) + 'static) {
+        let provider = self.providers.get(&self.account.id).map(|p| p.mail.clone());
+        let account = self.account.clone();
+        cx.spawn_in(window, async move |this, cx| {
+            let fallback = overlook_provider::message_to_raw(&message);
+            let bytes = match provider {
+                Some(p) => cx.background_spawn(async move { p.fetch_raw(&account, &message).await }).await.unwrap_or(fallback),
+                None => fallback,
+            };
+            let _ = this.update_in(cx, |this, window, cx| then(this, bytes, window, cx));
+        })
+        .detach();
+    }
+
+    fn safe_file_stem(subject: &str) -> String {
+        let stem: String = subject.chars().map(|c| if c.is_alphanumeric() || c == ' ' || c == '-' || c == '_' { c } else { ' ' }).collect();
+        let stem = stem.split_whitespace().collect::<Vec<_>>().join(" ");
+        if stem.is_empty() { "message".to_owned() } else { stem.chars().take(80).collect() }
+    }
+
+    pub(crate) fn save_message_eml(&mut self, message: Message, window: &mut Window, cx: &mut Context<Self>) {
+        let downloads = directories::UserDirs::new().and_then(|u| u.download_dir().map(|p| p.to_path_buf())).unwrap_or_else(|| PathBuf::from("."));
+        let name = format!("{}.eml", Self::safe_file_stem(&message.subject));
+        let receiver = cx.prompt_for_new_path(&downloads, Some(&name));
+        cx.spawn_in(window, async move |this, cx| {
+            let Ok(Ok(Some(target))) = receiver.await else { return };
+            let _ = this.update_in(cx, |this, window, cx| {
+                this.with_raw_message(message, window, cx, move |_this, bytes, window, cx| match std::fs::write(&target, &bytes) {
+                    Ok(()) => window.push_notification(Notification::success(format!("Saved to {}", target.display())), cx),
+                    Err(e) => window.push_notification(Notification::error(format!("Couldn’t save the message: {e}")), cx),
+                });
+            });
+        })
+        .detach();
+    }
+
+    pub(crate) fn view_message_source(&mut self, message: Message, window: &mut Window, cx: &mut Context<Self>) {
+        let dir = crate::updater::cache_dir().join("source");
+        let path = dir.join(format!("{}.eml", message.id.as_str().replace([':', '/'], "_")));
+        self.with_raw_message(message, window, cx, move |_this, bytes, window, cx| {
+            if let Err(e) = std::fs::create_dir_all(&dir).and_then(|_| std::fs::write(&path, &bytes)) {
+                window.push_notification(Notification::error(format!("Couldn’t write the source: {e}")), cx);
+                return;
+            }
+            cx.open_with_system(&path);
+        });
+    }
+
+    /// Writes a printable page for the message and opens it in the browser, which prints.
+    pub(crate) fn print_message(&mut self, message: Message, window: &mut Window, cx: &mut Context<Self>) {
+        use overlook_core::sanitize::{escape_html, sanitize_html, text_to_html, RemoteContent};
+        let body = match (&message.body.html, &message.body.text) {
+            (Some(h), _) => sanitize_html(h, RemoteContent::Allowed).html,
+            (None, Some(t)) => text_to_html(t),
+            (None, None) => String::new(),
+        };
+        let to = message.to.iter().map(Address::to_header).collect::<Vec<_>>().join(", ");
+        let page = format!(
+            "<!DOCTYPE html><html><head><meta charset=\"utf-8\"><title>{subject}</title><style>body{{font:15px/1.5 -apple-system,Segoe UI,Inter,sans-serif;color:#111;max-width:760px;margin:40px auto;padding:0 24px}}.h{{border-bottom:1px solid #ccc;padding-bottom:12px;margin-bottom:20px;font-size:13px;color:#444}}.h b{{color:#111}}h1{{font-size:22px;margin:0 0 12px}}blockquote{{margin:0 0 0 .8ex;border-left:2px solid #ccc;padding-left:1ex;color:#555}}table{{border-collapse:collapse}}td,th{{border:1px solid #ddd;padding:4px 8px}}@media print{{body{{margin:0}}}}</style></head><body><h1>{subject}</h1><div class=\"h\"><div><b>From:</b> {from}</div><div><b>To:</b> {to}</div><div><b>Date:</b> {date}</div></div>{body}<script>window.print()</script></body></html>",
+            subject = escape_html(&message.subject),
+            from = escape_html(&message.from.to_header()),
+            to = escape_html(&to),
+            date = escape_html(&overlook_core::time::format_full(message.date, self.utc_offset)),
+        );
+        let dir = crate::updater::cache_dir().join("print");
+        let path = dir.join(format!("{}.html", message.id.as_str().replace([':', '/'], "_")));
+        match std::fs::create_dir_all(&dir).and_then(|_| std::fs::write(&path, page)) {
+            Ok(()) => cx.open_with_system(&path),
+            Err(e) => window.push_notification(Notification::error(format!("Couldn’t prepare the page: {e}")), cx),
+        }
     }
 
     pub(crate) fn save_attachment(&mut self, attachment: Attachment, window: &mut Window, cx: &mut Context<Self>) {
@@ -1066,6 +1179,11 @@ impl MailWindow {
                             AfterDownload::Open => cx.open_with_system(&path),
                             AfterDownload::SaveTo(target) => this.finish_save(&path, &target, window, cx),
                             AfterDownload::Inline => {}
+                            AfterDownload::QuickLook => {
+                                let mut a = attachment.clone();
+                                a.local_path = Some(path.to_string_lossy().into_owned());
+                                this.quick_look = Some(a);
+                            }
                         }
                     }
                     Err(e) => window.push_notification(Notification::error(format!("Couldn’t download {}: {e}", attachment.filename)), cx),
@@ -1110,14 +1228,97 @@ impl MailWindow {
         self.list_focus.focus(window, cx);
     }
 
-    fn set_search(&mut self, query: String, _window: &mut Window, cx: &mut Context<Self>) {
+    fn set_search(&mut self, query: String, window: &mut Window, cx: &mut Context<Self>) {
         self.search_query = query;
+        self.search_generation += 1;
+        self.online_search = OnlineSearch::Idle;
         self.reload(cx);
         if !self.search_query.is_empty() && self.selected_summary().is_none() {
             self.selected = self.conversations.first().map(|c| c.id.clone());
             self.load_thread();
         }
+        self.start_online_search(window, cx);
         cx.notify();
+    }
+
+    /// What the search covered, for the line above the results.
+    fn search_coverage_line(&self, acct: &AccountId) -> String {
+        let local = self.store.search_coverage(acct).map(|c| c.sentence()).unwrap_or_default();
+        let provider = if self.is_sample(acct) { "the sample server" } else { "Gmail" };
+        let online = match &self.online_search {
+            OnlineSearch::Idle => String::new(),
+            OnlineSearch::Searching => format!(" · Searching {provider}…"),
+            OnlineSearch::Done { added: 0 } => format!(" · {provider} has nothing more."),
+            OnlineSearch::Done { added } => format!(" · {added} more from {provider}."),
+            OnlineSearch::Offline => format!(" · Offline, so {provider} was not searched."),
+            OnlineSearch::Failed(e) => format!(" · {provider} search failed: {e}"),
+        };
+        format!("{local}{online}")
+    }
+
+    /// Asks the provider for matches beyond what is on this device and downloads the ones
+    /// that are missing, after a short pause so every keystroke does not become a request.
+    fn start_online_search(&mut self, window: &mut Window, cx: &mut Context<Self>) {
+        let query = self.search_query.trim().to_owned();
+        if query.chars().count() < 2 {
+            return;
+        }
+        let generation = self.search_generation;
+        let acct = self.account.id.clone();
+        if !self.connected(&acct) {
+            self.online_search = OnlineSearch::Offline;
+            self.search_coverage = self.search_coverage_line(&acct);
+            return;
+        }
+        let Some(provider) = self.providers.get(&acct).map(|p| p.mail.clone()) else { return };
+        let account = self.account.clone();
+        let store = self.store.clone();
+        let labels = self.labels.clone();
+        cx.spawn_in(window, async move |this, cx| {
+            cx.background_executor().timer(Duration::from_millis(450)).await;
+            let still_current = this.update(cx, |this, cx| {
+                if this.search_generation != generation {
+                    return false;
+                }
+                this.online_search = OnlineSearch::Searching;
+                this.search_coverage = this.search_coverage_line(&this.account.id.clone());
+                cx.notify();
+                true
+            });
+            if !matches!(still_current, Ok(true)) {
+                return;
+            }
+            let result = cx
+                .background_spawn(async move {
+                    const FETCH_LIMIT: usize = 25;
+                    let ids = provider.search(&account, &query, 60).await?;
+                    let missing: Vec<ProviderId> = ids
+                        .into_iter()
+                        .filter(|pid| store.message(&MessageId(format!("{}:{}", account.id.0, pid.0))).ok().flatten().is_none())
+                        .take(FETCH_LIMIT)
+                        .collect();
+                    if missing.is_empty() {
+                        return Ok::<usize, overlook_provider::ProviderError>(0);
+                    }
+                    let messages = provider.fetch_messages(&account, &missing, &labels).await?;
+                    let protected = store.pending_message_ids(&account.id).unwrap_or_default();
+                    store.merge_remote_messages(&messages, &protected).map_err(|e| overlook_provider::ProviderError::Temporary(e.to_string()))?;
+                    Ok(messages.len())
+                })
+                .await;
+            let _ = this.update(cx, |this, cx| {
+                if this.search_generation != generation {
+                    return;
+                }
+                this.online_search = match result {
+                    Ok(added) => OnlineSearch::Done { added },
+                    Err(overlook_provider::ProviderError::Offline) => OnlineSearch::Offline,
+                    Err(e) => OnlineSearch::Failed(e.to_string()),
+                };
+                this.reload(cx);
+            });
+        })
+        .detach();
     }
 
     fn select_conversation(&mut self, id: Option<ConversationId>, window: &mut Window, cx: &mut Context<Self>) {
@@ -1356,6 +1557,11 @@ impl MailWindow {
 
     pub(crate) fn reply(&mut self, kind: DraftKind, window: &mut Window, cx: &mut Context<Self>) {
         let Some(source) = self.thread.iter().max_by_key(|m| m.date).cloned() else { return };
+        self.reply_to(kind, source, window, cx);
+    }
+
+    /// Replies to or forwards one particular message of the conversation.
+    pub(crate) fn reply_to(&mut self, kind: DraftKind, source: Message, window: &mut Window, cx: &mut Context<Self>) {
         let mut draft = Draft::in_response_to_with(self.account.id.clone(), kind, &source, &self.owner(), now(), self.prefs.quote_on_reply);
         // The quoted original is appended at send time and shown collapsed under the editor;
         // the body starts with two blank lines for the reply and the signature below them.
@@ -1555,7 +1761,10 @@ impl MailWindow {
         });
     }
     fn on_escape(&mut self, _: &Escape, window: &mut Window, cx: &mut Context<Self>) {
-        if self.settings.is_some() {
+        if self.quick_look.is_some() {
+            self.quick_look = None;
+            cx.notify();
+        } else if self.settings.is_some() {
             self.close_settings(window, cx);
         } else if self.composer.is_some() {
             self.close_composer(window, cx);
@@ -2207,5 +2416,6 @@ impl Render for MailWindow {
             .child(div().flex_1().min_h_0().child(self.render_body(cx)))
             .child(self.render_status_bar(cx))
             .when(self.settings.is_some(), |d| d.child(self.render_settings(cx)))
+            .when(self.quick_look.is_some(), |d| d.child(self.render_quick_look(cx)))
     }
 }

@@ -57,6 +57,30 @@ Google Calendar on the same OAuth client, with the `calendar.events` and `calend
 
 Signatures are appended with a blank line when composing, and above the quoted original in replies. Not yet: multiple signatures per account, automatic replies (needs the `gmail.settings.basic` scope), rules and sweep, and rich-text signatures.
 
+## Search
+
+Typing in the search field runs the local FTS5 query at once and, after 450 ms without further typing,
+asks the provider too (`MailProvider::search`, Gmail's `users.messages.list?q=`). Up to 25 matches that
+are not on this device are downloaded and merged; the line above the results says what was covered:
+"Searching N downloaded messages on this device · 25 more from Gmail" (or "Searching Gmail…", "Offline, so
+Gmail was not searched", or the failure). A generation counter drops results of a superseded query.
+
+## Reader
+
+The conversation header has Expand all / Collapse all when there is more than one message. An expanded
+message has a ⋯ menu: Reply, Reply all, Forward (this message, not the latest), Mark as read/unread, Print
+(a standalone HTML page in `~/.cache/overlook/print/` opened in the browser, which prints), Save as .eml and
+View source (both from `MailProvider::fetch_raw`, Gmail's `format=raw`, with a rebuilt message as fallback).
+Clicking an expanded message's header collapses it, except the latest.
+
+Image attachments (`Attachment::is_image`) are downloaded with the open conversation (up to 4 MB each) and
+shown as thumbnails on their cards; clicking one opens a quick look over the window with Open, Save as and
+Esc. Other attachments open with the system application as before.
+
+Data tables survive the HTML flattening: `sanitize::is_data_table` keeps a table that has header cells or is
+a consistent grid of 2 to 8 short columns without nested tables or images, and the view lays it out as a
+grid (the vendored parser now keeps empty cells so columns stay aligned). Layout tables are still flattened.
+
 ## Composer
 
 The body is Markdown-flavoured text edited in the kit's code-editor state (`EditorState`, language
@@ -113,6 +137,22 @@ colors, hidden junk and tracking, forwarded message, long paragraphs); all rende
 remaining gaps: data tables are flattened rather than laid out as a grid; `sup`/`sub` are shown
 inline; styles and colors from the mail are ignored by design.
 
+### Repeating events, drag, guests
+
+- A repeating occurrence carries `recurring_event_id` and `original_start`. Edit and Delete on one ask for a
+  scope: this event, this and following, or all (`RecurrenceScope`, `cal_scope_prompt`). The store applies
+  the edit to the local occurrences the scope covers (`apply_series_change`, `delete_event_locally_scoped`)
+  and queues one operation with the scope. Google: "all" patches the master with the series' times shifted
+  by the same amount; "following" ends the master's RRULE with `UNTIL` just before the occurrence and creates
+  a new series from it (`recurrence_until`, `recurrence_for_split`; a COUNT is dropped because it no longer
+  adds up). The next incremental sync brings every instance back from Google.
+- In Day and Week, a block can be dragged to another time or day and its bottom edge dragged to change the end
+  (`CalDrag`, 15-minute snapping, saved as an ordinary update of that occurrence).
+- The event editor has Guests (comma-separated addresses; known guests keep their responses, the owner is
+  added as organizer), Check availability (`CalendarProvider::free_busy`, Google's `freeBusy`), and Add a
+  Google Meet link (`wants_conference` → `conferenceData.createRequest` with `conferenceDataVersion=1`).
+  Rooms are Workspace resource calendars and are not offered; a personal Gmail account has none.
+
 ## Gmail
 
 1. Create a Google Cloud OAuth client of type **Desktop app** with the Gmail API enabled and the scopes `gmail.modify`, `gmail.send`, `openid`, `userinfo.email` on the consent screen (Testing mode with test users is fine for development; restricted-scope verification is needed for public release).
@@ -142,7 +182,7 @@ Keyboard additions: `Ctrl 1` Mail, `Ctrl 2` Calendar, `Ctrl Shift A` new event; 
 cargo test --workspace
 ```
 
-79 tests cover: appearance resolution (Follow system is not a third theme), recipient parsing, conversation summaries, reply/forward drafts, HTML sanitization and remote-image blocking, local time formatting, PKCE/OAuth request building, the sample provider, store durability across reopen, atomic change+operation (a failing change leaves no operation), Outbox queue/cancel, send completion, FTS search and coverage, settings, and the sync engine (offline leaves work queued; ordered replay; uncertain send reconciled without duplicates; cancelled send never sent).
+83 tests cover: appearance resolution (Follow system is not a third theme), recipient parsing, conversation summaries, reply/forward drafts, HTML sanitization and remote-image blocking, local time formatting, PKCE/OAuth request building, the sample provider, store durability across reopen, atomic change+operation (a failing change leaves no operation), Outbox queue/cancel, send completion, FTS search and coverage, settings, and the sync engine (offline leaves work queued; ordered replay; uncertain send reconciled without duplicates; cancelled send never sent).
 
 The manual scenario used to validate the shell (keyboard only, with `wtype` on Hyprland):
 

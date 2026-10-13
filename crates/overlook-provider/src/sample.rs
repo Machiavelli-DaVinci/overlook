@@ -113,6 +113,26 @@ impl MailProvider for SampleProvider {
         })
     }
 
+    fn search(&self, account: &Account, query: &str, limit: usize) -> BoxFuture<'_, Result<Vec<ProviderId>, ProviderError>> {
+        let account = account.clone();
+        let needle = query.to_ascii_lowercase();
+        Box::pin(async move {
+            self.require_online()?;
+            self.sleep().await;
+            let snapshot = sample_mailbox(&account, overlook_core::time::now());
+            let mut hits: Vec<&Message> = snapshot
+                .messages
+                .iter()
+                .filter(|m| {
+                    let hay = format!("{} {} {} {}", m.subject, m.from.email, m.from.name.clone().unwrap_or_default(), m.body.text.clone().unwrap_or_default()).to_ascii_lowercase();
+                    needle.split_whitespace().all(|w| hay.contains(w))
+                })
+                .collect();
+            hits.sort_by_key(|m| std::cmp::Reverse(m.date));
+            Ok(hits.into_iter().filter_map(|m| m.provider_id.clone()).take(limit).collect())
+        })
+    }
+
     fn fetch_changes(&self, _account: &Account, checkpoint: &str) -> BoxFuture<'_, Result<RemoteChanges, ProviderError>> {
         let checkpoint = checkpoint.to_owned();
         Box::pin(async move {
@@ -221,6 +241,8 @@ pub fn sample_events(account: &Account, now: Timestamp) -> Vec<Event> {
             event_type: event_type.map(str::to_owned),
             color: None,
             reminders: None,
+            original_start: None,
+            wants_conference: false,
             pending: false,
         }
     };
@@ -304,6 +326,15 @@ impl CalendarProvider for SampleProvider {
 
     fn update_event(&self, account: &Account, calendar: &Calendar, event: &Event) -> BoxFuture<'_, Result<Event, ProviderError>> {
         self.create_event(account, calendar, event)
+    }
+
+    fn free_busy(&self, _account: &Account, emails: &[String], _start: Timestamp, _end: Timestamp) -> BoxFuture<'_, Result<Vec<(String, Option<bool>)>, ProviderError>> {
+        let emails = emails.to_vec();
+        Box::pin(async move {
+            self.require_online()?;
+            self.sleep().await;
+            Ok(emails.into_iter().map(|e| { let busy = e.contains("alex") || e.contains("daniel"); (e, Some(busy)) }).collect())
+        })
     }
 
     fn delete_event(&self, _account: &Account, calendar: &Calendar, provider_id: &ProviderId) -> BoxFuture<'_, Result<(), ProviderError>> {

@@ -164,6 +164,11 @@ pub fn parse_rfc3339(s: &str) -> Option<Timestamp> {
 }
 
 /// RFC 3339 in UTC, as Google's API expects for `timeMin`/`timeMax`.
+/// UTC in iCalendar basic form, `20261014T160000Z`, as RRULE `UNTIL` wants it.
+pub fn utc_basic(ts: Timestamp) -> String {
+    jiff::Timestamp::from_millisecond(ts).map(|t| t.strftime("%Y%m%dT%H%M%SZ").to_string()).unwrap_or_default()
+}
+
 pub fn to_rfc3339(ts: Timestamp) -> String {
     JTimestamp::from_millisecond(ts).unwrap_or(JTimestamp::UNIX_EPOCH).to_string()
 }

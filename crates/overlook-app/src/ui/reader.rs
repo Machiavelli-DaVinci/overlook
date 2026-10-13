@@ -219,6 +219,25 @@ impl MailWindow {
                     ))
                     .child("·")
                     .child(format!("You and {}", summary.participant_line()))
+                    .when(self.thread.len() > 1, |d| {
+                        let all_ids: Vec<MessageId> = self.thread.iter().map(|m| m.id.clone()).collect();
+                        let all_open = all_ids.iter().all(|id| self.expanded.contains(id) || *id == summary.latest_message_id);
+                        d.child("·").child(
+                            Button::new("expand-all")
+                                .ghost()
+                                .xsmall()
+                                .icon(icon(if all_open { "chevrons-down-up" } else { "chevrons-up-down" }).size(px(13.)))
+                                .label(if all_open { "Collapse all" } else { "Expand all" })
+                                .on_click(cx.listener(move |this, _, _w, cx| {
+                                    if all_open {
+                                        this.expanded.clear();
+                                    } else {
+                                        this.expanded.extend(all_ids.iter().cloned());
+                                    }
+                                    cx.notify();
+                                })),
+                        )
+                    })
                     .when(summary.pending, |d| {
                         d.child("·").child(
                             h_flex()
@@ -378,6 +397,10 @@ impl MailWindow {
             format!("to {} · {}", parts.join(", "), m.from.email)
         };
         let mid = m.id.clone();
+        let is_latest = self.selected_summary().is_some_and(|s| s.latest_message_id == m.id);
+        let collapse_id = m.id.clone();
+        let menu_message = m.clone();
+        let t = cx.entity().downgrade();
 
         v_flex()
             .pt(px(10.))
@@ -385,8 +408,16 @@ impl MailWindow {
             .gap(px(14.))
             .child(
                 h_flex()
+                    .id(SharedString::from(format!("mhead-{}", m.id)))
                     .items_center()
                     .gap(px(12.))
+                    .when(!is_latest, |d| d.cursor_pointer())
+                    .on_click(cx.listener(move |this, _, _w, cx| {
+                        if !is_latest {
+                            this.expanded.remove(&collapse_id);
+                            cx.notify();
+                        }
+                    }))
                     .child(if m.is_outgoing { owner_avatar(&owner, 34., &p) } else { avatar(&who, 34., &p) })
                     .child(
                         v_flex()
@@ -400,6 +431,33 @@ impl MailWindow {
                             .text_size(px(12.))
                             .text_color(p.muted)
                             .child(format_full(m.date, self.utc_offset)),
+                    )
+                    .child(
+                        Button::new(SharedString::from(format!("mmenu-{}", m.id)))
+                            .ghost()
+                            .xsmall()
+                            .icon(icon("ellipsis-vertical").size(px(15.)))
+                            .tooltip("More actions for this message")
+                            .dropdown_menu(move |menu, _window, _cx| {
+                                let m = menu_message.clone();
+                                let item = |menu: gpui_kit::component::menu::PopupMenu, label: &str, t: WeakEntity<MailWindow>, m: Message, f: fn(&mut MailWindow, Message, &mut Window, &mut Context<MailWindow>)| {
+                                    menu.item(PopupMenuItem::new(label.to_owned()).on_click(move |_, window, cx| {
+                                        let _ = t.update(cx, |this, cx| f(this, m.clone(), window, cx));
+                                    }))
+                                };
+                                let menu = item(menu, "Reply", t.clone(), m.clone(), |this, m, w, cx| this.reply_to(DraftKind::Reply, m, w, cx));
+                                let menu = item(menu, "Reply all", t.clone(), m.clone(), |this, m, w, cx| this.reply_to(DraftKind::ReplyAll, m, w, cx));
+                                let menu = item(menu, "Forward", t.clone(), m.clone(), |this, m, w, cx| this.reply_to(DraftKind::Forward, m, w, cx));
+                                let menu = menu.separator();
+                                let menu = item(menu, if m.is_read { "Mark as unread" } else { "Mark as read" }, t.clone(), m.clone(), |this, m, w, cx| {
+                                    let read = !m.is_read;
+                                    this.set_read(vec![m.id.clone()], read, w, cx)
+                                });
+                                let menu = menu.separator();
+                                let menu = item(menu, "Print…", t.clone(), m.clone(), |this, m, w, cx| this.print_message(m, w, cx));
+                                let menu = item(menu, "Save as .eml…", t.clone(), m.clone(), |this, m, w, cx| this.save_message_eml(m, w, cx));
+                                item(menu, "View source", t.clone(), m, |this, m, w, cx| this.view_message_source(m, w, cx))
+                            }),
                     ),
             )
             .when(!m.body.is_cached(), |d| {
@@ -541,6 +599,63 @@ impl MailWindow {
         let url = format!("data:{mime};base64,{}", base64_encode(&bytes));
         self.inline_images.borrow_mut().insert(a.id.clone(), Some(url.clone()));
         Some(url)
+    }
+
+    /// The image attachment shown over the window, with Open and Save.
+    pub(super) fn render_quick_look(&self, cx: &mut Context<Self>) -> AnyElement {
+        let Some(a) = self.quick_look.clone() else { return div().into_any_element() };
+        let Some(path) = a.local_path.as_deref().map(std::path::PathBuf::from) else { return div().into_any_element() };
+        let open = a.clone();
+        let save = a.clone();
+        let mut backdrop: Hsla = gpui_kit::black();
+        backdrop.a = 0.86;
+        div()
+            .id("quick-look")
+            .absolute()
+            .inset_0()
+            .bg(backdrop)
+            .flex()
+            .flex_col()
+            .on_click(cx.listener(|this, _, _w, cx| {
+                this.quick_look = None;
+                cx.notify();
+            }))
+            .child(
+                h_flex()
+                    .items_center()
+                    .gap(px(8.))
+                    .px(px(20.))
+                    .h(px(52.))
+                    .text_color(gpui_kit::white())
+                    .child(icon("image").size(px(16.)).text_color(gpui_kit::white()))
+                    .child(div().flex_1().truncate().text_size(px(14.)).font_weight(FontWeight::MEDIUM).child(a.filename.clone()))
+                    .child(div().text_size(px(12.)).opacity(0.7).child(a.human_size()))
+                    .child(Button::new("ql-open").ghost().small().icon(icon("external-link").size(px(15.))).label("Open").on_click(cx.listener(move |_this, _, _w, cx| {
+                        cx.stop_propagation();
+                        if let Some(path) = open.local_path.as_deref() {
+                            cx.open_with_system(std::path::Path::new(path));
+                        }
+                    })))
+                    .child(Button::new("ql-save").ghost().small().icon(icon("download").size(px(15.))).label("Save as…").on_click(cx.listener(move |this, _, window, cx| {
+                        cx.stop_propagation();
+                        this.save_attachment(save.clone(), window, cx);
+                    })))
+                    .child(Button::new("ql-close").ghost().small().icon(icon("x").size(px(16.))).tooltip("Close (Esc)").on_click(cx.listener(|this, _, _w, cx| {
+                        this.quick_look = None;
+                        cx.notify();
+                    }))),
+            )
+            .child(
+                div()
+                    .flex_1()
+                    .min_h_0()
+                    .p(px(24.))
+                    .flex()
+                    .items_center()
+                    .justify_center()
+                    .child(img(path).max_w_full().max_h_full().object_fit(ObjectFit::Contain).rounded(px(6.))),
+            )
+            .into_any_element()
     }
 
     fn render_attachment(&self, a: &Attachment, cx: &mut Context<Self>) -> impl IntoElement {
@@ -721,6 +836,7 @@ fn attachment_card(a: &Attachment, p: &crate::theme::Palette, downloading: bool)
         "FIG" | "PNG" | "JPG" | "SVG" => (c(0xEEE8FA, p), c(0x6E55B7, p)),
         _ => (p.chip, p.muted),
     };
+    let thumbnail = a.is_image().then(|| a.local_path.as_deref().map(std::path::PathBuf::from).filter(|p| p.exists())).flatten();
     h_flex()
         .items_center()
         .gap(px(12.))
@@ -731,8 +847,9 @@ fn attachment_card(a: &Attachment, p: &crate::theme::Palette, downloading: bool)
         .border_1()
         .border_color(p.divider)
         .bg(p.surface)
-        .child(
-            div()
+        .child(match thumbnail {
+            Some(path) => div().flex_none().size(px(36.)).rounded(px(6.)).overflow_hidden().bg(p.chip).child(img(path).size_full().object_fit(ObjectFit::Cover)),
+            None => div()
                 .flex_none()
                 .size(px(36.))
                 .rounded(px(6.))
@@ -744,7 +861,7 @@ fn attachment_card(a: &Attachment, p: &crate::theme::Palette, downloading: bool)
                 .text_size(px(10.))
                 .font_weight(FontWeight::SEMIBOLD)
                 .child(a.badge()),
-        )
+        })
         .child(
             v_flex()
                 .flex_1()
@@ -757,7 +874,7 @@ fn attachment_card(a: &Attachment, p: &crate::theme::Palette, downloading: bool)
                         .child(if downloading {
                             format!("{} · Downloading…", a.human_size())
                         } else if a.is_downloaded() {
-                            format!("{} · Open", a.human_size())
+                            format!("{} · {}", a.human_size(), if a.is_image() { "Preview" } else { "Open" })
                         } else {
                             format!("{} · Click to download", a.human_size())
                         }),
