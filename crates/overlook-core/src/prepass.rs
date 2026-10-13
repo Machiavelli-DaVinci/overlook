@@ -88,6 +88,12 @@ fn clean_children(node: &Handle, flags: &Flags) -> Vec<Handle> {
                 if matches!(new_name, "p" | "div") && is_blank(&children) {
                     continue;
                 }
+                // Each embedded message (Outlook's From:/Sent: block, Gmail's "On … wrote:"
+                // or "Forwarded message" line) is set off with a rule, so a forwarded chain
+                // reads as separate messages. Not when the author already put one there.
+                if starts_embedded_message(child, &local, &attrs_vec) && !out.last().is_some_and(|n| is_named(n, &["hr"])) {
+                    out.push(element("hr", vec![]));
+                }
                 if new_name != local || bold {
                     // rcdom's Drop empties the children of every node beneath a dropped
                     // node, including ones that now live under `fresh`; detach them first.
@@ -355,6 +361,39 @@ fn split_quote(node: &Handle) -> Option<Vec<Handle>> {
     None
 }
 
+/// Whether this element begins a message embedded in the body: an Outlook header block, a
+/// Gmail attribution line, or a Gmail quote container.
+fn starts_embedded_message(node: &Handle, local: &str, attrs: &[Attribute]) -> bool {
+    if local != "div" && local != "p" {
+        return false;
+    }
+    let class = attr(attrs, "class").unwrap_or("").to_ascii_lowercase();
+    if class.split_whitespace().any(|c| c == "gmail_attr") {
+        return true;
+    }
+    let style = attr(attrs, "style").unwrap_or("").to_ascii_lowercase();
+    if style.contains("border-top") && subtree_text(node, 200).trim_start().starts_with("From:") {
+        return true;
+    }
+    // Plain-text style markers count only when they are this element's own first text,
+    // not when they sit in a child that will get the rule itself.
+    let own = node.children.borrow().iter().find_map(|c| match &c.data {
+        NodeData::Text { contents } => {
+            let t = contents.borrow().to_string();
+            (!is_blank_text(&t)).then_some(Some(t))
+        }
+        NodeData::Element { .. } => Some(None),
+        _ => None,
+    });
+    match own {
+        Some(Some(t)) => {
+            let t = t.trim_start();
+            t.starts_with("-----Original Message-----") || t.starts_with("---------- Forwarded message")
+        }
+        _ => false,
+    }
+}
+
 fn is_quote_start(node: &Handle) -> bool {
     let NodeData::Element { name, attrs, .. } = &node.data else { return false };
     let attrs = attrs.borrow();
@@ -475,6 +514,17 @@ mod tests {
     fn trims_breaks_that_only_add_blank_lines() {
         let p = prepare("<div>FYI<br><br><div>next</div><br></div><div><br>lead<br>line<br></div>");
         assert_eq!(p.html, "<html><body><div>FYI<div>next</div></div><div>lead<br>line</div></body></html>");
+    }
+
+    #[test]
+    fn embedded_message_headers_get_a_rule() {
+        let o = prepare(r#"<div><p>Thanks</p><div style="border:none;border-top:solid #E1E1E1 1.0pt"><p><b>From:</b> A</p></div><p>original</p></div>"#);
+        assert!(o.html.contains("<hr><div"), "{}", o.html);
+        let f = prepare(r#"<div dir="ltr">FYI<div class="gmail_quote"><div class="gmail_attr">---------- Forwarded message ---------<br>From: A</div><div>body</div></div></div>"#);
+        assert_eq!(f.html.matches("<hr>").count(), 1, "{}", f.html);
+        // Not doubled when the author already drew one.
+        let d = prepare(r#"<div><hr><div style="border-top:1px solid #ccc"><p>From: A</p></div></div>"#);
+        assert_eq!(d.html.matches("<hr>").count(), 1, "{}", d.html);
     }
 
     #[test]

@@ -146,3 +146,6 @@ Brand assets and the HTML design preview keep their existing maintenance command
   now final for the verification submission; the demo video must show Contacts as well.
 
 - v0.4.0 published 2026-10-13 (Contacts module with People API read-write; author text colours kept; Outlook reply headers shown inline; quotes collapse only when they repeat the thread). Working version is now 0.4.1.
+
+- Reader header (2026-10-13): the sender's address sits beside the name ("Brian Cramer <b@…>") and the
+  second line is "to …, cc …" only; a rule precedes each embedded message header in a body.

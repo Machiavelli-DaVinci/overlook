@@ -154,7 +154,10 @@ Received HTML goes through three stages before the native view sees it, all in `
    bare URLs into links, and splits the quoted history of a reply (Gmail `gmail_quote`, `blockquote
    type=cite`, Yahoo, Thunderbird) into `Sanitized.quoted`, taking everything after the quote start at
    every nesting level. Forwards and Outlook's `From: / Sent: / To:` header blocks are not split: the
-   header is context for notes people write inside the quoted text, and Gmail shows it too.
+   header is context for notes people write inside the quoted text, and Gmail shows it too. Every
+   embedded message header (Outlook's block, Gmail's `gmail_attr` line, a "Forwarded message" or
+   "Original Message" marker) gets a rule in front of it, so a forwarded chain reads as separate messages;
+   the reader adds the same rule when it inlines a split quote.
 2. `sanitize_html` (ammonia) enforces the tag and attribute allow-list and the remote-image policy,
    then `flatten_tables` turns layout tables into block flow. Of an author's inline styling only the
    text colour is kept (`style="color:…"` reduced to that one declaration, `<font color>`), because

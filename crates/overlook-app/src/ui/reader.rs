@@ -384,9 +384,9 @@ impl MailWindow {
         let dark = p.is_dark();
         // Quoted history is folded away only when it repeats a message already in this
         // conversation; otherwise it is part of what the sender wants read.
-        let (body, quoted) = match sanitized.quoted {
+        let (body, quoted) = match sanitized.quoted.map(|q| q.trim_start_matches("<hr>").to_owned()) {
             Some(q) if self.quote_repeats_thread(&q, m) => (sanitized.html, Some(q)),
-            Some(q) => (format!("{}{}", sanitized.html, q), None),
+            Some(q) => (format!("{}<hr>{}", sanitized.html, q), None),
             None => (sanitized.html, None),
         };
         let body_html = self.resolve_inline_images(m, overlook_core::sanitize::adapt_colors(&body, dark));
@@ -394,16 +394,21 @@ impl MailWindow {
         let quote_shown = self.quotes_shown.contains(&m.id);
         let quote_id = m.id.clone();
         let to_line = {
-            let mut parts: Vec<String> = m
-                .to
-                .iter()
-                .map(|a| if a.email.eq_ignore_ascii_case(&self.account.email) { "me".to_owned() } else { a.display_name() })
-                .collect();
-            if parts.is_empty() {
-                parts.push("me".into());
+            let names = |list: &[Address]| -> Vec<String> {
+                list.iter().map(|a| if a.email.eq_ignore_ascii_case(&self.account.email) { "me".to_owned() } else { a.display_name() }).collect()
+            };
+            let mut to = names(&m.to);
+            if to.is_empty() {
+                to.push("me".into());
             }
-            format!("to {} · {}", parts.join(", "), m.from.email)
+            let mut line = format!("to {}", to.join(", "));
+            let cc = names(&m.cc);
+            if !cc.is_empty() {
+                line.push_str(&format!(" · cc {}", cc.join(", ")));
+            }
+            line
         };
+        let sender_email = if m.is_outgoing { self.account.email.clone() } else { m.from.email.clone() };
         let mid = m.id.clone();
         let is_latest = self.selected_summary().is_some_and(|s| s.latest_message_id == m.id);
         let collapse_id = m.id.clone();
@@ -435,11 +440,15 @@ impl MailWindow {
                                 let card_id = m.id.clone();
                                 div()
                                     .id(SharedString::from(format!("sender-{}", m.id)))
+                                    .flex()
+                                    .items_baseline()
+                                    .gap(px(6.))
                                     .text_size(px(14.))
                                     .font_weight(FontWeight::SEMIBOLD)
                                     .cursor_pointer()
                                     .hover(|d| d.text_color(p.accent))
                                     .child(who.display_name())
+                                    .when(!sender_email.eq_ignore_ascii_case(&who.display_name()), |d| d.child(div().text_size(px(12.)).font_weight(FontWeight::NORMAL).text_color(p.muted).child(format!("<{sender_email}>"))))
                                     .on_click(cx.listener(move |this, _, _w, cx| {
                                         cx.stop_propagation();
                                         this.contact_card = if this.contact_card.as_ref() == Some(&card_id) { None } else { Some(card_id.clone()) };

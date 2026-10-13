@@ -551,6 +551,10 @@ pub fn text_to_html(text: &str) -> String {
                 out.push_str("</p>");
                 open_paragraph = false;
             }
+            let marker = body.trim_start();
+            if !open_paragraph && (marker.starts_with("---------- Forwarded message") || marker.starts_with("-----Original Message-----")) {
+                out.push_str("<hr>");
+            }
             if !open_paragraph {
                 out.push_str("<p>");
                 open_paragraph = true;
