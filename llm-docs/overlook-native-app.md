@@ -108,12 +108,17 @@ colour choices (by design), and underline, which Markdown has no mark for.
 
 ## Contacts, signatures, automatic replies, mailto
 
-- **Contacts.** `MailProvider::fetch_contacts` (Google People API: `people/me/connections` and
-  `otherContacts`, scopes `contacts.readonly` and `contacts.other.readonly`) runs once a day from the sync
-  (`contacts_synced_at:<acct>`), into the `contacts` table (schema v9). The composer's suggestions put
-  address-book matches first, then previous correspondents. Clicking a sender's name in the reader opens a
-  contact card with New message and "Mail from them" (a `from:` search). Settings → Accounts shows the count,
-  a sync button, and "Sign in again" when the token lacks the scope.
+- **Contacts.** A module of its own (Ctrl+3, `ui/contacts.rs`): list with search and three filters, a
+  detail pane, New contact (Ctrl+N inside the module), Edit and Delete for address-book entries, New message
+  and "Mail from them". The model is `Contact` (id = People API resource name or `local:<uuid>`, primary
+  `email` plus `emails`, given/family name, phone, organization, title, notes, photo, `etag`, `pending`) in the
+  `people` table (schema v10, migrated from the v9 `contacts` table). Edits go through the operation log
+  (`CreateContact`, `UpdateContact`, `DeleteContact`) and `MailProvider::{create,update,delete}_contact`;
+  Google's `people:createContact`, `:updateContact` (etag refetched when stale) and `:deleteContact`. The
+  daily `fetch_contacts` (`people/me/connections` + `otherContacts`) keeps rows with pending local edits.
+  Scopes: `contacts` (read-write) and `contacts.other.readonly`; without the write scope the sidebar says
+  changes stay on this device and offers Sign in again. The composer suggests address-book matches first,
+  and a sender card in the reader opens or adds the person in Contacts.
 - **Signatures.** `AccountPrefs.signatures` is a list of named Markdown-flavoured signatures with
   `default_new` / `default_reply` ids (`None` = no signature); `normalized()` migrates the old single
   `signature` field and the two include switches. Settings → Accounts manages them (add, rename, delete, pick
@@ -220,7 +225,7 @@ Keyboard additions: `Ctrl 1` Mail, `Ctrl 2` Calendar, `Ctrl Shift A` new event; 
 cargo test --workspace
 ```
 
-87 tests cover: appearance resolution (Follow system is not a third theme), recipient parsing, conversation summaries, reply/forward drafts, HTML sanitization and remote-image blocking, local time formatting, PKCE/OAuth request building, the sample provider, store durability across reopen, atomic change+operation (a failing change leaves no operation), Outbox queue/cancel, send completion, FTS search and coverage, settings, and the sync engine (offline leaves work queued; ordered replay; uncertain send reconciled without duplicates; cancelled send never sent).
+88 tests cover: appearance resolution (Follow system is not a third theme), recipient parsing, conversation summaries, reply/forward drafts, HTML sanitization and remote-image blocking, local time formatting, PKCE/OAuth request building, the sample provider, store durability across reopen, atomic change+operation (a failing change leaves no operation), Outbox queue/cancel, send completion, FTS search and coverage, settings, and the sync engine (offline leaves work queued; ordered replay; uncertain send reconciled without duplicates; cancelled send never sent).
 
 The manual scenario used to validate the shell (keyboard only, with `wtype` on Hyprland):
 

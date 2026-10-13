@@ -956,26 +956,41 @@ impl Store {
         })
     }
 
-    /// Replaces the account's contacts with the provider's list.
+    /// Replaces the account's contacts with the provider's list. Contacts changed on this device
+    /// and not yet pushed are kept.
     pub fn replace_contacts(&self, account: &AccountId, contacts: &[Contact]) -> Result<()> {
         self.with_tx(|tx| {
-            tx.execute("DELETE FROM contacts WHERE account_id=?1", [&account.0])?;
+            tx.execute("DELETE FROM people WHERE account_id=?1 AND pending=0", [&account.0])?;
             for c in contacts {
-                tx.execute(
-                    "INSERT OR REPLACE INTO contacts(account_id, email, name, photo_url, in_address_book, updated) VALUES(?1,?2,?3,?4,?5,?6)",
-                    params![account.0, c.email.to_ascii_lowercase(), c.name, c.photo_url, c.in_address_book as i64, c.updated],
-                )?;
+                if tx.query_row("SELECT COUNT(*) FROM people WHERE account_id=?1 AND id=?2", params![account.0, c.id], |r| r.get::<_, i64>(0))? > 0 {
+                    continue; // a pending local edit wins until it is pushed
+                }
+                upsert_contact_tx(tx, c)?;
             }
             Ok(())
         })
     }
 
     pub fn contact_count(&self, account: &AccountId) -> Result<usize> {
-        self.with_conn(|c| Ok(c.query_row("SELECT COUNT(*) FROM contacts WHERE account_id=?1", [&account.0], |r| r.get::<_, i64>(0))? as usize))
+        self.with_conn(|c| Ok(c.query_row("SELECT COUNT(*) FROM people WHERE account_id=?1", [&account.0], |r| r.get::<_, i64>(0))? as usize))
     }
 
+    pub fn contacts(&self, account: &AccountId) -> Result<Vec<Contact>> {
+        let mut all = self.contacts_where(account, "", &[])?;
+        all.sort_by_key(|c| c.display_name().to_lowercase());
+        Ok(all)
+    }
+
+    pub fn contact_by_id(&self, account: &AccountId, id: &str) -> Result<Option<Contact>> {
+        Ok(self.contacts_where(account, "AND id=?2", &[id])?.into_iter().next())
+    }
+
+    /// The contact with this address, address-book entries first.
     pub fn contact(&self, account: &AccountId, email: &str) -> Result<Option<Contact>> {
-        Ok(self.contacts_where(account, "AND email=?2", &email.to_ascii_lowercase(), 1)?.into_iter().next())
+        let needle = email.trim().to_ascii_lowercase();
+        let mut hits: Vec<Contact> = self.contacts_where(account, "", &[])?.into_iter().filter(|c| c.has_email(&needle)).collect();
+        hits.sort_by(|a, b| b.in_address_book.cmp(&a.in_address_book));
+        Ok(hits.into_iter().next())
     }
 
     /// Contacts whose name or address starts with `prefix` (any word of the name), address
@@ -985,40 +1000,87 @@ impl Store {
         if needle.is_empty() {
             return Ok(Vec::new());
         }
-        let all = self.contacts_where(account, "", "", 5000)?;
-        let mut hits: Vec<Contact> = all
+        let mut hits: Vec<Contact> = self
+            .contacts_where(account, "", &[])?
             .into_iter()
             .filter(|c| {
-                c.email.starts_with(&needle)
-                    || c.name.as_deref().is_some_and(|n| {
-                        let lower = n.to_ascii_lowercase();
-                        lower.starts_with(&needle) || lower.split_whitespace().any(|w| w.starts_with(&needle))
-                    })
+                c.emails.iter().any(|e| e.to_ascii_lowercase().starts_with(&needle))
+                    || c.email.to_ascii_lowercase().starts_with(&needle)
+                    || c.display_name().to_lowercase().split_whitespace().any(|w| w.starts_with(&needle))
+                    || c.display_name().to_lowercase().starts_with(&needle)
             })
             .collect();
-        hits.sort_by(|a, b| b.in_address_book.cmp(&a.in_address_book).then_with(|| a.name.is_none().cmp(&b.name.is_none())).then_with(|| a.email.cmp(&b.email)));
+        hits.sort_by(|a, b| b.in_address_book.cmp(&a.in_address_book).then_with(|| a.name.is_none().cmp(&b.name.is_none())).then_with(|| a.display_name().cmp(&b.display_name())));
         hits.truncate(limit);
         Ok(hits)
     }
 
-    fn contacts_where(&self, account: &AccountId, clause: &str, arg: &str, limit: usize) -> Result<Vec<Contact>> {
+    /// Saves a contact changed on this device and queues the push.
+    pub fn save_contact_locally(&self, account: &AccountId, contact: &Contact) -> Result<PendingOperation> {
+        let ts = now();
+        let mut c = contact.clone();
+        c.pending = true;
+        c.updated = ts;
+        let kind = if c.id.starts_with("local:") { OperationKind::CreateContact { contact_id: c.id.clone() } } else { OperationKind::UpdateContact { contact_id: c.id.clone() } };
+        self.with_tx(|tx| {
+            upsert_contact_tx(tx, &c)?;
+            insert_operation_tx(tx, account, kind, ts)
+        })
+    }
+
+    /// Removes a contact locally and queues its deletion.
+    pub fn delete_contact_locally(&self, account: &AccountId, contact: &Contact) -> Result<PendingOperation> {
+        let ts = now();
+        self.with_tx(|tx| {
+            tx.execute("DELETE FROM people WHERE account_id=?1 AND id=?2", params![account.0, contact.id])?;
+            let resource_name = (!contact.id.starts_with("local:")).then(|| contact.id.clone());
+            insert_operation_tx(tx, account, OperationKind::DeleteContact { contact_id: contact.id.clone(), resource_name }, ts)
+        })
+    }
+
+    /// The provider accepted a local change: the row takes the provider's copy (and id).
+    pub fn mark_contact_synced(&self, account: &AccountId, local_id: &str, synced: &Contact) -> Result<()> {
+        let mut c = synced.clone();
+        c.pending = false;
+        self.with_tx(|tx| {
+            if local_id != c.id {
+                tx.execute("DELETE FROM people WHERE account_id=?1 AND id=?2", params![account.0, local_id])?;
+            }
+            upsert_contact_tx(tx, &c)
+        })
+    }
+
+    fn contacts_where(&self, account: &AccountId, clause: &str, args: &[&str]) -> Result<Vec<Contact>> {
         self.with_conn(|c| {
-            let sql = format!("SELECT account_id, email, name, photo_url, in_address_book, updated FROM contacts WHERE account_id=?1 {clause} LIMIT {limit}");
+            let sql = format!(
+                "SELECT id, account_id, email, emails_json, name, given_name, family_name, phone, organization, title, notes, photo_url, in_address_book, etag, updated, pending
+                 FROM people WHERE account_id=?1 {clause}"
+            );
             let mut stmt = c.prepare(&sql)?;
             let map = |r: &rusqlite::Row| {
                 Ok(Contact {
-                    account_id: AccountId(r.get(0)?),
-                    email: r.get(1)?,
-                    name: r.get(2)?,
-                    photo_url: r.get(3)?,
-                    in_address_book: r.get::<_, i64>(4)? != 0,
-                    updated: r.get(5)?,
+                    id: r.get(0)?,
+                    account_id: AccountId(r.get(1)?),
+                    email: r.get(2)?,
+                    emails: serde_json::from_str(&r.get::<_, String>(3)?).unwrap_or_default(),
+                    name: r.get(4)?,
+                    given_name: r.get(5)?,
+                    family_name: r.get(6)?,
+                    phone: r.get(7)?,
+                    organization: r.get(8)?,
+                    title: r.get(9)?,
+                    notes: r.get(10)?,
+                    photo_url: r.get(11)?,
+                    in_address_book: r.get::<_, i64>(12)? != 0,
+                    etag: r.get(13)?,
+                    updated: r.get(14)?,
+                    pending: r.get::<_, i64>(15)? != 0,
                 })
             };
-            let rows: Vec<Contact> = if clause.is_empty() {
-                stmt.query_map([&account.0], map)?.collect::<std::result::Result<Vec<_>, _>>()?
-            } else {
-                stmt.query_map(params![account.0, arg], map)?.collect::<std::result::Result<Vec<_>, _>>()?
+            let rows: Vec<Contact> = match args {
+                [] => stmt.query_map([&account.0], map)?.collect::<std::result::Result<Vec<_>, _>>()?,
+                [a] => stmt.query_map(params![account.0, a], map)?.collect::<std::result::Result<Vec<_>, _>>()?,
+                _ => Vec::new(),
             };
             Ok(rows)
         })
@@ -1145,6 +1207,35 @@ fn upsert_message_tx(tx: &Connection, m: &Message) -> Result<()> {
             params![a.id.0, m.id.0, a.filename, a.mime_type, a.size_bytes as i64, a.local_path, a.provider_id.as_ref().map(|p| &p.0), a.content_id],
         )?;
     }
+    Ok(())
+}
+
+fn upsert_contact_tx(tx: &Connection, c: &Contact) -> Result<()> {
+    tx.execute(
+        "INSERT INTO people(id, account_id, email, emails_json, name, given_name, family_name, phone, organization, title, notes, photo_url, in_address_book, etag, updated, pending)
+         VALUES(?1,?2,?3,?4,?5,?6,?7,?8,?9,?10,?11,?12,?13,?14,?15,?16)
+         ON CONFLICT(account_id, id) DO UPDATE SET email=excluded.email, emails_json=excluded.emails_json, name=excluded.name, given_name=excluded.given_name,
+            family_name=excluded.family_name, phone=excluded.phone, organization=excluded.organization, title=excluded.title, notes=excluded.notes,
+            photo_url=excluded.photo_url, in_address_book=excluded.in_address_book, etag=excluded.etag, updated=excluded.updated, pending=excluded.pending",
+        params![
+            c.id,
+            c.account_id.0,
+            c.email.to_ascii_lowercase(),
+            serde_json::to_string(&c.emails)?,
+            c.name,
+            c.given_name,
+            c.family_name,
+            c.phone,
+            c.organization,
+            c.title,
+            c.notes,
+            c.photo_url,
+            c.in_address_book as i64,
+            c.etag,
+            c.updated,
+            c.pending as i64,
+        ],
+    )?;
     Ok(())
 }
 

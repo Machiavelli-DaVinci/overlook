@@ -2,7 +2,7 @@
 
 use rusqlite::Connection;
 
-const MIGRATIONS: &[&str] = &[V1, V2, V3, V4, V5, V6, V7, V8, V9];
+const MIGRATIONS: &[&str] = &[V1, V2, V3, V4, V5, V6, V7, V8, V9, V10];
 
 pub fn migrate(conn: &Connection) -> rusqlite::Result<()> {
     let current: i64 = conn.query_row("PRAGMA user_version", [], |r| r.get(0))?;
@@ -254,5 +254,33 @@ CREATE TABLE contacts (
     updated INTEGER NOT NULL,
     PRIMARY KEY(account_id, email)
 );
+COMMIT;
+"#;
+
+const V10: &str = r#"
+BEGIN;
+CREATE TABLE people (
+    id TEXT NOT NULL,
+    account_id TEXT NOT NULL REFERENCES accounts(id) ON DELETE CASCADE,
+    email TEXT NOT NULL DEFAULT '',
+    emails_json TEXT NOT NULL DEFAULT '[]',
+    name TEXT,
+    given_name TEXT,
+    family_name TEXT,
+    phone TEXT,
+    organization TEXT,
+    title TEXT,
+    notes TEXT,
+    photo_url TEXT,
+    in_address_book INTEGER NOT NULL DEFAULT 0,
+    etag TEXT,
+    updated INTEGER NOT NULL,
+    pending INTEGER NOT NULL DEFAULT 0,
+    PRIMARY KEY(account_id, id)
+);
+INSERT INTO people(id, account_id, email, emails_json, name, photo_url, in_address_book, updated)
+    SELECT 'legacy:' || email, account_id, email, '["' || email || '"]', name, photo_url, in_address_book, updated FROM contacts;
+DROP TABLE contacts;
+CREATE INDEX people_email ON people(account_id, email);
 COMMIT;
 "#;

@@ -689,6 +689,11 @@ impl MailWindow {
                 }
                 this.sync_composer_fields(cx);
             })))
+            .child({
+                let who = who.clone();
+                let in_book = contact.as_ref().is_some_and(|c| c.in_address_book);
+                Button::new("card-contacts").ghost().small().icon(icon(if in_book { "book-user" } else { "user-plus" }).size(px(14.))).label(if in_book { "Open in Contacts" } else { "Add to contacts" }).on_click(cx.listener(move |this, _, window, cx| this.show_in_contacts(who.clone(), window, cx)))
+            })
             .child(Button::new("card-search").ghost().small().icon(icon("search").size(px(14.))).label("Mail from them").on_click(cx.listener(move |this, _, window, cx| {
                 let input = this.search_input.clone();
                 let q = search_from.clone();

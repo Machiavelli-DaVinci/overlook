@@ -457,6 +457,44 @@ pub async fn run_sync(store: Arc<Store>, provider: Arc<dyn MailProvider>, calend
                     }
                 }
             }
+            kind if kind.is_contact() => {
+                let contact = kind.contact_id().and_then(|id| store.contact_by_id(&acct, id).ok().flatten());
+                let result: Result<(), ProviderError> = match kind {
+                    OperationKind::CreateContact { contact_id } => match &contact {
+                        Some(c) => provider.create_contact(&account, c).await.and_then(|created| store.mark_contact_synced(&acct, contact_id, &created).map_err(|e| ProviderError::Temporary(e.to_string()))),
+                        None => Ok(()),
+                    },
+                    OperationKind::UpdateContact { contact_id } => match &contact {
+                        Some(c) => provider.update_contact(&account, c).await.and_then(|updated| store.mark_contact_synced(&acct, contact_id, &updated).map_err(|e| ProviderError::Temporary(e.to_string()))),
+                        None => Ok(()),
+                    },
+                    OperationKind::DeleteContact { resource_name, .. } => match resource_name {
+                        Some(r) => provider.delete_contact(&account, r).await,
+                        None => Ok(()),
+                    },
+                    _ => Ok(()),
+                };
+                match result {
+                    Ok(()) => {
+                        let _ = store.set_operation_state(&op.id, OperationState::Applied, None);
+                        outcome.applied += 1;
+                    }
+                    Err(ProviderError::Rejected(reason)) => {
+                        let _ = store.set_operation_state(&op.id, OperationState::Failed, Some(&reason));
+                        outcome.failed.push(kind.describe());
+                    }
+                    Err(ProviderError::SignInRequired) => {
+                        let _ = store.set_operation_state(&op.id, OperationState::Pending, Some("sign in again to change contacts"));
+                    }
+                    Err(err) => {
+                        let _ = store.set_operation_state(&op.id, OperationState::Pending, Some(&err.to_string()));
+                        final_state = state_for(&err);
+                        outcome.stopped_offline = matches!(err, ProviderError::Offline);
+                        outcome.rate_limited = matches!(err, ProviderError::RateLimited(_));
+                        break;
+                    }
+                }
+            }
             kind => {
                 let messages: Vec<Message> = kind.message_ids().iter().filter_map(|id| store.message(id).ok().flatten()).collect();
                 match provider.apply(&account, &op, &messages, &labels).await {

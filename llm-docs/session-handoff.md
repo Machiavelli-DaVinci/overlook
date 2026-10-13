@@ -140,3 +140,7 @@ Brand assets and the HTML design preview keep their existing maintenance command
   header blocks are no longer treated as quote markers; nested quote splitting takes trailing nodes;
   quotes collapse only when they repeat the thread. Verified on the annotated board-topics message in
   both themes.
+
+- Contacts module (2026-10-13): third module with add/edit/delete through the People API; scope
+  `contacts` (read-write) replaces `contacts.readonly`. Schema v10 `people` table. The OAuth scope set is
+  now final for the verification submission; the demo video must show Contacts as well.

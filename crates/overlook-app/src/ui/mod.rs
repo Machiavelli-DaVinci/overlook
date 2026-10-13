@@ -2,6 +2,7 @@
 
 mod calendar;
 mod composer;
+mod contacts;
 mod mail_highlight;
 mod list;
 mod settings;
@@ -56,6 +57,7 @@ actions!(
         PrevConversation,
         SwitchToMail,
         SwitchToCalendar,
+        SwitchToContacts,
         CalendarPrevious,
         CalendarNext,
         CalendarToday,
@@ -106,6 +108,7 @@ pub fn init(cx: &mut App) {
         KeyBinding::new("f5", SyncNow, Some(WINDOW_CONTEXT)),
         KeyBinding::new("ctrl-1", SwitchToMail, Some(WINDOW_CONTEXT)),
         KeyBinding::new("ctrl-2", SwitchToCalendar, Some(WINDOW_CONTEXT)),
+        KeyBinding::new("ctrl-3", SwitchToContacts, Some(WINDOW_CONTEXT)),
         KeyBinding::new("ctrl-shift-a", NewEventAction, Some(WINDOW_CONTEXT)),
         KeyBinding::new("ctrl-,", OpenSettings, Some(WINDOW_CONTEXT)),
         KeyBinding::new("ctrl-b", FormatBold, Some(WINDOW_CONTEXT)),
@@ -285,6 +288,13 @@ pub struct MailWindow {
     pub(crate) quotes_shown: BTreeSet<MessageId>,
     /// The message whose sender's contact card is open.
     pub(crate) contact_card: Option<MessageId>,
+    // Contacts module state.
+    pub(crate) contacts: Vec<Contact>,
+    pub(crate) contact_selected: Option<String>,
+    pub(crate) contact_search: Entity<InputState>,
+    pub(crate) contact_query: String,
+    pub(crate) contact_filter: contacts::ContactFilter,
+    pub(crate) contact_form: Option<contacts::ContactForm>,
     /// An image or PDF attachment shown over the window.
     pub(crate) quick_look: Option<QuickLook>,
     /// First-page thumbnails of PDF attachments, rendered in the background.
@@ -375,7 +385,14 @@ impl MailWindow {
         }
         cx.set_global(AppearanceGlobal(appearance));
         let search_input = cx.new(|cx| InputState::new(window, cx).placeholder("Search mail"));
+        let contact_search = cx.new(|cx| InputState::new(window, cx).placeholder("Search contacts"));
         let mut subs = Vec::new();
+        subs.push(cx.subscribe_in(&contact_search, window, |this, state, event: &InputEvent, _window, cx| {
+            if matches!(event, InputEvent::Change) {
+                this.contact_query = state.read(cx).value().to_string();
+                cx.notify();
+            }
+        }));
         subs.push(cx.subscribe_in(&search_input, window, |this, state, event: &InputEvent, window, cx| match event {
             InputEvent::Change => {
                 let value = state.read(cx).value().to_string();
@@ -408,6 +425,7 @@ impl MailWindow {
             StartupModule::Calendar => Module::Calendar,
             StartupModule::LastUsed => match store.setting::<String>("last_module").ok().flatten().as_deref() {
                 Some("calendar") => Module::Calendar,
+                Some("contacts") => Module::Contacts,
                 _ => Module::Mail,
             },
         };
@@ -449,6 +467,12 @@ impl MailWindow {
             quotes_shown: BTreeSet::new(),
             quick_look: None,
             contact_card: None,
+            contacts: Vec::new(),
+            contact_selected: None,
+            contact_search,
+            contact_query: String::new(),
+            contact_filter: contacts::ContactFilter::All,
+            contact_form: None,
             pdf_thumbs: HashMap::new(),
             pdf_thumbs_pending: HashSet::new(),
             inline_images: std::cell::RefCell::new(HashMap::new()),
@@ -943,6 +967,7 @@ impl MailWindow {
         }
         self.load_thread();
         self.reload_calendar();
+        self.reload_contacts();
         cx.notify();
     }
 
@@ -1857,6 +1882,11 @@ impl MailWindow {
     // ---------------------------------------------------------------- actions
 
     fn on_compose(&mut self, _: &Compose, window: &mut Window, cx: &mut Context<Self>) {
+        // In Contacts, Ctrl+N starts a new contact rather than a message.
+        if self.module == Module::Contacts {
+            self.start_new_contact(None, window, cx);
+            return;
+        }
         self.compose_new(window, cx);
     }
     fn on_focus_search(&mut self, _: &FocusSearch, window: &mut Window, cx: &mut Context<Self>) {
@@ -1879,6 +1909,8 @@ impl MailWindow {
             self.close_settings(window, cx);
         } else if self.composer.is_some() {
             self.close_composer(window, cx);
+        } else if self.contact_form.is_some() {
+            self.cancel_contact_form(cx);
         } else if self.new_event.is_some() {
             self.cancel_new_event(window, cx);
         } else if self.cal_scope_prompt.is_some() {
@@ -1995,6 +2027,9 @@ impl MailWindow {
     }
     fn on_switch_mail(&mut self, _: &SwitchToMail, window: &mut Window, cx: &mut Context<Self>) {
         self.set_module(Module::Mail, window, cx);
+    }
+    fn on_switch_contacts(&mut self, _: &SwitchToContacts, window: &mut Window, cx: &mut Context<Self>) {
+        self.set_module(Module::Contacts, window, cx);
     }
     fn on_switch_calendar(&mut self, _: &SwitchToCalendar, window: &mut Window, cx: &mut Context<Self>) {
         self.set_module(Module::Calendar, window, cx);
@@ -2137,6 +2172,11 @@ impl MailWindow {
                                 segment_with_icon("module-calendar", icon("calendar").size(px(15.)), "Calendar", self.module == Module::Calendar, &p)
                                     .tooltip(|window, cx| Tooltip::new("Calendar (Ctrl 2)").build(window, cx))
                                     .on_click(cx.listener(|this, _, window, cx| this.set_module(Module::Calendar, window, cx))),
+                            )
+                            .child(
+                                segment_with_icon("module-contacts", icon("users").size(px(15.)), "Contacts", self.module == Module::Contacts, &p)
+                                    .tooltip(|window, cx| Tooltip::new("Contacts (Ctrl 3)").build(window, cx))
+                                    .on_click(cx.listener(|this, _, window, cx| this.set_module(Module::Contacts, window, cx))),
                             ),
                     )
                     .child(
@@ -2408,6 +2448,13 @@ impl MailWindow {
     // ------------------------------------------------------------------ body
 
     fn render_body(&self, cx: &mut Context<Self>) -> AnyElement {
+        if self.module == Module::Contacts {
+            return h_resizable("main-contacts")
+                .with_state(&self.panes)
+                .child(resizable_panel().size(px(self.sidebar_width)).size_range(px(180.)..px(360.)).child(self.render_contacts_sidebar(cx).into_any_element()))
+                .child(resizable_panel().child(self.render_contacts_main(cx).into_any_element()))
+                .into_any_element();
+        }
         if self.module == Module::Calendar {
             return h_resizable("main-calendar")
                 .with_state(&self.panes)
@@ -2527,6 +2574,7 @@ impl Render for MailWindow {
             .on_action(cx.listener(Self::on_sync_now))
             .on_action(cx.listener(Self::on_switch_mail))
             .on_action(cx.listener(Self::on_switch_calendar))
+            .on_action(cx.listener(Self::on_switch_contacts))
             .on_action(cx.listener(Self::on_cal_prev))
             .on_action(cx.listener(Self::on_cal_next))
             .on_action(cx.listener(Self::on_cal_today))

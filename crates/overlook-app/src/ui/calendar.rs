@@ -26,6 +26,7 @@ use overlook_core::*;
 pub enum Module {
     Mail,
     Calendar,
+    Contacts,
 }
 
 #[derive(Clone, Copy, Debug, PartialEq, Eq, Hash)]
@@ -154,11 +155,16 @@ impl MailWindow {
             return;
         }
         self.module = module;
-        let _ = self.store.set_setting("last_module", &if module == Module::Calendar { "calendar" } else { "mail" });
+        let _ = self.store.set_setting("last_module", &match module { Module::Calendar => "calendar", Module::Contacts => "contacts", Module::Mail => "mail" });
         match module {
             Module::Calendar => {
                 self.reload_calendar();
                 self.cal_focus.focus(window, cx);
+            }
+            Module::Contacts => {
+                self.reload_contacts();
+                let input = self.contact_search.clone();
+                input.update(cx, |s, cx| s.focus(window, cx));
             }
             Module::Mail => self.list_focus.focus(window, cx),
         }

@@ -828,21 +828,63 @@ mod tests {
 }
 
 /// Someone from the account's address book (Google Contacts) or its "other contacts": people
-/// the user has corresponded with. Used for recipient suggestions and the contact card.
-#[derive(Clone, Debug, PartialEq, Eq, Serialize, Deserialize)]
+/// the user has corresponded with. Address-book entries can be edited; the rest are read-only.
+#[derive(Clone, Debug, PartialEq, Eq, Serialize, Deserialize, Default)]
+#[serde(default)]
 pub struct Contact {
+    /// The provider's resource name (`people/c123`, `otherContacts/c456`) or `local:<uuid>` for
+    /// one created on this device and not yet pushed.
+    pub id: String,
     pub account_id: AccountId,
+    /// Primary address; empty for a contact without one.
     pub email: String,
+    pub emails: Vec<String>,
     pub name: Option<String>,
+    pub given_name: Option<String>,
+    pub family_name: Option<String>,
+    pub phone: Option<String>,
+    pub organization: Option<String>,
+    pub title: Option<String>,
+    pub notes: Option<String>,
     pub photo_url: Option<String>,
     /// In the address book proper, as opposed to inferred from correspondence.
     pub in_address_book: bool,
+    /// The provider's version marker, needed to update.
+    pub etag: Option<String>,
     pub updated: Timestamp,
+    /// Changed on this device and not yet pushed.
+    pub pending: bool,
 }
 
 impl Contact {
+    pub fn new_local(account_id: AccountId, now: Timestamp) -> Self {
+        Self { id: format!("local:{}", uuid::Uuid::new_v4()), account_id, in_address_book: true, updated: now, pending: true, ..Default::default() }
+    }
+
     pub fn address(&self) -> Address {
         Address { name: self.name.clone(), email: self.email.clone() }
+    }
+
+    /// Name, or the address, or a placeholder.
+    pub fn display_name(&self) -> String {
+        self.name
+            .clone()
+            .filter(|n| !n.trim().is_empty())
+            .or_else(|| {
+                let full = format!("{} {}", self.given_name.clone().unwrap_or_default(), self.family_name.clone().unwrap_or_default());
+                let full = full.trim().to_owned();
+                (!full.is_empty()).then_some(full)
+            })
+            .or_else(|| (!self.email.is_empty()).then(|| self.email.clone()))
+            .unwrap_or_else(|| "(No name)".into())
+    }
+
+    pub fn is_editable(&self) -> bool {
+        self.in_address_book
+    }
+
+    pub fn has_email(&self, email: &str) -> bool {
+        self.email.eq_ignore_ascii_case(email) || self.emails.iter().any(|e| e.eq_ignore_ascii_case(email))
     }
 }
 

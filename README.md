@@ -55,6 +55,9 @@ and you can read, search, write, and file mail with no connection at all.
   sent twice. Survives a crash or a restart.
 - **Two themes, done well.** Light and Dark, with *Follow system*. Bundled Inter and Source Serif 4 so it
   looks the same on every machine. Keyboard shortcuts you already know from Outlook.
+- **Contacts.** A third module beside Mail and Calendar: your Google Contacts and the people you have written
+  to, searchable, with a detail card, add, edit and delete that sync back to Google, and one click to write to
+  someone or find everything they sent. Changes made offline wait in the same queue as mail.
 - **Settings that do things.** Accounts and signatures, notifications, sync interval, mark-as-read timing,
   remote images, download size, working hours, reminders, automatic replies (out of office), and more. Every
   control takes effect immediately.
@@ -132,7 +135,7 @@ client that belongs to you. Nothing passes through a Last Refuge server.
    **Google Calendar API**.
 2. Configure the consent screen (External, Testing), add yourself as a test user, and add these scopes:
    `gmail.modify`, `gmail.send`, `gmail.settings.basic`, `calendar.events`, `calendar.readonly`,
-   `contacts.readonly`, `contacts.other.readonly`, `openid`, `userinfo.email`.
+   `contacts`, `contacts.other.readonly`, `openid`, `userinfo.email`.
 3. Create an OAuth client of type **Desktop app** and download its JSON.
 4. Save it as `~/.config/overlook/google-oauth-client.json`.
 5. In Overlook, open the account menu at the bottom of the sidebar → **Add Gmail account…** and sign in in
@@ -157,7 +160,7 @@ in Google Cloud lifts that. The [native app guide](llm-docs/overlook-native-app.
 | <kbd>E</kbd> | Archive, or Move to Inbox when already archived |
 | <kbd>Delete</kbd> | Move to Trash |
 | <kbd>S</kbd> / <kbd>U</kbd> | Star / toggle read |
-| <kbd>Ctrl</kbd>+<kbd>1</kbd> / <kbd>Ctrl</kbd>+<kbd>2</kbd> | Mail / Calendar |
+| <kbd>Ctrl</kbd>+<kbd>1</kbd> / <kbd>2</kbd> / <kbd>3</kbd> | Mail / Calendar / Contacts |
 | <kbd>Ctrl</kbd>+<kbd>Shift</kbd>+<kbd>A</kbd> | New event |
 | <kbd>←</kbd> <kbd>→</kbd> <kbd>T</kbd> <kbd>D</kbd> <kbd>W</kbd> <kbd>M</kbd> <kbd>A</kbd> | Calendar: move, today, day, week, month, agenda |
 | <kbd>Enter</kbd> / <kbd>Delete</kbd> | Calendar: edit / delete the selected event |

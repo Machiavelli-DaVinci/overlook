@@ -1,8 +1,10 @@
 # Google OAuth verification
 
 Status (2026-10-12): preparing the submission for project `overlook-511415` (Desktop app client).
-Sensitive scopes: `gmail.send`, `calendar.events`, `calendar.readonly`, `contacts.readonly`,
-`contacts.other.readonly` (added 2026-10-12 for recipient suggestions and sender cards). Restricted scopes:
+Sensitive scopes: `gmail.send`, `calendar.events`, `calendar.readonly`, `contacts` (read-write, 2026-10-13:
+the Contacts module adds, edits and deletes address-book entries through the People API; it replaced
+`contacts.readonly`), `contacts.other.readonly` (2026-10-12, the "other contacts" list for recipient
+suggestions). Restricted scopes:
 `gmail.modify` and `gmail.settings.basic` (added 2026-10-12 for automatic replies; read and write of the
 vacation responder only). Both need the yearly CASA Tier 2 security assessment in addition to the review.
 The justification texts below predate the three new scopes; add a sentence for each before submitting.

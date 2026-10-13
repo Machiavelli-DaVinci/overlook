@@ -4,6 +4,7 @@ use super::api::{ApiError, GmailClient};
 use super::mapping::{self, base64url_encode, gmail_id, label_from_json, message_from_json};
 use super::mime::build_raw;
 use crate::{draft_message_id, BoxFuture, MailProvider, MailboxSnapshot, ProviderError, RemoteChanges, SendContext, SendOutcome, SentReceipt};
+use overlook_core::time::Timestamp;
 use overlook_core::*;
 use serde_json::{json, Value};
 use std::collections::{BTreeSet, HashMap};
@@ -250,6 +251,10 @@ impl MailProvider for GmailProvider {
         self.client.has_scope(super::oauth::CONTACTS_SCOPE_MARKER)
     }
 
+    fn has_contacts_write_access(&self) -> bool {
+        self.client.tokens().scope.as_deref().is_some_and(|s| s.split_whitespace().any(|x| x == super::oauth::CONTACTS_WRITE_SCOPE))
+    }
+
     fn fetch_contacts(&self, account: &Account) -> BoxFuture<'_, Result<Option<Vec<Contact>>, ProviderError>> {
         let account = account.clone();
         Box::pin(async move {
@@ -258,49 +263,15 @@ impl MailProvider for GmailProvider {
             }
             let now = overlook_core::time::now();
             let mut out: Vec<Contact> = Vec::new();
-            let mut seen: HashMap<String, usize> = HashMap::new();
-            let mut push = |email: &str, name: Option<String>, photo: Option<String>, in_book: bool, out: &mut Vec<Contact>| {
-                let key = email.trim().to_ascii_lowercase();
-                if key.is_empty() || !key.contains('@') {
-                    return;
-                }
-                match seen.get(&key) {
-                    Some(&i) => {
-                        let c = &mut out[i];
-                        c.in_address_book |= in_book;
-                        if c.name.is_none() {
-                            c.name = name;
-                        }
-                        if c.photo_url.is_none() {
-                            c.photo_url = photo;
-                        }
-                    }
-                    None => {
-                        seen.insert(key.clone(), out.len());
-                        out.push(Contact { account_id: account.id.clone(), email: key, name, photo_url: photo, in_address_book: in_book, updated: now });
-                    }
-                }
-            };
-            let mut collect = |v: &Value, list: &str, in_book: bool, out: &mut Vec<Contact>| {
-                for person in v.get(list).and_then(|c| c.as_array()).into_iter().flatten() {
-                    let name = person.get("names").and_then(|n| n.as_array()).and_then(|a| a.first()).and_then(|n| n.get("displayName")).and_then(|d| d.as_str()).map(str::to_owned);
-                    let photo = person.get("photos").and_then(|p| p.as_array()).and_then(|a| a.iter().find(|p| p.get("default").and_then(|d| d.as_bool()) != Some(true)).or(a.first())).and_then(|p| p.get("url")).and_then(|u| u.as_str()).map(str::to_owned);
-                    for e in person.get("emailAddresses").and_then(|e| e.as_array()).into_iter().flatten() {
-                        if let Some(value) = e.get("value").and_then(|v| v.as_str()) {
-                            push(value, name.clone(), photo.clone(), in_book, out);
-                        }
-                    }
-                }
-            };
             for (url, list, in_book) in [
-                ("https://people.googleapis.com/v1/people/me/connections?personFields=names,emailAddresses,photos&pageSize=1000", "connections", true),
-                ("https://people.googleapis.com/v1/otherContacts?readMask=names,emailAddresses&pageSize=1000", "otherContacts", false),
+                (format!("{PEOPLE_BASE}/people/me/connections?personFields={PERSON_FIELDS}&pageSize=1000"), "connections", true),
+                (format!("{PEOPLE_BASE}/otherContacts?readMask=names,emailAddresses,phoneNumbers&pageSize=1000"), "otherContacts", false),
             ] {
                 let mut page: Option<String> = None;
                 loop {
                     let full = match &page {
                         Some(p) => format!("{url}&pageToken={}", super::oauth::url_encode(p)),
-                        None => url.to_owned(),
+                        None => url.clone(),
                     };
                     let v = match self.client.get_url(&full) {
                         Ok(v) => v,
@@ -309,7 +280,11 @@ impl MailProvider for GmailProvider {
                         Err(ApiError::Client(403, _)) | Err(ApiError::Unauthorized) => break,
                         Err(e) => return Err(e.into()),
                     };
-                    collect(&v, list, in_book, &mut out);
+                    for person in v.get(list).and_then(|c| c.as_array()).into_iter().flatten() {
+                        if let Some(c) = contact_from_person(&account.id, person, in_book, now) {
+                            out.push(c);
+                        }
+                    }
                     page = v.get("nextPageToken").and_then(|t| t.as_str()).map(str::to_owned);
                     if page.is_none() {
                         break;
@@ -317,6 +292,62 @@ impl MailProvider for GmailProvider {
                 }
             }
             Ok(Some(out))
+        })
+    }
+
+    fn create_contact(&self, account: &Account, contact: &Contact) -> BoxFuture<'_, Result<Contact, ProviderError>> {
+        let account = account.clone();
+        let contact = contact.clone();
+        Box::pin(async move {
+            if !self.has_contacts_write_access() {
+                return Err(ProviderError::SignInRequired);
+            }
+            let url = format!("{PEOPLE_BASE}/people:createContact?personFields={PERSON_FIELDS}");
+            let v = self.client.post_url(&url, &person_json(&contact, None))?;
+            contact_from_person(&account.id, &v, true, overlook_core::time::now()).ok_or_else(|| ProviderError::Rejected("Google returned an unreadable contact".into()))
+        })
+    }
+
+    fn update_contact(&self, account: &Account, contact: &Contact) -> BoxFuture<'_, Result<Contact, ProviderError>> {
+        let account = account.clone();
+        let contact = contact.clone();
+        Box::pin(async move {
+            if !self.has_contacts_write_access() {
+                return Err(ProviderError::SignInRequired);
+            }
+            // The update needs the current etag; fetch it when the local copy has none or
+            // when Google says ours is stale.
+            let fetch_etag = || -> Result<Option<String>, ApiError> {
+                let v = self.client.get_url(&format!("{PEOPLE_BASE}/{}?personFields=metadata", contact.id))?;
+                Ok(v.get("etag").and_then(|e| e.as_str()).map(str::to_owned))
+            };
+            let mut etag = contact.etag.clone();
+            if etag.is_none() {
+                etag = fetch_etag()?;
+            }
+            let url = format!("{PEOPLE_BASE}/{}:updateContact?updatePersonFields={UPDATE_FIELDS}&personFields={PERSON_FIELDS}", contact.id);
+            let v = match self.client.patch_url(&url, &person_json(&contact, etag.as_deref())) {
+                Ok(v) => v,
+                Err(ApiError::Client(400, m)) if m.to_ascii_lowercase().contains("etag") => {
+                    let fresh = fetch_etag()?;
+                    self.client.patch_url(&url, &person_json(&contact, fresh.as_deref()))?
+                }
+                Err(e) => return Err(e.into()),
+            };
+            contact_from_person(&account.id, &v, true, overlook_core::time::now()).ok_or_else(|| ProviderError::Rejected("Google returned an unreadable contact".into()))
+        })
+    }
+
+    fn delete_contact(&self, _account: &Account, resource_name: &str) -> BoxFuture<'_, Result<(), ProviderError>> {
+        let resource_name = resource_name.to_owned();
+        Box::pin(async move {
+            if !self.has_contacts_write_access() {
+                return Err(ProviderError::SignInRequired);
+            }
+            match self.client.delete_url(&format!("{PEOPLE_BASE}/{resource_name}:deleteContact")) {
+                Ok(_) | Err(ApiError::NotFound) => Ok(()),
+                Err(e) => Err(e.into()),
+            }
         })
     }
 
@@ -571,4 +602,94 @@ impl MailProvider for GmailProvider {
             })
         })
     }
+}
+
+pub const PEOPLE_BASE: &str = "https://people.googleapis.com/v1";
+const PERSON_FIELDS: &str = "names,emailAddresses,phoneNumbers,organizations,biographies,photos,metadata";
+const UPDATE_FIELDS: &str = "names,emailAddresses,phoneNumbers,organizations,biographies";
+
+/// A People API person as a contact. `None` when it has neither a name nor an address.
+pub fn contact_from_person(account: &AccountId, person: &Value, in_book: bool, now: Timestamp) -> Option<Contact> {
+    let id = person.get("resourceName")?.as_str()?.to_owned();
+    let name_obj = person.get("names").and_then(|n| n.as_array()).and_then(|a| a.first());
+    let str_at = |obj: Option<&Value>, key: &str| obj.and_then(|o| o.get(key)).and_then(|v| v.as_str()).map(str::to_owned).filter(|s| !s.trim().is_empty());
+    let name = str_at(name_obj, "displayName");
+    let emails: Vec<String> = person
+        .get("emailAddresses")
+        .and_then(|e| e.as_array())
+        .map(|arr| arr.iter().filter_map(|e| e.get("value").and_then(|v| v.as_str())).map(|v| v.trim().to_ascii_lowercase()).filter(|v| v.contains('@')).collect())
+        .unwrap_or_default();
+    if name.is_none() && emails.is_empty() {
+        return None;
+    }
+    let org = person.get("organizations").and_then(|o| o.as_array()).and_then(|a| a.first());
+    let photo = person
+        .get("photos")
+        .and_then(|p| p.as_array())
+        .and_then(|a| a.iter().find(|p| p.get("default").and_then(|d| d.as_bool()) != Some(true)).or(a.first()))
+        .and_then(|p| p.get("url"))
+        .and_then(|u| u.as_str())
+        .map(str::to_owned);
+    Some(Contact {
+        id,
+        account_id: account.clone(),
+        email: emails.first().cloned().unwrap_or_default(),
+        emails,
+        name,
+        given_name: str_at(name_obj, "givenName"),
+        family_name: str_at(name_obj, "familyName"),
+        phone: person.get("phoneNumbers").and_then(|p| p.as_array()).and_then(|a| a.first()).and_then(|p| p.get("value")).and_then(|v| v.as_str()).map(str::to_owned),
+        organization: str_at(org, "name"),
+        title: str_at(org, "title"),
+        notes: person.get("biographies").and_then(|b| b.as_array()).and_then(|a| a.first()).and_then(|b| b.get("value")).and_then(|v| v.as_str()).map(str::to_owned),
+        photo_url: photo,
+        in_address_book: in_book,
+        etag: person.get("etag").and_then(|e| e.as_str()).map(str::to_owned),
+        updated: now,
+        pending: false,
+    })
+}
+
+/// The People API body for creating or updating a contact.
+pub fn person_json(c: &Contact, etag: Option<&str>) -> Value {
+    let mut body = json!({});
+    if let Some(e) = etag {
+        body["etag"] = Value::String(e.to_owned());
+    }
+    let mut names = json!({});
+    if let Some(g) = c.given_name.as_deref().filter(|s| !s.trim().is_empty()) {
+        names["givenName"] = Value::String(g.trim().to_owned());
+    }
+    if let Some(f) = c.family_name.as_deref().filter(|s| !s.trim().is_empty()) {
+        names["familyName"] = Value::String(f.trim().to_owned());
+    }
+    if names.as_object().is_some_and(|o| o.is_empty()) {
+        if let Some(n) = c.name.as_deref().filter(|s| !s.trim().is_empty()) {
+            let mut parts = n.trim().splitn(2, ' ');
+            names["givenName"] = Value::String(parts.next().unwrap_or("").to_owned());
+            if let Some(rest) = parts.next() {
+                names["familyName"] = Value::String(rest.to_owned());
+            }
+        }
+    }
+    body["names"] = if names.as_object().is_some_and(|o| o.is_empty()) { json!([]) } else { json!([names]) };
+    let emails: Vec<Value> = std::iter::once(c.email.clone()).chain(c.emails.iter().cloned()).filter(|e| !e.trim().is_empty()).fold(Vec::<String>::new(), |mut acc, e| { if !acc.iter().any(|x| x.eq_ignore_ascii_case(&e)) { acc.push(e); } acc }).into_iter().map(|e| json!({ "value": e })).collect();
+    body["emailAddresses"] = Value::Array(emails);
+    body["phoneNumbers"] = match c.phone.as_deref().filter(|p| !p.trim().is_empty()) {
+        Some(p) => json!([{ "value": p.trim() }]),
+        None => json!([]),
+    };
+    let mut org = json!({});
+    if let Some(o) = c.organization.as_deref().filter(|s| !s.trim().is_empty()) {
+        org["name"] = Value::String(o.trim().to_owned());
+    }
+    if let Some(t) = c.title.as_deref().filter(|s| !s.trim().is_empty()) {
+        org["title"] = Value::String(t.trim().to_owned());
+    }
+    body["organizations"] = if org.as_object().is_some_and(|o| o.is_empty()) { json!([]) } else { json!([org]) };
+    body["biographies"] = match c.notes.as_deref().filter(|n| !n.trim().is_empty()) {
+        Some(n) => json!([{ "value": n.trim(), "contentType": "TEXT_PLAIN" }]),
+        None => json!([]),
+    };
+    body
 }

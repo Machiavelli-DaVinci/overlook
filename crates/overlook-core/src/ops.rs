@@ -47,6 +47,12 @@ pub enum OperationKind {
         #[serde(default)]
         original_start: Option<Timestamp>,
     },
+    /// Push a contact created on this device.
+    CreateContact { contact_id: String },
+    /// Push local edits of a contact.
+    UpdateContact { contact_id: String },
+    /// Delete a contact at the provider.
+    DeleteContact { contact_id: String, resource_name: Option<String> },
 }
 
 impl OperationKind {
@@ -70,6 +76,20 @@ impl OperationKind {
             OperationKind::CreateEvent { .. } => "Create event".to_owned(),
             OperationKind::UpdateEvent { .. } => "Update event".to_owned(),
             OperationKind::DeleteEvent { .. } => "Delete event".to_owned(),
+            OperationKind::CreateContact { .. } => "Add contact".to_owned(),
+            OperationKind::UpdateContact { .. } => "Update contact".to_owned(),
+            OperationKind::DeleteContact { .. } => "Delete contact".to_owned(),
+        }
+    }
+
+    pub fn is_contact(&self) -> bool {
+        matches!(self, OperationKind::CreateContact { .. } | OperationKind::UpdateContact { .. } | OperationKind::DeleteContact { .. })
+    }
+
+    pub fn contact_id(&self) -> Option<&str> {
+        match self {
+            OperationKind::CreateContact { contact_id } | OperationKind::UpdateContact { contact_id } | OperationKind::DeleteContact { contact_id, .. } => Some(contact_id),
+            _ => None,
         }
     }
 
@@ -101,7 +121,10 @@ impl OperationKind {
             | OperationKind::RespondToEvent { .. }
             | OperationKind::CreateEvent { .. }
             | OperationKind::UpdateEvent { .. }
-            | OperationKind::DeleteEvent { .. } => &[],
+            | OperationKind::DeleteEvent { .. }
+            | OperationKind::CreateContact { .. }
+            | OperationKind::UpdateContact { .. }
+            | OperationKind::DeleteContact { .. } => &[],
         }
     }
 

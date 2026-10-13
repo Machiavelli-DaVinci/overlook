@@ -144,6 +144,24 @@ pub trait MailProvider: Send + Sync {
         Box::pin(async { Ok(None) })
     }
 
+    /// Whether contacts can be created, changed and deleted at the provider.
+    fn has_contacts_write_access(&self) -> bool {
+        false
+    }
+
+    /// Creates the contact at the provider; returns the provider's copy, with its id.
+    fn create_contact(&self, _account: &Account, _contact: &Contact) -> BoxFuture<'_, Result<Contact, ProviderError>> {
+        Box::pin(async { Err(ProviderError::Rejected("this account cannot store contacts".into())) })
+    }
+
+    fn update_contact(&self, _account: &Account, _contact: &Contact) -> BoxFuture<'_, Result<Contact, ProviderError>> {
+        Box::pin(async { Err(ProviderError::Rejected("this account cannot store contacts".into())) })
+    }
+
+    fn delete_contact(&self, _account: &Account, _resource_name: &str) -> BoxFuture<'_, Result<(), ProviderError>> {
+        Box::pin(async { Err(ProviderError::Rejected("this account cannot store contacts".into())) })
+    }
+
     /// The message as RFC 822 bytes, for "Save as .eml" and "View source". The default
     /// rebuilds it from the stored headers and body.
     fn fetch_raw(&self, _account: &Account, message: &Message) -> BoxFuture<'_, Result<Vec<u8>, ProviderError>> {

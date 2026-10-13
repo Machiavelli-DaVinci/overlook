@@ -32,6 +32,7 @@ struct Inner {
     event_overrides: Mutex<Vec<Event>>,
     deleted_events: Mutex<HashSet<String>>,
     vacation: Mutex<VacationSettings>,
+    contacts: Mutex<Vec<Contact>>,
 }
 
 impl Default for SampleProvider {
@@ -53,6 +54,7 @@ impl SampleProvider {
                 event_overrides: Mutex::new(Vec::new()),
                 deleted_events: Mutex::new(HashSet::new()),
                 vacation: Mutex::new(VacationSettings::default()),
+                contacts: Mutex::new(Vec::new()),
             }),
         }
     }
@@ -119,6 +121,78 @@ impl MailProvider for SampleProvider {
         true
     }
 
+    fn has_contacts_write_access(&self) -> bool {
+        true
+    }
+
+    fn fetch_contacts(&self, account: &Account) -> BoxFuture<'_, Result<Option<Vec<Contact>>, ProviderError>> {
+        let account = account.clone();
+        Box::pin(async move {
+            self.require_online()?;
+            let mut book = self.inner.contacts.lock().unwrap();
+            if book.is_empty() {
+                let now = overlook_core::time::now();
+                let make = |id: &str, name: &str, email: &str, org: Option<&str>, in_book: bool| Contact {
+                    id: id.into(),
+                    account_id: account.id.clone(),
+                    email: email.into(),
+                    emails: vec![email.into()],
+                    name: Some(name.into()),
+                    given_name: name.split(' ').next().map(str::to_owned),
+                    family_name: name.split(' ').nth(1).map(str::to_owned),
+                    organization: org.map(str::to_owned),
+                    in_address_book: in_book,
+                    updated: now,
+                    ..Default::default()
+                };
+                book.extend([
+                    make("people/c1", "Maya Chen", "maya@northstar.example", Some("Northstar Studio"), true),
+                    make("people/c2", "Alex Rivera", "alex@northstar.example", Some("Northstar Studio"), true),
+                    make("people/c3", "Daniel Okafor", "daniel@example.com", None, true),
+                    make("people/c4", "Sophie Lindqvist", "sophie@example.com", None, true),
+                    make("otherContacts/c5", "Priya Natarajan", "priya@fieldandvine.example", None, false),
+                ]);
+            }
+            Ok(Some(book.clone()))
+        })
+    }
+
+    fn create_contact(&self, _account: &Account, contact: &Contact) -> BoxFuture<'_, Result<Contact, ProviderError>> {
+        let mut c = contact.clone();
+        Box::pin(async move {
+            self.require_online()?;
+            self.sleep().await;
+            c.id = format!("people/{}", self.next_id("c").0);
+            c.pending = false;
+            c.in_address_book = true;
+            c.etag = Some("v1".into());
+            self.inner.contacts.lock().unwrap().push(c.clone());
+            Ok(c)
+        })
+    }
+
+    fn update_contact(&self, _account: &Account, contact: &Contact) -> BoxFuture<'_, Result<Contact, ProviderError>> {
+        let mut c = contact.clone();
+        Box::pin(async move {
+            self.require_online()?;
+            self.sleep().await;
+            c.pending = false;
+            let mut book = self.inner.contacts.lock().unwrap();
+            book.retain(|x| x.id != c.id);
+            book.push(c.clone());
+            Ok(c)
+        })
+    }
+
+    fn delete_contact(&self, _account: &Account, resource_name: &str) -> BoxFuture<'_, Result<(), ProviderError>> {
+        let id = resource_name.to_owned();
+        Box::pin(async move {
+            self.require_online()?;
+            self.inner.contacts.lock().unwrap().retain(|x| x.id != id);
+            Ok(())
+        })
+    }
+
     fn has_settings_access(&self) -> bool {
         true
     }
@@ -136,22 +210,6 @@ impl MailProvider for SampleProvider {
             self.require_online()?;
             *self.inner.vacation.lock().unwrap() = settings;
             Ok(())
-        })
-    }
-
-    fn fetch_contacts(&self, account: &Account) -> BoxFuture<'_, Result<Option<Vec<Contact>>, ProviderError>> {
-        let account = account.clone();
-        Box::pin(async move {
-            self.require_online()?;
-            let now = overlook_core::time::now();
-            let book = |name: &str, email: &str, in_book: bool| Contact { account_id: account.id.clone(), email: email.into(), name: Some(name.into()), photo_url: None, in_address_book: in_book, updated: now };
-            Ok(Some(vec![
-                book("Maya Chen", "maya@northstar.example", true),
-                book("Alex Rivera", "alex@northstar.example", true),
-                book("Daniel Okafor", "daniel@example.com", true),
-                book("Sophie Lindqvist", "sophie@example.com", true),
-                book("Priya Natarajan", "priya@fieldandvine.example", false),
-            ]))
         })
     }
 
