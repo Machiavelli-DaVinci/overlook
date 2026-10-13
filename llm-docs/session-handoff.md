@@ -144,3 +144,5 @@ Brand assets and the HTML design preview keep their existing maintenance command
 - Contacts module (2026-10-13): third module with add/edit/delete through the People API; scope
   `contacts` (read-write) replaces `contacts.readonly`. Schema v10 `people` table. The OAuth scope set is
   now final for the verification submission; the demo video must show Contacts as well.
+
+- v0.4.0 published 2026-10-13 (Contacts module with People API read-write; author text colours kept; Outlook reply headers shown inline; quotes collapse only when they repeat the thread). Working version is now 0.4.1.
