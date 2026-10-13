@@ -135,3 +135,8 @@ Brand assets and the HTML design preview keep their existing maintenance command
   "Sign in again" in Settings → Accounts for contacts and automatic replies until re-authorised.
 
 - v0.3.0 published 2026-10-12 (Gmail batch endpoint, PDF previews, colspan, contacts, named signatures + automatic replies, mailto single instance, reminder snooze, calendar keys, sup/sub). Working version is now 0.3.1.
+
+- Rendering follow-up (2026-10-12): author text colours are kept and theme-adapted; Outlook From:/Sent:
+  header blocks are no longer treated as quote markers; nested quote splitting takes trailing nodes;
+  quotes collapse only when they repeat the thread. Verified on the annotated board-topics message in
+  both themes.

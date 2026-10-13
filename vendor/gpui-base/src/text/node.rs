@@ -607,6 +607,8 @@ pub struct TextMark {
     ///
     /// `None` means the text is not highlighted.
     pub highlight: Option<Hsla>,
+    /// Overlook patch: an explicit text colour from `style="color: …"` or `<font color>`.
+    pub color: Option<Hsla>,
     pub link: Option<LinkMark>,
 }
 
@@ -642,6 +644,12 @@ impl TextMark {
         self
     }
 
+    /// Overlook patch: colour the text itself.
+    pub fn color(mut self, color: Hsla) -> Self {
+        self.color = Some(color);
+        self
+    }
+
     pub fn link(mut self, link: impl Into<LinkMark>) -> Self {
         self.link = Some(link.into());
         self
@@ -653,6 +661,9 @@ impl TextMark {
         self.strikethrough |= other.strikethrough;
         self.underline |= other.underline;
         self.code |= other.code;
+        if other.color.is_some() {
+            self.color = other.color;
+        }
         if other.highlight.is_some() {
             self.highlight = other.highlight;
         }
@@ -2415,6 +2426,9 @@ fn mark_highlight(mark: &TextMark, node_cx: &NodeContext, cx: &App) -> InlineHig
     }
     if let Some(color) = mark.highlight {
         highlight.background_color = Some(color);
+    }
+    if let Some(color) = mark.color {
+        highlight.color = Some(color);
     }
     InlineHighlight {
         style: highlight,

@@ -49,26 +49,24 @@ fn builder(policy: RemoteContent) -> ammonia::Builder<'static> {
     builder.add_tag_attributes("td", ["colspan", "rowspan"]);
     builder.add_tag_attributes("th", ["colspan", "rowspan"]);
     builder.add_tag_attributes("ol", ["start"]);
-    builder.link_rel(Some("noopener noreferrer"));
-    builder.url_schemes(["http", "https", "mailto"].into_iter().collect());
-    builder.strip_comments(true);
-    match policy {
-        RemoteContent::Blocked => {
-            // Only inline `cid:` references survive; everything remote is removed.
-            builder.url_schemes(["http", "https", "mailto", "cid"].into_iter().collect());
-            builder.attribute_filter(|element, attribute, value| {
-                if element == "img" && attribute == "src" && !value.starts_with("cid:") {
-                    None
-                } else {
-                    Some(value.into())
-                }
-            });
-        }
-        RemoteContent::Allowed => {
-            builder.url_schemes(["http", "https", "mailto", "cid"].into_iter().collect());
-        }
+    // Only the text colour survives of an author's styling; everything else is layout.
+    for tag in ["span", "font", "b", "i", "strong", "em", "u", "p", "div", "li"] {
+        builder.add_tag_attributes(tag, ["style"]);
     }
-
+    builder.add_tag_attributes("font", ["color"]);
+    builder.link_rel(Some("noopener noreferrer"));
+    builder.url_schemes(["http", "https", "mailto", "cid"].into_iter().collect());
+    builder.strip_comments(true);
+    let blocked = policy == RemoteContent::Blocked;
+    builder.attribute_filter(move |element, attribute, value| {
+        if attribute == "style" {
+            return color_only_style(value).map(Into::into);
+        }
+        if blocked && element == "img" && attribute == "src" && !value.starts_with("cid:") {
+            return None;
+        }
+        Some(value.into())
+    });
     builder
 }
 
@@ -257,6 +255,124 @@ fn is_data_table(block: &str) -> bool {
     let consistent = first >= 2 && first <= 8 && cell_counts.iter().all(|&n| n == first || n == 0);
     let short = cells > 0 && longest <= 160 && total / cells <= 60;
     (has_header && consistent) || (consistent && short)
+}
+
+/// `color: …` from a style attribute, or nothing: the only declaration the reader keeps.
+fn color_only_style(style: &str) -> Option<String> {
+    for decl in style.split(';') {
+        let Some((key, value)) = decl.split_once(':') else { continue };
+        if key.trim().eq_ignore_ascii_case("color") {
+            let value = value.trim().trim_end_matches("!important").trim();
+            if !value.is_empty() && value.len() <= 40 && value.chars().all(|c| c.is_ascii_alphanumeric() || matches!(c, '#' | '(' | ')' | ',' | ' ' | '.' | '%')) {
+                return Some(format!("color:{value}"));
+            }
+        }
+    }
+    None
+}
+
+/// Rewrites explicit text colours so they stay readable on the current theme: dark colours
+/// are lightened for the dark theme, near-white ones darkened for the light theme. Hue is
+/// kept, so red stays red.
+pub fn adapt_colors(html: &str, dark: bool) -> String {
+    let mut out = String::with_capacity(html.len());
+    let mut rest = html;
+    while let Some(i) = rest.find("color").map(|i| i) {
+        // Match `color:` inside style, or `color="` on <font>.
+        let after = &rest[i + 5..];
+        let (sep_len, quote_end) = if after.starts_with(':') {
+            (1, [';', '"', '\''])
+        } else if after.starts_with("=\"") {
+            (2, ['"', '"', '"'])
+        } else {
+            out.push_str(&rest[..i + 5]);
+            rest = after;
+            continue;
+        };
+        let value_start = i + 5 + sep_len;
+        let value_end = rest[value_start..].find(|c: char| quote_end.contains(&c)).map(|e| value_start + e).unwrap_or(rest.len());
+        let value = rest[value_start..value_end].trim();
+        let replaced = parse_hex_color(value).map(|(r, g, b)| adapt_rgb(r, g, b, dark)).map(|(r, g, b)| format!("#{r:02x}{g:02x}{b:02x}"));
+        out.push_str(&rest[..value_start]);
+        match replaced {
+            Some(c) => out.push_str(&c),
+            None => out.push_str(&rest[value_start..value_end]),
+        }
+        rest = &rest[value_end..];
+    }
+    out.push_str(rest);
+    out
+}
+
+fn parse_hex_color(value: &str) -> Option<(u8, u8, u8)> {
+    let v = value.trim().to_ascii_lowercase();
+    let named = match v.as_str() {
+        "red" => Some((0xff, 0, 0)),
+        "darkred" | "maroon" => Some((0x8b, 0, 0)),
+        "green" => Some((0, 0x80, 0)),
+        "blue" => Some((0, 0, 0xff)),
+        "navy" => Some((0, 0, 0x80)),
+        "orange" => Some((0xff, 0xa5, 0)),
+        "purple" => Some((0x80, 0, 0x80)),
+        "gray" | "grey" => Some((0x80, 0x80, 0x80)),
+        "black" | "windowtext" => Some((0, 0, 0)),
+        "white" => Some((0xff, 0xff, 0xff)),
+        _ => None,
+    };
+    if named.is_some() {
+        return named;
+    }
+    if let Some(inner) = v.strip_prefix("rgb(").or_else(|| v.strip_prefix("rgba(")) {
+        let p: Vec<u8> = inner.trim_end_matches(')').split(',').take(3).filter_map(|x| x.trim().parse::<f32>().ok()).map(|f| f.clamp(0., 255.) as u8).collect();
+        return (p.len() == 3).then(|| (p[0], p[1], p[2]));
+    }
+    let hex = v.strip_prefix('#')?;
+    let hex: String = if hex.len() == 3 { hex.chars().flat_map(|c| [c, c]).collect() } else { hex.to_owned() };
+    if hex.len() != 6 {
+        return None;
+    }
+    let n = u32::from_str_radix(&hex, 16).ok()?;
+    Some(((n >> 16) as u8, (n >> 8) as u8, n as u8))
+}
+
+/// Adjusts lightness only, in HSL, so the hue the author chose is kept.
+fn adapt_rgb(r: u8, g: u8, b: u8, dark: bool) -> (u8, u8, u8) {
+    let (rf, gf, bf) = (r as f32 / 255., g as f32 / 255., b as f32 / 255.);
+    let max = rf.max(gf).max(bf);
+    let min = rf.min(gf).min(bf);
+    let l = (max + min) / 2.;
+    let d = max - min;
+    let s = if d == 0. { 0. } else { d / (1. - (2. * l - 1.).abs()) };
+    let h = if d == 0. {
+        0.
+    } else if max == rf {
+        60. * (((gf - bf) / d) % 6.)
+    } else if max == gf {
+        60. * ((bf - rf) / d + 2.)
+    } else {
+        60. * ((rf - gf) / d + 4.)
+    };
+    let h = if h < 0. { h + 360. } else { h };
+    let new_l: f32 = if dark && l < 0.45 {
+        if s < 0.15 { 0.82 } else { 0.68 }
+    } else if !dark && l > 0.8 {
+        if s < 0.15 { 0.25 } else { 0.38 }
+    } else {
+        return (r, g, b);
+    };
+    // HSL back to RGB.
+    let c = (1. - (2. * new_l - 1.).abs()) * s;
+    let x = c * (1. - ((h / 60.) % 2. - 1.).abs());
+    let m = new_l - c / 2.;
+    let (r1, g1, b1) = match h as u32 {
+        0..=59 => (c, x, 0.),
+        60..=119 => (x, c, 0.),
+        120..=179 => (0., c, x),
+        180..=239 => (0., x, c),
+        240..=299 => (x, 0., c),
+        _ => (c, 0., x),
+    };
+    (((r1 + m) * 255.).round() as u8, ((g1 + m) * 255.).round() as u8, ((b1 + m) * 255.).round() as u8)
 }
 
 fn count_remote(html: &str) -> usize {
@@ -546,6 +662,18 @@ mod tests {
         let nested = sanitize_html("<table><tr><td><p>Hello there, this is a long paragraph of newsletter copy that runs on well past the length of any data cell and keeps going.</p><table><tr><td><p>Another long paragraph of copy inside the nested layout table that is also far too long for a data cell.</p></td><td>b</td></tr></table></td></tr></table>", RemoteContent::Blocked);
         assert!(!nested.html.contains("<table"), "{}", nested.html);
         assert!(nested.html.contains("<p>Hello there") && nested.html.contains("\u{a0}\u{a0}\u{a0}\u{a0}b"), "{}", nested.html);
+    }
+
+    #[test]
+    fn text_colour_survives_and_adapts() {
+        let s = sanitize_html(r##"<p>Topic <span style="color:red; font-size:11pt; mso-fareast-language:EN-US">careful</span> and <font color="#1F497D" face="Calibri">navy</font></p>"##, RemoteContent::Blocked);
+        assert!(s.html.contains(r#"<span style="color:red">careful</span>"#), "{}", s.html);
+        assert!(s.html.contains(r##"<font color="#1F497D">navy</font>"##), "{}", s.html);
+        let dark = adapt_colors(&s.html, true);
+        assert!(dark.contains("color:#ff0000") || dark.contains("color:red"), "{dark}");
+        assert!(!dark.contains("#1F497D") && !dark.contains("#1f497d"), "{dark}");
+        let light = adapt_colors(r##"<span style="color:#ffffff">x</span>"##, false);
+        assert!(!light.contains("#ffffff"), "{light}");
     }
 
     #[test]

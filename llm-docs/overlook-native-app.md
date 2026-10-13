@@ -147,13 +147,20 @@ Received HTML goes through three stages before the native view sees it, all in `
    blocks (Gmail's `<div><br></div>`, Outlook's `<p>&nbsp;</p>`), trims `<br>`s that only add blank
    lines, rewrites `<center>` to `<div>` and `<dt>/<dd>` to blocks, protects `<pre>` whitespace, turns
    bare URLs into links, and splits the quoted history of a reply (Gmail `gmail_quote`, `blockquote
-   type=cite`, Yahoo, Thunderbird, Outlook's `From:` header block) into `Sanitized.quoted`. Forwards
-   are not split.
+   type=cite`, Yahoo, Thunderbird) into `Sanitized.quoted`, taking everything after the quote start at
+   every nesting level. Forwards and Outlook's `From: / Sent: / To:` header blocks are not split: the
+   header is context for notes people write inside the quoted text, and Gmail shows it too.
 2. `sanitize_html` (ammonia) enforces the tag and attribute allow-list and the remote-image policy,
-   then `flatten_tables` turns layout tables into block flow.
+   then `flatten_tables` turns layout tables into block flow. Of an author's inline styling only the
+   text colour is kept (`style="color:…"` reduced to that one declaration, `<font color>`), because
+   colour carries meaning in annotated replies; the vendored view renders it through a `TextMark`
+   colour. The reader runs `adapt_colors` so dark colours lighten on the dark theme and near-white
+   ones darken on the light theme, hue preserved.
 3. The view, `TextView::html` from the vendored `gpui-base` (see `vendor/README.md`), renders it.
 
-The reader collapses `Sanitized.quoted` behind "Show quoted text" per message, and replaces `cid:`
+The reader collapses `Sanitized.quoted` behind "Show quoted text" only when the quoted text repeats an
+earlier message of the same conversation (`quote_repeats_thread`); otherwise it is shown inline, since a
+quote the reader has never seen is content, not history. It replaces `cid:
 image references with `data:` URLs built from the downloaded inline attachment (`Attachment.content_id`,
 schema v6; inline images of the open conversation are fetched automatically, up to 4 MB each; a
 one-time backfill re-fetches older messages with `cid:` references). Plain-text mail is converted by

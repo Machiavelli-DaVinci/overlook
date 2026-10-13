@@ -343,7 +343,11 @@ fn split_quote(node: &Handle) -> Option<Vec<Handle>> {
             return Some(quoted);
         }
         if matches!(child.data, NodeData::Element { .. }) {
-            if let Some(found) = split_quote(child) {
+            if let Some(mut found) = split_quote(child) {
+                // Everything after the quote in document order goes with it, at every
+                // level: siblings that follow the ancestor holding the quote start too.
+                found.extend(children[i + 1..].iter().cloned());
+                set_children(node, children[..=i].to_vec());
                 return Some(found);
             }
         }
@@ -364,12 +368,10 @@ fn is_quote_start(node: &Handle) -> bool {
                 // A forward is content, not history.
                 return !first_text_matching(node, "gmail_attr").is_some_and(|t| t.contains("Forwarded message"));
             }
-            if class.contains("yahoo_quoted") || class.contains("moz-cite-prefix") || id == "divrplyfwdmsg" || id == "appendonsend" {
-                return true;
-            }
-            // Outlook desktop: a top border followed by the From:/Sent:/To: header block.
-            let style = attr(&attrs, "style").unwrap_or("").to_ascii_lowercase();
-            style.contains("border-top") && subtree_text(node, 200).trim_start().starts_with("From:")
+            // Outlook's "From: / Sent: / To:" header block is deliberately not a quote
+            // marker: people annotate inside the text that follows it, and the header is
+            // the context for those notes. It stays inline, as Gmail shows it.
+            class.contains("yahoo_quoted") || class.contains("moz-cite-prefix") || id == "divrplyfwdmsg" || id == "appendonsend"
         }
         _ => false,
     }
@@ -460,8 +462,13 @@ mod tests {
     fn splits_cite_blockquotes_and_outlook_headers() {
         let p = prepare(r#"<div>Reply</div><blockquote type="cite"><div>older</div></blockquote>"#);
         assert!(p.quoted.as_deref().is_some_and(|q| q.contains("older")) && !p.html.contains("older"));
+        // Outlook's header block and what follows stay inline.
         let o = prepare(r#"<div class="WordSection1"><p>Thanks</p><div style="border:none;border-top:solid #E1E1E1 1.0pt;padding:3.0pt 0in 0in 0in"><p><b>From:</b> A<br><b>Sent:</b> B</p></div><p>original</p></div>"#);
-        assert!(o.quoted.as_deref().is_some_and(|q| q.contains("original")) && o.html.contains("Thanks") && !o.html.contains("original"));
+        assert!(o.quoted.is_none() && o.html.contains("From:") && o.html.contains("original"), "{}", o.html);
+        // A Gmail quote nested one level down takes the nodes after its ancestor with it.
+        let n = prepare(r#"<div><div>New<div class="gmail_quote"><blockquote class="gmail_quote">old</blockquote></div></div><p>trailing signature</p></div>"#);
+        assert!(n.html.contains("New") && !n.html.contains("old") && !n.html.contains("trailing"), "{}", n.html);
+        assert!(n.quoted.as_deref().is_some_and(|q| q.contains("old") && q.contains("trailing")));
     }
 
     #[test]

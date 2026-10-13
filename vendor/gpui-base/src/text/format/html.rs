@@ -132,6 +132,46 @@ pub(super) fn mark_color_from_values(color: Option<&str>, style: Option<&str>) -
     style.and_then(|css_text| parse_mark_color(style_attrs(css_text).get("background-color")?))
 }
 
+/// Overlook patch: CSS colours as mail uses them: `#rgb`, `#rrggbb`, `rgb(r, g, b)` and the
+/// common names.
+pub(super) fn parse_css_color(value: &str) -> Option<Hsla> {
+    let v = value.trim().trim_end_matches("!important").trim().to_ascii_lowercase();
+    if let Some(hex) = v.strip_prefix('#') {
+        let hex = hex.trim();
+        let expanded: String = if hex.len() == 3 { hex.chars().flat_map(|c| [c, c]).collect() } else { hex.to_owned() };
+        if expanded.len() != 6 {
+            return None;
+        }
+        return u32::from_str_radix(&expanded, 16).ok().map(|n| gpui::rgb(n).into());
+    }
+    if let Some(inner) = v.strip_prefix("rgb(").or_else(|| v.strip_prefix("rgba(")) {
+        let parts: Vec<u32> = inner.trim_end_matches(')').split(',').take(3).filter_map(|p| p.trim().parse::<f32>().ok()).map(|f| f.clamp(0., 255.) as u32).collect();
+        if parts.len() == 3 {
+            return Some(gpui::rgb((parts[0] << 16) | (parts[1] << 8) | parts[2]).into());
+        }
+        return None;
+    }
+    let named = match v.as_str() {
+        "red" => 0xff0000,
+        "darkred" | "maroon" => 0x8b0000,
+        "green" => 0x008000,
+        "darkgreen" => 0x006400,
+        "blue" => 0x0000ff,
+        "navy" => 0x000080,
+        "orange" => 0xffa500,
+        "darkorange" => 0xff8c00,
+        "purple" => 0x800080,
+        "gray" | "grey" => 0x808080,
+        "darkgray" | "darkgrey" => 0xa9a9a9,
+        "teal" => 0x008080,
+        "brown" => 0xa52a2a,
+        "magenta" | "fuchsia" => 0xff00ff,
+        "black" | "windowtext" => 0x000000,
+        _ => return None,
+    };
+    Some(gpui::rgb(named).into())
+}
+
 fn parse_mark_color(value: &str) -> Option<Hsla> {
     if value.starts_with('#') {
         return gpui::Rgba::try_from(value).ok().map(Into::into);
@@ -379,6 +419,15 @@ fn parse_paragraph(paragraph: &mut Paragraph, node: &Rc<Node>) {
                     paragraph,
                     Some(TextMark::default().highlight(color)),
                 );
+            }
+            // Overlook patch: an author's text colour (`<span style="color:red">`,
+            // `<font color="#c00">`) is kept; it carries meaning in annotated replies.
+            local_name!("span") | local_name!("font") => {
+                let color = attr_value(&attrs, local_name!("color"))
+                    .as_deref()
+                    .and_then(parse_css_color)
+                    .or_else(|| attr_value(&attrs, local_name!("style")).and_then(|css| style_attrs(&css).get("color").and_then(|v| parse_css_color(v))));
+                merge_children_with_mark(node, paragraph, color.map(|c| TextMark::default().color(c)));
             }
             local_name!("a") => {
                 let link_mark = LinkMark {

@@ -381,8 +381,16 @@ impl MailWindow {
             (None, None) => String::new(),
         };
         let sanitized = sanitize_html(&html, policy);
-        let body_html = self.resolve_inline_images(m, sanitized.html);
-        let quoted_html = sanitized.quoted.map(|q| self.resolve_inline_images(m, q));
+        let dark = p.is_dark();
+        // Quoted history is folded away only when it repeats a message already in this
+        // conversation; otherwise it is part of what the sender wants read.
+        let (body, quoted) = match sanitized.quoted {
+            Some(q) if self.quote_repeats_thread(&q, m) => (sanitized.html, Some(q)),
+            Some(q) => (format!("{}{}", sanitized.html, q), None),
+            None => (sanitized.html, None),
+        };
+        let body_html = self.resolve_inline_images(m, overlook_core::sanitize::adapt_colors(&body, dark));
+        let quoted_html = quoted.map(|q| self.resolve_inline_images(m, overlook_core::sanitize::adapt_colors(&q, dark)));
         let quote_shown = self.quotes_shown.contains(&m.id);
         let quote_id = m.id.clone();
         let to_line = {
@@ -614,6 +622,27 @@ impl MailWindow {
         let url = format!("data:{mime};base64,{}", base64_encode(&bytes));
         self.inline_images.borrow_mut().insert(a.id.clone(), Some(url.clone()));
         Some(url)
+    }
+
+    /// Whether quoted HTML repeats the text of an earlier message in the open conversation.
+    fn quote_repeats_thread(&self, quoted_html: &str, m: &Message) -> bool {
+        fn normalized(text: &str) -> String {
+            text.split_whitespace().collect::<Vec<_>>().join(" ").to_lowercase()
+        }
+        let quoted = normalized(&overlook_core::sanitize::html_to_text(quoted_html));
+        if quoted.len() < 40 {
+            return false;
+        }
+        self.thread.iter().filter(|other| other.id != m.id && other.date <= m.date).any(|other| {
+            let text = other.body.text.clone().or_else(|| other.body.html.as_deref().map(overlook_core::sanitize::html_to_text)).unwrap_or_default();
+            let text = normalized(&text);
+            if text.len() < 40 {
+                return false;
+            }
+            // The first line or two of the earlier message, found inside the quote.
+            let probe: String = text.chars().take(120).collect();
+            quoted.contains(probe.trim())
+        })
     }
 
     /// Who a sender is: address book entry or correspondent, with the two things one does
