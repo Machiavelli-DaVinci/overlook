@@ -149,3 +149,5 @@ Brand assets and the HTML design preview keep their existing maintenance command
 
 - Reader header (2026-10-13): the sender's address sits beside the name ("Brian Cramer <b@…>") and the
   second line is "to …, cc …" only; a rule precedes each embedded message header in a body.
+
+- v0.4.1 published 2026-10-13 (rule before embedded message headers; sender address beside the name). Working version is now 0.4.2.
