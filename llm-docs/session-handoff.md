@@ -126,3 +126,5 @@ Brand assets and the HTML design preview keep their existing maintenance command
   free/busy and Google Meet. Schema v8 (`original_start`, `wants_conference`). Drag and the scope prompt were
   verified by build and unit tests only; no pointer automation was available to click them. Deferred items
   are listed in the roadmap doc.
+
+- v0.2.0 published 2026-10-12 (rich-text composer; online search, reader polish, image previews, data tables, recurring-series scopes, drag to move/resize, guests + Meet). Working version is now 0.2.1.
