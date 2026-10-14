@@ -16,7 +16,7 @@ use overlook_store::MailboxView;
 
 impl MailWindow {
     pub(super) fn render_sidebar(&self, cx: &mut Context<Self>) -> impl IntoElement {
-        let p = *cx.palette();
+        let p = cx.palette().navigation_palette();
         let status = self.status.clone();
         let outbox = status.outbox_items;
         let drafts = self.drafts.len();
@@ -147,6 +147,7 @@ impl MailWindow {
         v_flex()
             .size_full()
             .bg(p.sidebar)
+            .text_color(p.foreground)
             .border_r_1()
             .border_color(p.divider)
             .pt(px(18.))
@@ -189,7 +190,7 @@ impl MailWindow {
                         Button::new("sync-now")
                             .ghost()
                             .xsmall()
-                            .icon(icon("refresh-cw").size(px(14.)))
+                            .icon(icon("refresh-cw").size(px(14.)).text_color(p.muted))
                             .tooltip("Sync now")
                             .loading(self.is_syncing_active())
                             .on_click(cx.listener(|this, _, window, cx| this.sync_now(window, cx))),
@@ -198,7 +199,7 @@ impl MailWindow {
                         Button::new("account-menu")
                             .ghost()
                             .xsmall()
-                            .icon(icon("chevrons-up-down").size(px(14.)))
+                            .icon(icon("chevrons-up-down").size(px(14.)).text_color(p.muted))
                             .tooltip("Accounts")
                             .dropdown_menu(move |mut menu, _window, _cx| {
                                 menu = menu.label("Accounts");

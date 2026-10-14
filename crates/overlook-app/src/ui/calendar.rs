@@ -592,7 +592,7 @@ impl MailWindow {
     // --------------------------------------------------------------- sidebar
 
     pub(crate) fn render_calendar_sidebar(&self, cx: &mut Context<Self>) -> impl IntoElement {
-        let p = *cx.palette();
+        let p = cx.palette().navigation_palette();
         let (dot, text) = match &self.cal_status {
             SyncState::UpToDate => (p.success, "Up to date".to_owned()),
             SyncState::Syncing => (p.accent, "Syncing…".to_owned()),
@@ -638,6 +638,7 @@ impl MailWindow {
         v_flex()
             .size_full()
             .bg(p.sidebar)
+            .text_color(p.foreground)
             .border_r_1()
             .border_color(p.divider)
             .pt(px(18.))

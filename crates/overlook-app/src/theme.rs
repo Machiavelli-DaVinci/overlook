@@ -116,17 +116,45 @@ impl Palette {
             ResolvedTheme::Gray => [0xE5E7EB, 0xF3F4F6, 0xD1D5DB, 0x1F2937, 0x4B5563, 0xB8BEC7, 0x6B7280, 0xDDE1E7, 0x374151, 0xCDD5DF, 0x1F2937, 0x805015],
             ResolvedTheme::Blue => [0xEDF4FC, 0xF8FBFF, 0xDCE9F8, 0x172D4D, 0x4E6480, 0xC7D6E8, 0x657F9F, 0xE2EDFA, 0x245A96, 0xD3E4F8, 0x193F70, 0x805015],
             ResolvedTheme::White => [0xFFFFFF, 0xFFFFFF, 0xFAFAFA, 0x20242B, 0x59616D, 0xE0E3E7, 0x767D87, 0xF0F2F5, 0x374151, 0xE5E9EF, 0x20242B, 0x805015],
-            ResolvedTheme::GrayWhite => [0xF3F4F6, 0xFFFFFF, 0xE5E7EB, 0x1F2937, 0x4B5563, 0xD1D5DB, 0x6B7280, 0xECEFF3, 0x374151, 0xDDE3EC, 0x1F2937, 0x805015],
+            ResolvedTheme::Alexander => [0xDFE3E8, 0xFFFFFF, 0xE3E6EB, 0x182B46, 0x48596C, 0xB8C2CF, 0x63748A, 0xECEEF1, 0x1F57A5, 0xDDE0E4, 0x17314D, 0x1F57A5],
             ResolvedTheme::Pink => [0xFCF0F5, 0xFFFAFC, 0xF5DFE9, 0x402536, 0x765364, 0xE8C9D8, 0xA06A84, 0xF6E4ED, 0x963D68, 0xF0D4E2, 0x692C4B, 0x805015],
         };
         let [background, surface, sidebar, foreground, muted, divider, control_border, hover, action, selection, selection_text, focus] = colors.map(c);
-        Self {
+        let mut palette = Self {
             resolved: theme,
             background, surface, sidebar, foreground, muted, divider, control_border,
             hover, accent: action, action, selection, selection_text, focus,
             avatar: selection, avatar_ink: selection_text, chip: hover, label_slate: action,
             ..Self::light()
+        };
+        if theme == ResolvedTheme::Alexander {
+            palette.chip = c(0xECEEF1);
+            palette.brand_accent = c(0xFF9F0A);
+            palette.label_amber = c(0xFF9F0A);
         }
+        palette
+    }
+
+    /// Navigation has its own contrast context, independent of white mail surfaces.
+    /// Keep generic segmented controls light while the left navigation is navy.
+    pub fn navigation_palette(&self) -> Self {
+        let mut p = *self;
+        if self.resolved == ResolvedTheme::Alexander {
+            p.sidebar = c(0x142433);
+            p.foreground = c(0xF3F5F7);
+            p.muted = c(0xBFCAD7);
+            p.hover = c(0x3A4758);
+            p.divider = c(0x405064);
+            p.accent = self.selection_text;
+            p.success = c(0xA8CEB1);
+            p.warning = c(0xF1BE78);
+            p.error = c(0xFFB0A6);
+        }
+        p
+    }
+
+    pub fn message_accent(&self) -> Hsla {
+        if self.resolved == ResolvedTheme::Alexander { c(0xFF9F0A) } else { self.accent }
     }
 
     /// Keep the message center white independently of the surrounding light colorway.
@@ -191,6 +219,13 @@ fn component_colors(theme: ResolvedTheme) -> serde_json::Value {
             _ => continue, // Preserve status colors, white action text, and overlays.
         };
         *value = serde_json::Value::String(color_hex(replacement));
+    }
+    let nav = p.navigation_palette();
+    for (key, value) in [
+        ("sidebar.background", nav.sidebar), ("sidebar.foreground", nav.foreground),
+        ("sidebar.border", nav.divider),
+    ] {
+        colors[key] = serde_json::Value::String(color_hex(value));
     }
     colors
 }
@@ -322,7 +357,7 @@ mod tests {
             let colors = component_colors(theme);
             for (key, color) in [
                 ("background", p.background), ("foreground", p.foreground),
-                ("popover.background", p.surface), ("sidebar.background", p.sidebar),
+                ("popover.background", p.surface), ("sidebar.background", p.navigation_palette().sidebar),
                 ("primary.background", p.action), ("accent.background", p.selection),
                 ("accent.foreground", p.selection_text), ("ring", p.focus),
             ] {
@@ -344,8 +379,31 @@ mod tests {
     }
 
     #[test]
+    fn alexander_has_navy_navigation_gray_highlights_and_amber_edge() {
+        let p = Palette::for_theme(ResolvedTheme::Alexander);
+        assert_eq!(p.surface, c(0xFFFFFF));
+        assert_eq!(p.action, c(0x1F57A5));
+        assert_eq!(p.chip, c(0xECEEF1));
+        assert_eq!(p.selection, c(0xDDE0E4));
+        assert_eq!(p.brand_accent, c(0xFF9F0A));
+        assert_eq!(p.message_accent(), c(0xFF9F0A));
+        assert_eq!(p.label_amber, c(0xFF9F0A));
+        assert_eq!(p.focus, p.action, "Keep keyboard focus legible on white surfaces");
+        let nav = p.navigation_palette();
+        assert_eq!(nav.sidebar, c(0x142433));
+        for (fg, bg) in [(nav.foreground, nav.sidebar), (nav.muted, nav.sidebar), (nav.foreground, nav.hover), (nav.accent, nav.selection)] {
+            let (a, b) = (luminance(fg), luminance(bg));
+            assert!((a.max(b) + 0.05) / (a.min(b) + 0.05) >= 4.5);
+        }
+        for (fg, bg) in [(p.foreground, p.chip), (p.foreground, p.brand_accent), (p.focus, p.surface)] {
+            let (a, b) = (luminance(fg), luminance(bg));
+            assert!((a.max(b) + 0.05) / (a.min(b) + 0.05) >= 3.0);
+        }
+    }
+
+    #[test]
     fn colorways_are_distinct() {
-        let themes = [ResolvedTheme::Gray, ResolvedTheme::Blue, ResolvedTheme::White, ResolvedTheme::GrayWhite, ResolvedTheme::Pink];
+        let themes = [ResolvedTheme::Gray, ResolvedTheme::Blue, ResolvedTheme::White, ResolvedTheme::Alexander, ResolvedTheme::Pink];
         for (i, theme) in themes.iter().enumerate() {
             for other in &themes[i + 1..] {
                 assert_ne!(component_colors(*theme), component_colors(*other));

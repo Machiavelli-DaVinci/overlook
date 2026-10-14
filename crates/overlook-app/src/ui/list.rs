@@ -273,7 +273,7 @@ impl MailWindow {
                         .bottom(px(if selected { 12. } else { 10. }))
                         .w(px(3.))
                         .rounded(px(2.))
-                        .bg(p.accent),
+                        .bg(p.message_accent()),
                 )
             })
             .when(!compact && self.prefs.show_avatars, |d| d.child(avatar(&who, 30., &p).mt(px(1.))))

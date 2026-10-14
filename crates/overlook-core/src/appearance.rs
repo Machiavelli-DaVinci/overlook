@@ -11,10 +11,11 @@ use serde::{Deserialize, Serialize};
 pub enum AppearancePreference {
     Light,
     Dark,
+    #[serde(alias = "gray-white")]
     Gray,
     Blue,
     White,
-    GrayWhite,
+    Alexander,
     Pink,
     #[default]
     FollowSystem,
@@ -27,7 +28,7 @@ impl AppearancePreference {
         AppearancePreference::Gray,
         AppearancePreference::Blue,
         AppearancePreference::White,
-        AppearancePreference::GrayWhite,
+        AppearancePreference::Alexander,
         AppearancePreference::Pink,
         AppearancePreference::FollowSystem,
     ];
@@ -40,7 +41,7 @@ impl AppearancePreference {
             AppearancePreference::Gray => "Gray",
             AppearancePreference::Blue => "Blue",
             AppearancePreference::White => "White",
-            AppearancePreference::GrayWhite => "Gray/White",
+            AppearancePreference::Alexander => "Alexander",
             AppearancePreference::Pink => "Pink",
             AppearancePreference::FollowSystem => "Follow system",
         }
@@ -53,7 +54,7 @@ impl AppearancePreference {
             AppearancePreference::Gray => "gray",
             AppearancePreference::Blue => "blue",
             AppearancePreference::White => "white",
-            AppearancePreference::GrayWhite => "gray-white",
+            AppearancePreference::Alexander => "alexander",
             AppearancePreference::Pink => "pink",
             AppearancePreference::FollowSystem => "follow-system",
         }
@@ -63,10 +64,10 @@ impl AppearancePreference {
         match key {
             "light" => Some(AppearancePreference::Light),
             "dark" => Some(AppearancePreference::Dark),
-            "gray" => Some(AppearancePreference::Gray),
+            "gray" | "gray-white" => Some(AppearancePreference::Gray),
             "blue" => Some(AppearancePreference::Blue),
             "white" => Some(AppearancePreference::White),
-            "gray-white" => Some(AppearancePreference::GrayWhite),
+            "alexander" => Some(AppearancePreference::Alexander),
             "pink" => Some(AppearancePreference::Pink),
             "follow-system" | "system" => Some(AppearancePreference::FollowSystem),
             _ => None,
@@ -81,7 +82,7 @@ impl AppearancePreference {
             AppearancePreference::Gray => ResolvedTheme::Gray,
             AppearancePreference::Blue => ResolvedTheme::Blue,
             AppearancePreference::White => ResolvedTheme::White,
-            AppearancePreference::GrayWhite => ResolvedTheme::GrayWhite,
+            AppearancePreference::Alexander => ResolvedTheme::Alexander,
             AppearancePreference::Pink => ResolvedTheme::Pink,
             AppearancePreference::FollowSystem => match system {
                 SystemAppearance::Dark => ResolvedTheme::Dark,
@@ -106,10 +107,11 @@ pub enum SystemAppearance {
 pub enum ResolvedTheme {
     Light,
     Dark,
+    #[serde(alias = "GrayWhite")]
     Gray,
     Blue,
     White,
-    GrayWhite,
+    Alexander,
     Pink,
 }
 
@@ -152,7 +154,7 @@ mod tests {
             (AppearancePreference::Gray, ResolvedTheme::Gray, false),
             (AppearancePreference::Blue, ResolvedTheme::Blue, false),
             (AppearancePreference::White, ResolvedTheme::White, false),
-            (AppearancePreference::GrayWhite, ResolvedTheme::GrayWhite, false),
+            (AppearancePreference::Alexander, ResolvedTheme::Alexander, false),
             (AppearancePreference::Pink, ResolvedTheme::Pink, false),
         ] {
             for system in [SystemAppearance::Light, SystemAppearance::Dark, SystemAppearance::Unknown] {
@@ -171,9 +173,17 @@ mod tests {
             assert_eq!(json, format!("\"{}\"", pref.as_key()));
             assert_eq!(serde_json::from_str::<AppearancePreference>(&json).unwrap(), pref);
         }
-        assert_eq!(AppearancePreference::GrayWhite.label(), "Gray/White");
-        assert_eq!(AppearancePreference::GrayWhite.as_key(), "gray-white");
+        assert_eq!(AppearancePreference::Alexander.label(), "Alexander");
+        assert_eq!(AppearancePreference::Alexander.as_key(), "alexander");
         assert_eq!(AppearancePreference::default(), AppearancePreference::FollowSystem);
+    }
+
+    #[test]
+    fn retired_gray_white_settings_migrate_to_gray() {
+        assert_eq!(AppearancePreference::from_key("gray-white"), Some(AppearancePreference::Gray));
+        assert_eq!(serde_json::from_str::<AppearancePreference>("\"gray-white\"").unwrap(), AppearancePreference::Gray);
+        assert_eq!(serde_json::from_str::<ResolvedTheme>("\"GrayWhite\"").unwrap(), ResolvedTheme::Gray);
+        assert!(AppearancePreference::ALL.iter().all(|pref| pref.label() != "Gray/White"));
     }
 
     #[test]

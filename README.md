@@ -55,7 +55,7 @@ and you can read, search, write, and file mail with no connection at all.
   and replayed when you are back. A visible Outbox says *Waiting for connection*; *Sent* appears only after
   Gmail accepts the message, and a dropped connection mid-send is reconciled before any retry so nothing is
   sent twice. Survives a crash or a restart.
-- **A theme for your taste.** Light, Dark, Gray, Blue, White, Gray/White, and Pink, with *Follow system*
+- **A theme for your taste.** Light, Dark, Gray, Blue, White, Alexander, and Pink, with *Follow system*
   selecting Light or Dark. Bundled Inter and Source Serif 4 so it
   looks the same on every machine. Keyboard shortcuts you already know from Outlook.
 - **Contacts.** A third module beside Mail and Calendar: your Google Contacts and the people you have written

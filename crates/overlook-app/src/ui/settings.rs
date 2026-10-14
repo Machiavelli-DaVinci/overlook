@@ -367,11 +367,14 @@ impl MailWindow {
         let Some(state) = self.settings.as_ref() else { return div().into_any_element() };
         let page = state.page;
 
-        let nav = v_flex()
+        let nav = {
+            let p = cx.palette().navigation_palette();
+            v_flex()
             .w(px(200.))
             .flex_none()
             .h_full()
             .bg(p.sidebar)
+            .text_color(p.foreground)
             .border_r_1()
             .border_color(p.divider)
             .p(px(12.))
@@ -395,7 +398,8 @@ impl MailWindow {
                     .child(icon(pg.icon()).size(px(16.)).text_color(if active { p.accent } else { p.muted }))
                     .child(pg.label())
                     .on_click(cx.listener(move |this, _, _w, cx| this.set_settings_page(pg, cx)))
-            }));
+            }))
+        };
 
         let content: AnyElement = match page {
             SettingsPage::Accounts => self.render_settings_accounts(state, cx).into_any_element(),

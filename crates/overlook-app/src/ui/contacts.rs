@@ -245,7 +245,7 @@ impl MailWindow {
     // --------------------------------------------------------------- render
 
     pub(crate) fn render_contacts_sidebar(&self, cx: &mut Context<Self>) -> impl IntoElement {
-        let p = *cx.palette();
+        let p = cx.palette().navigation_palette();
         let total = self.contacts.len();
         let book = self.contacts.iter().filter(|c| c.in_address_book).count();
         let other = total - book;
@@ -261,16 +261,18 @@ impl MailWindow {
                 .rounded(px(7.))
                 .cursor_pointer()
                 .text_size(px(13.))
+                .text_color(if active { p.selection_text } else { p.foreground })
                 .when(active, |d| d.bg(p.selection).font_weight(FontWeight::SEMIBOLD))
                 .when(!active, |d| d.hover(|d| d.bg(p.hover)))
                 .child(icon(icon_name).size(px(15.)).text_color(if active { p.accent } else { p.muted }))
                 .child(div().flex_1().child(label))
-                .child(div().text_size(px(11.)).text_color(p.muted).child(count.to_string()))
+                .child(div().text_size(px(11.)).text_color(if active { p.selection_text } else { p.muted }).child(count.to_string()))
                 .on_click(cx.listener(move |this, _, _w, cx| this.set_contact_filter(filter, cx)))
         };
         v_flex()
             .size_full()
             .bg(p.sidebar)
+            .text_color(p.foreground)
             .p(px(10.))
             .gap(px(12.))
             .child(
@@ -292,7 +294,7 @@ impl MailWindow {
                         .rounded(px(8.))
                         .bg(p.chip)
                         .text_size(px(11.))
-                        .text_color(p.muted)
+                        .text_color(cx.palette().muted)
                         .child("Changes stay on this device until Overlook may edit your Google Contacts.")
                         .child(Button::new("contacts-write-signin").xsmall().label("Sign in again").on_click(cx.listener(move |this, _, window, cx| this.start_google_sign_in(Some(email.clone()), window, cx)))),
                 )
