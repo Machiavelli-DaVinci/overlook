@@ -13,6 +13,13 @@ serde_json = { workspace = true }
 thiserror = { workspace = true }
 tracing = { workspace = true }
 ureq = { version = "3", features = ["json"] }
-lettre = { version = "0.11", default-features = false, features = ["builder"] }
+lettre = { version = "0.11", default-features = false, features = ["builder", "smtp-transport", "rustls-tls"] }
+# IMAP/POP3 (phase 2/3): raw message parsing and the IMAP client. The imap crate's own TLS
+# features pin an older rustls, so TLS streams are built here with the rustls ureq already uses.
+mail-parser = "0.11"
+imap = { version = "3.0.0-alpha.15", default-features = false }
+imap-proto = "0.16"
+rustls = { version = "0.23", default-features = false, features = ["ring", "std", "tls12", "logging"] }
+webpki-roots = "1"
 base64 = "0.22"
 rand = "0.10"
