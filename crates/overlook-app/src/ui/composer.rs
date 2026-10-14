@@ -427,7 +427,7 @@ impl MailWindow {
         v_flex()
             .when(inline, |d| d.mx(px(28.)).mt(px(18.)).mb(px(28.)).rounded(px(10.)).border_1().border_color(p.divider))
             .when(!inline, |d| d.size_full())
-            .bg(p.surface)
+            .bg(p.message_surface())
             .overflow_hidden()
             .child(
                 h_flex()
@@ -499,7 +499,12 @@ impl MailWindow {
                     .py(px(12.))
                     .text_size(px(15.))
                     .line_height(px(24.))
-                    .child(TextView::html(SharedString::from(format!("preview-{}", c.draft.id)), render_markdown(&c.draft.body_text)).selectable(true))
+                    .child({
+                        let policy = if self.prefs.remote_images == RemoteImages::Allow { overlook_core::sanitize::RemoteContent::Allowed } else { overlook_core::sanitize::RemoteContent::Blocked };
+                        let html = overlook_core::compose::outgoing_preview(&c.draft, None, policy);
+                        let html = overlook_core::sanitize::adapt_colors(&html, p.is_dark());
+                        TextView::html(SharedString::from(format!("preview-{}", c.draft.id)), html).selectable(true)
+                    })
                     .into_any_element()
             } else {
                 div()
@@ -627,7 +632,12 @@ impl MailWindow {
             _ => format!("Quoting {who} · {when}"),
         };
         let shown = c.quote_shown;
-        let html = shown.then(|| overlook_core::compose::outgoing_bodies(&Draft { body_text: String::new(), ..c.draft.clone() }, Some(source)).html);
+        let html = shown.then(|| {
+            let allow_remote = self.remote_allowed.contains(&source.id) || self.prefs.remote_images == RemoteImages::Allow;
+            let policy = if allow_remote { overlook_core::sanitize::RemoteContent::Allowed } else { overlook_core::sanitize::RemoteContent::Blocked };
+            let safe = overlook_core::compose::quote_preview(&c.draft, source, policy);
+            self.resolve_inline_images(source, overlook_core::sanitize::adapt_colors(&safe, p.is_dark()))
+        });
         Some(
             v_flex()
                 .px(px(16.))

@@ -1,0 +1,10 @@
+Current plain reply <not markup> & confirmation.
+Second current line.
+
+> Previous sample question
+> See https://example.test/plain?item=2&view=full
+>
+>> Oldest sample context
+>> Keep the complete history.
+>
+> Previous sample closing

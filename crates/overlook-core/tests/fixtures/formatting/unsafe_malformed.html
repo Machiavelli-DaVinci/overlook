@@ -1,0 +1,9 @@
+<!doctype html><html><head><base href="https://evil.example.test/"><style>STYLE_PAYLOAD body{background:url(https://evil.example.test/css)}</style><script>SCRIPT_PAYLOAD alert(1)</script></head><body onload="alert(2)">
+<p>Visible recovery start <b>bold recovery<i>italic recovery</b> tail</i>
+<a href="javascript:alert(3)" onclick="alert(4)">Unsafe link label</a>
+<a href="data:text/html,attack">Data link label</a><a href="https://example.test/safe?x=1&amp;y=2">Safe reference</a>
+<iframe src="https://evil.example.test/frame">FRAME_PAYLOAD</iframe><svg><script>SVG_PAYLOAD</script></svg>
+<form action="https://evil.example.test/submit"><input value="secret"><button>Submit</button></form>
+<img src="https://images.example.test/visible.png" width="80" height="40" onerror="alert(5)" alt="Visible sample image"><img src="cid:synthetic-logo" alt="Inline sample logo">
+<div style="color:#222;font-size:14px;background-image:url(https://evil.example.test/css);position:fixed;behavior:url(attack);width:expression(alert(6))">Visible safe style</div>
+<!-- COMMENT_PAYLOAD --><p>Visible recovery end

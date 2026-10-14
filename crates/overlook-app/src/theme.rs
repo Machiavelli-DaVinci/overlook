@@ -1,4 +1,4 @@
-//! Overlook's two themes, mapped from `branding/tokens.json`.
+//! Overlook's built-in themes. Light and Dark retain the original brand palettes.
 //!
 //! `Palette` holds the semantic tokens the custom mail views paint with. The same values are
 //! projected onto the component library's theme so inputs, menus, buttons, and scrollbars
@@ -108,10 +108,30 @@ impl Palette {
     }
 
     pub fn for_theme(theme: ResolvedTheme) -> Self {
-        match theme {
-            ResolvedTheme::Light => Self::light(),
-            ResolvedTheme::Dark => Self::dark(),
+        let colors = match theme {
+            ResolvedTheme::Light => return Self::light(),
+            ResolvedTheme::Dark => return Self::dark(),
+            // Background, surface, sidebar, text, muted, divider, control border,
+            // hover, action, selection, selected text, and focus ring.
+            ResolvedTheme::Gray => [0xE5E7EB, 0xF3F4F6, 0xD1D5DB, 0x1F2937, 0x4B5563, 0xB8BEC7, 0x6B7280, 0xDDE1E7, 0x374151, 0xCDD5DF, 0x1F2937, 0x805015],
+            ResolvedTheme::Blue => [0xEDF4FC, 0xF8FBFF, 0xDCE9F8, 0x172D4D, 0x4E6480, 0xC7D6E8, 0x657F9F, 0xE2EDFA, 0x245A96, 0xD3E4F8, 0x193F70, 0x805015],
+            ResolvedTheme::White => [0xFFFFFF, 0xFFFFFF, 0xFAFAFA, 0x20242B, 0x59616D, 0xE0E3E7, 0x767D87, 0xF0F2F5, 0x374151, 0xE5E9EF, 0x20242B, 0x805015],
+            ResolvedTheme::GrayWhite => [0xF3F4F6, 0xFFFFFF, 0xE5E7EB, 0x1F2937, 0x4B5563, 0xD1D5DB, 0x6B7280, 0xECEFF3, 0x374151, 0xDDE3EC, 0x1F2937, 0x805015],
+            ResolvedTheme::Pink => [0xFCF0F5, 0xFFFAFC, 0xF5DFE9, 0x402536, 0x765364, 0xE8C9D8, 0xA06A84, 0xF6E4ED, 0x963D68, 0xF0D4E2, 0x692C4B, 0x805015],
+        };
+        let [background, surface, sidebar, foreground, muted, divider, control_border, hover, action, selection, selection_text, focus] = colors.map(c);
+        Self {
+            resolved: theme,
+            background, surface, sidebar, foreground, muted, divider, control_border,
+            hover, accent: action, action, selection, selection_text, focus,
+            avatar: selection, avatar_ink: selection_text, chip: hover, label_slate: action,
+            ..Self::light()
         }
+    }
+
+    /// Keep the message center white independently of the surrounding light colorway.
+    pub fn message_surface(&self) -> Hsla {
+        if self.is_dark() { self.surface } else { c(0xFFFFFF) }
     }
 
     pub fn is_dark(&self) -> bool {
@@ -138,16 +158,55 @@ impl ActivePalette for App {
     }
 }
 
-/// Component-library theme file for one of the two themes.
-fn component_theme(theme: ResolvedTheme) -> ThemeConfig {
-    let (name, mode, j) = match theme {
-        ResolvedTheme::Light => ("Overlook Light", "light", LIGHT_JSON),
-        ResolvedTheme::Dark => ("Overlook Dark", "dark", DARK_JSON),
+/// Project the same palette onto native controls and rich-text rendering.
+fn component_colors(theme: ResolvedTheme) -> serde_json::Value {
+    let base = if theme.is_dark() { DARK_JSON } else { LIGHT_JSON };
+    let mut colors: serde_json::Value = serde_json::from_str(base).expect("valid color tokens");
+    if matches!(theme, ResolvedTheme::Light | ResolvedTheme::Dark) {
+        return colors;
+    }
+    let p = Palette::for_theme(theme);
+    let shade = |color: Hsla, alpha| -> Hsla {
+        Rgba::from(color).blend(gpui_kit::rgb(0).alpha(alpha)).into()
     };
-    let json = format!(
-        r#"{{"name":"{name}","mode":"{mode}","font.family":"Inter","font.size":14,"radius":6,"radius.lg":10,"shadow":true,"colors":{j}}}"#
-    );
-    serde_json::from_str(&json).expect("theme json is valid")
+    for value in colors.as_object_mut().expect("color object").values_mut() {
+        let replacement = match value.as_str().unwrap_or_default() {
+            "#F4F3EE" => p.background,
+            "#FFFEFB" => p.surface,
+            "#F0F1EC" => p.sidebar,
+            "#192B35" => p.foreground,
+            "#5E6D73" => p.muted,
+            "#DCE2DF" | "#C9D2CF" => p.divider,
+            "#986020" => p.focus,
+            "#365F73" => p.action,
+            "#2E5366" => shade(p.action, 0.12),
+            "#264757" => shade(p.action, 0.24),
+            "#E8EDE9" => p.hover,
+            "#DFE6E1" => shade(p.hover, 0.03),
+            "#D4DDD7" => shade(p.hover, 0.06),
+            "#E3EDEA" | "#C9DCD6" => p.selection,
+            "#284D5D" => p.selection_text,
+            "#B9C4C0" => p.divider,
+            "#9DABA7" => p.control_border,
+            _ => continue, // Preserve status colors, white action text, and overlays.
+        };
+        *value = serde_json::Value::String(color_hex(replacement));
+    }
+    colors
+}
+
+fn color_hex(color: Hsla) -> String {
+    let rgba = Rgba::from(color);
+    format!("#{:02X}{:02X}{:02X}", (rgba.r * 255.).round() as u8, (rgba.g * 255.).round() as u8, (rgba.b * 255.).round() as u8)
+}
+
+fn component_theme(theme: ResolvedTheme) -> ThemeConfig {
+    let mode = if theme.is_dark() { "dark" } else { "light" };
+    serde_json::from_value(serde_json::json!({
+        "name": format!("Overlook {theme:?}"), "mode": mode,
+        "font.family": "Inter", "font.size": 14, "radius": 6,
+        "radius.lg": 10, "shadow": true, "colors": component_colors(theme),
+    })).expect("theme json is valid")
 }
 
 const LIGHT_JSON: &str = r##"{
@@ -202,18 +261,15 @@ const DARK_JSON: &str = r##"{
   "table.background": "#17242C", "table.hover.background": "#23353F", "table.active.background": "#28404C", "table.active.border": "#A9CDD9", "table.even.background": "#17242C", "table.head.background": "#121F27", "table.head.foreground": "#A8B7BA", "table.row.border": "#30424B"
 }"##;
 
-/// Installs both Overlook themes into the component library (once) and applies `theme`.
+/// Installs the selected colorway and applies its light/dark rendering mode.
 pub fn apply(theme: ResolvedTheme, cx: &mut App) {
-    let light = Rc::new(component_theme(ResolvedTheme::Light));
+    let light = Rc::new(component_theme(if theme.is_dark() { ResolvedTheme::Light } else { theme }));
     let dark = Rc::new(component_theme(ResolvedTheme::Dark));
     Theme::update(cx, |t| {
         t.light_theme = light;
         t.dark_theme = dark;
     });
-    let mode = match theme {
-        ResolvedTheme::Light => ThemeMode::Light,
-        ResolvedTheme::Dark => ThemeMode::Dark,
-    };
+    let mode = if theme.is_dark() { ThemeMode::Dark } else { ThemeMode::Light };
     Theme::change(mode, None, cx);
     cx.set_global(Palette::for_theme(theme));
     cx.refresh_windows();
@@ -234,4 +290,66 @@ pub fn apply_preference(pref: AppearancePreference, system: SystemAppearance, cx
         apply(resolved, cx);
     }
     resolved
+}
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+
+    fn luminance(color: Hsla) -> f32 {
+        let c = Rgba::from(color);
+        let linear = |v: f32| if v <= 0.04045 { v / 12.92 } else { ((v + 0.055) / 1.055).powf(2.4) };
+        0.2126 * linear(c.r) + 0.7152 * linear(c.g) + 0.0722 * linear(c.b)
+    }
+
+    #[test]
+    fn all_themes_have_readable_text_and_matching_component_tokens() {
+        for pref in AppearancePreference::ALL {
+            let theme = pref.resolve(SystemAppearance::Light);
+            let p = Palette::for_theme(theme);
+            assert_eq!(p.resolved, theme);
+            for (fg, bg) in [
+                (p.foreground, p.background), (p.foreground, p.surface),
+                (p.foreground, p.sidebar), (p.muted, p.surface),
+                (p.foreground, p.message_surface()), (p.muted, p.message_surface()),
+                (p.muted, p.sidebar), (p.selection_text, p.selection),
+                (p.on_action, p.action), (p.avatar_ink, p.avatar),
+            ] {
+                let (a, b) = (luminance(fg), luminance(bg));
+                let ratio = (a.max(b) + 0.05) / (a.min(b) + 0.05);
+                assert!(ratio >= 4.5, "{theme:?}: contrast {ratio}");
+            }
+            let colors = component_colors(theme);
+            for (key, color) in [
+                ("background", p.background), ("foreground", p.foreground),
+                ("popover.background", p.surface), ("sidebar.background", p.sidebar),
+                ("primary.background", p.action), ("accent.background", p.selection),
+                ("accent.foreground", p.selection_text), ("ring", p.focus),
+            ] {
+                assert_eq!(colors[key].as_str(), Some(color_hex(color).as_str()), "{theme:?}: {key}");
+            }
+            let _ = component_theme(theme);
+        }
+    }
+
+    #[test]
+    fn message_center_is_white_except_in_dark_mode() {
+        for pref in AppearancePreference::ALL {
+            for system in [SystemAppearance::Light, SystemAppearance::Dark, SystemAppearance::Unknown] {
+                let p = Palette::for_theme(pref.resolve(system));
+                let expected = if p.is_dark() { p.surface } else { c(0xFFFFFF) };
+                assert_eq!(p.message_surface(), expected, "{pref:?}, {system:?}");
+            }
+        }
+    }
+
+    #[test]
+    fn colorways_are_distinct() {
+        let themes = [ResolvedTheme::Gray, ResolvedTheme::Blue, ResolvedTheme::White, ResolvedTheme::GrayWhite, ResolvedTheme::Pink];
+        for (i, theme) in themes.iter().enumerate() {
+            for other in &themes[i + 1..] {
+                assert_ne!(component_colors(*theme), component_colors(*other));
+            }
+        }
+    }
 }

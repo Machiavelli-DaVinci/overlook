@@ -609,6 +609,10 @@ pub struct TextMark {
     pub highlight: Option<Hsla>,
     /// Overlook patch: an explicit text colour from `style="color: …"` or `<font color>`.
     pub color: Option<Hsla>,
+    pub font_size_scale: Option<f32>,
+    pub font_family: Option<SharedString>,
+    pub font_weight: Option<FontWeight>,
+    pub font_style: Option<FontStyle>,
     pub link: Option<LinkMark>,
 }
 
@@ -656,6 +660,18 @@ impl TextMark {
     }
 
     pub fn merge(&mut self, other: TextMark) {
+        if other.font_size_scale.is_some() {
+            self.font_size_scale = other.font_size_scale;
+        }
+        if other.font_family.is_some() {
+            self.font_family = other.font_family;
+        }
+        if other.font_weight.is_some() {
+            self.font_weight = other.font_weight;
+        }
+        if other.font_style.is_some() {
+            self.font_style = other.font_style;
+        }
         self.bold |= other.bold;
         self.italic |= other.italic;
         self.strikethrough |= other.strikethrough;
@@ -1303,6 +1319,8 @@ impl InlineNode {
 /// We are keep the selection state inside this AST Nodes.
 #[derive(Debug, Clone, Default)]
 pub(crate) struct Paragraph {
+    /// HTML-only layout; None retains Markdown's spacing and typography.
+    pub(super) html_style: Option<super::format::html::HtmlParagraphStyle>,
     pub(super) span: Option<Span>,
     pub(super) children: Vec<InlineNode>,
     /// The link references in this paragraph, used for reference links.
@@ -1359,7 +1377,8 @@ struct ParagraphRender {
 
 impl PartialEq for Paragraph {
     fn eq(&self, other: &Self) -> bool {
-        self.span == other.span
+        self.html_style == other.html_style
+            && self.span == other.span
             && self.children == other.children
             && self.link_refs == other.link_refs
     }
@@ -1373,6 +1392,7 @@ impl Paragraph {
             link_refs: HashMap::new(),
             state: Arc::new(Mutex::new(InlineState::default())),
             render_cache: ParagraphRenderCache::default(),
+            html_style: None,
         }
     }
 
@@ -1709,6 +1729,8 @@ impl Paragraph {
 pub(crate) struct Table {
     pub(crate) children: Vec<TableRow>,
     pub(crate) column_aligns: Vec<ColumnumnAlign>,
+    /// None: Markdown first-row header. Some: HTML's explicitly authored header rows.
+    pub(crate) html_headers: Option<Vec<bool>>,
     pub(crate) span: Option<Span>,
     /// The [`TableData`] handed to the `table_actions` hook, kept between
     /// frames; see [`Table::cached_table_data`].
@@ -1845,6 +1867,12 @@ pub struct TableData {
 }
 
 impl Table {
+    pub(crate) fn is_header(&self, row: usize) -> bool {
+        self.html_headers
+            .as_ref()
+            .map_or(row == 0, |rows| rows.get(row).copied().unwrap_or(false))
+    }
+
     pub(crate) fn column_align(&self, index: usize) -> ColumnumnAlign {
         self.column_aligns.get(index).copied().unwrap_or_default()
     }
@@ -1903,8 +1931,20 @@ impl Table {
         };
 
         TableData {
-            headers: self.children.first().map(row_text).unwrap_or_default(),
-            rows: self.children.iter().skip(1).map(row_text).collect(),
+            headers: self
+                .children
+                .iter()
+                .enumerate()
+                .find(|(ix, _)| self.is_header(*ix))
+                .map(|(_, row)| row_text(row))
+                .unwrap_or_default(),
+            rows: self
+                .children
+                .iter()
+                .enumerate()
+                .filter(|(ix, _)| !self.is_header(*ix))
+                .map(|(_, row)| row_text(row))
+                .collect(),
             markdown: self.to_markdown(),
             span: self.span.map(|span| span.start..span.end),
         }
@@ -1969,6 +2009,7 @@ impl Paragraph {
                 link_refs: Default::default(),
                 state: Arc::new(Mutex::new(InlineState::default())),
                 render_cache: ParagraphRenderCache::default(),
+                html_style: self.html_style.clone(),
             },
         )
     }
@@ -2009,19 +2050,6 @@ impl Paragraph {
                 .children
                 .iter()
                 .all(|node| node.text.is_empty() && node.image.is_none())
-    }
-
-    /// Return length of children text.
-    pub(crate) fn text_len(&self) -> usize {
-        self.children
-            .iter()
-            .map(|node| node.text.len())
-            .sum::<usize>()
-    }
-
-    pub(crate) fn merge(&mut self, other: Self) {
-        self.children.extend(other.children);
-        self.invalidate_render_cache();
     }
 }
 
@@ -2430,10 +2458,13 @@ fn mark_highlight(mark: &TextMark, node_cx: &NodeContext, cx: &App) -> InlineHig
     if let Some(color) = mark.color {
         highlight.color = Some(color);
     }
+    highlight.font_weight = mark.font_weight.or(highlight.font_weight);
+    highlight.font_style = mark.font_style.or(highlight.font_style);
     InlineHighlight {
         style: highlight,
-        font_family,
-        font_size_scale: mark.code.then_some(0.875),
+        font_family: mark.font_family.clone().or(font_family),
+        font_size_scale: mark.font_size_scale.or(mark.code.then_some(0.875)),
+        code_chip: mark.code,
     }
 }
 
@@ -2465,10 +2496,35 @@ impl Paragraph {
         highlights
     }
 
+    fn render(
+        &self,
+        fade_key: Option<TextLeafKey>,
+        node_cx: &NodeContext,
+        window: &mut Window,
+        cx: &mut App,
+    ) -> AnyElement {
+        let content = self.render_content(fade_key, node_cx, window, cx);
+        if let Some(style) = &self.html_style {
+            div()
+                .text_size(px(style.font_size))
+                .line_height(relative(style.line_height))
+                .when(style.align == "center", |this| this.text_center())
+                .when(style.align == "right", |this| this.text_right())
+                .when(matches!(style.align.as_str(), "left" | "justify"), |this| {
+                    this.text_left()
+                })
+                .when(style.align == "left", |this| this.text_left())
+                .child(content)
+                .into_any_element()
+        } else {
+            content
+        }
+    }
+
     /// `fade_key` names this paragraph's text for the streamed fade-in and
     /// for range highlights; the owning block supplies it because a heading
     /// or table cell paragraph carries no span of its own.
-    fn render(
+    fn render_content(
         &self,
         fade_key: Option<TextLeafKey>,
         node_cx: &NodeContext,
@@ -2669,10 +2725,12 @@ impl Paragraph {
         let has_text = self.children.iter().any(|child| !child.text.is_empty());
         self.children.iter().any(|child| child.custom.is_some())
             || (has_image && has_text)
-            || self
-                .children
-                .iter()
-                .any(|child| child.marks.iter().any(|(_, mark)| mark.code))
+            || self.children.iter().any(|child| {
+                child
+                    .marks
+                    .iter()
+                    .any(|(_, mark)| mark.code || mark.font_size_scale.is_some())
+            })
     }
 
     fn inline_flow_items(
@@ -3024,7 +3082,12 @@ fn measure_table_columns(
     for &(row_ix, ix) in &measured.custom_cells {
         let cell = &table.children[row_ix].children[ix];
         let items = cell.children.inline_flow_items(None, &[], &[], node_cx, cx);
-        let style = text_styles.row_refinement(row_ix).clone();
+        let mut style = text_styles
+            .row_refinement(if table.is_header(row_ix) { 0 } else { 1 })
+            .clone();
+        if let Some(html) = &cell.children.html_style {
+            style.font_size = Some(px(html.font_size).into());
+        }
         let width = window.with_text_style(Some(style), |window| {
             super::inline_flow::intrinsic_width(&items, window, cx)
         });
@@ -3051,9 +3114,14 @@ fn measure_table_text_columns(
     let mut col_w = vec![CELL_MIN_PX; col_count];
     let mut custom_cells = Vec::new();
     for (row_ix, row) in table.children.iter().enumerate() {
-        let text_style = text_styles.row(row_ix);
-        let font_size = text_style.font_size.to_pixels(window.rem_size());
+        let base_text_style = text_styles.row(if table.is_header(row_ix) { 0 } else { 1 });
         for (ix, cell) in row.children.iter().enumerate() {
+            let mut resolved_style = base_text_style.clone();
+            if let Some(html) = &cell.children.html_style {
+                resolved_style.font_size = px(html.font_size).into();
+            }
+            let text_style = &resolved_style;
+            let font_size = text_style.font_size.to_pixels(window.rem_size());
             let Some(slot) = col_w.get_mut(ix) else {
                 continue;
             };
@@ -3099,7 +3167,7 @@ fn measure_table_text_columns(
                         range.end,
                         |range, highlight| (range, highlight.clone()),
                     );
-                    if highlights.iter().any(|(_, h)| h.font_size_scale.is_some()) {
+                    if highlights.iter().any(|(_, h)| h.code_chip) {
                         line_w += px(crate::text::inline_flow::INLINE_CODE_PADDING * 2.);
                     }
                     let runs = text_runs(range.len(), text_style, &highlights);
@@ -3125,6 +3193,35 @@ fn measure_table_text_columns(
 
 impl Paragraph {
     fn to_markdown(&self) -> String {
+        if self.html_style.is_some() {
+            // HTML marks may overlap. Serialize effective runs rather than letting
+            // a narrower child mark replace the entire ancestor's text.
+            let mut source = MarkdownSource::default();
+            for node in &self.children {
+                let mut boundaries = vec![0, node.text.len()];
+                for (range, _) in &node.marks {
+                    boundaries.extend([range.start, range.end]);
+                }
+                boundaries.sort_unstable();
+                boundaries.dedup();
+                for bounds in boundaries.windows(2) {
+                    if bounds[0] == bounds[1] {
+                        continue;
+                    }
+                    let mut mark = TextMark::default();
+                    for (range, layer) in &node.marks {
+                        if range.start <= bounds[0] && range.end >= bounds[1] {
+                            mark.merge(layer.clone());
+                        }
+                    }
+                    source.push_marked(&node.text[bounds[0]..bounds[1]], &mark);
+                }
+                if let Some(image) = &node.image {
+                    source.push_str(&image_markdown(image));
+                }
+            }
+            return format!("{}\n\n", source.finish());
+        }
         if self.children.iter().any(|node| node.custom.is_some()) {
             let mut source = MarkdownSource::default();
             for node in &self.children {
@@ -3813,10 +3910,9 @@ impl BlockNode {
                     .border_color(style.border())
                     .flex()
                     .flex_row()
-                    // The first row is the header, as everywhere else that
-                    // reads a table (`table_data`, `to_markdown`). The
-                    // refinement comes last so it can override the defaults.
-                    .when(row_ix == 0, |this| {
+                    // Markdown uses its first row; HTML retains authored th rows.
+                    // Refine last so application table styling can override defaults.
+                    .when(table.is_header(row_ix), |this| {
                         this.bg(style.code_background())
                             .text_color(style.foreground())
                             .when_some(top_left, |this, radius| this.rounded_tl(radius))
@@ -3867,15 +3963,25 @@ impl BlockNode {
                     )
                 }))
                 .into_any_element(),
-            BlockNode::Paragraph(paragraph) => gapped(
-                paragraph.render(
+            BlockNode::Paragraph(paragraph) => {
+                let content = paragraph.render(
                     paragraph.span.map(|span| TextLeafKey::block(span.start)),
                     node_cx,
                     window,
                     cx,
-                ),
-                mb,
-            ),
+                );
+                if let Some(style) = &paragraph.html_style {
+                    div()
+                        .pt(px(style.margin_top))
+                        .pb(px(style.margin_bottom))
+                        .pl(px(style.margin_left))
+                        .pr(px(style.margin_right))
+                        .child(content)
+                        .into_any_element()
+                } else {
+                    gapped(content, mb)
+                }
+            }
             BlockNode::Heading {
                 level,
                 children,
@@ -4222,6 +4328,59 @@ mod tests {
     }
 
     #[test]
+    fn html_layout_distinguishes_div_paragraph_spacing_and_authored_line_height() {
+        use crate::text::inline::test_draw::in_prepaint;
+        use crate::text::inline::test_fonts::WideMonoTextSystem;
+        use gpui::{AvailableSpace, TestApp};
+        let mut app = TestApp::with_text_system(Arc::new(WideMonoTextSystem));
+        in_prepaint(&mut app, |window, cx| {
+            let mut height = |html: &str| {
+                let mut node_cx = NodeContext::default();
+                let doc = crate::text::format::html::parse(html, &mut node_cx).unwrap();
+                let mut element =
+                    doc.blocks[0].render_block(NodeRenderOptions::default(), &node_cx, window, cx);
+                element
+                    .layout_as_root(AvailableSpace::min_size(), window, cx)
+                    .height
+            };
+            let tight = height("<div>x</div><div>x</div>");
+            let paragraphs = height("<p>x</p><p>x</p>");
+            assert!((f32::from(paragraphs - tight) - 32.).abs() < 1.);
+            let normal = height("<div>x</div>");
+            let spaced = height("<div style='margin:20px 0 30px'>x</div>");
+            assert!((f32::from(spaced - normal) - 50.).abs() < 1.);
+            let tall = height("<div style='font-size:20px;line-height:2'>x<br>x</div>");
+            assert!((f32::from(tall) - 80.).abs() < 1.);
+        });
+    }
+
+    #[test]
+    fn html_table_measurement_uses_authored_cell_font_size() {
+        use crate::text::inline::test_draw::in_prepaint;
+        use crate::text::inline::test_fonts::WideMonoTextSystem;
+        use gpui::TestApp;
+        let mut app = TestApp::with_text_system(Arc::new(WideMonoTextSystem));
+        in_prepaint(&mut app, |window, cx| {
+            let mut width = |size: u32| {
+                let mut node_cx = NodeContext::default();
+                let document = crate::text::format::html::parse(
+                    &format!(
+                        "<table style='font-size:{size}px'><tr><td>long cell text</td></tr></table>"
+                    ),
+                    &mut node_cx,
+                )
+                .unwrap();
+                let BlockNode::Table(table) = &document.blocks[0] else {
+                    panic!("table")
+                };
+                assert!(!table.is_header(0));
+                measure_table_columns(table, 1, &node_cx, window, cx)[0]
+            };
+            assert!(width(32) > width(16) * 1.5);
+        });
+    }
+
+    #[test]
     fn selected_inline_object_interleaves_runs_and_preserves_enclosing_mark() {
         let before = InlineNode::new("中文 ");
         let formula =
@@ -4564,6 +4723,7 @@ mod tests {
                 }],
             }],
             column_aligns: vec![],
+            html_headers: None,
             span: None,
             table_data_cache: TableDataCache::default(),
             column_widths_cache: TableColumnWidthsCache::default(),
@@ -4716,6 +4876,7 @@ mod tests {
     fn paragraph_with_children(children: Vec<InlineNode>) -> Paragraph {
         let combined: String = children.iter().map(|c| c.text.to_string()).collect();
         let paragraph = Paragraph {
+            html_style: None,
             span: None,
             children,
             link_refs: HashMap::new(),
@@ -5013,6 +5174,7 @@ mod tests {
                 },
             ],
             column_aligns: vec![ColumnumnAlign::Left, ColumnumnAlign::Right],
+            html_headers: None,
             span: None,
             table_data_cache: TableDataCache::default(),
             column_widths_cache: TableColumnWidthsCache::default(),
@@ -5040,6 +5202,7 @@ mod tests {
                 .map(|children| TableRow { children })
                 .collect(),
             column_aligns,
+            html_headers: None,
             span: None,
             table_data_cache: TableDataCache::default(),
             column_widths_cache: TableColumnWidthsCache::default(),
@@ -5203,6 +5366,7 @@ mod tests {
             ..Default::default()
         };
         Paragraph {
+            html_style: None,
             span: None,
             children: vec![InlineNode::image(image)],
             link_refs: HashMap::new(),

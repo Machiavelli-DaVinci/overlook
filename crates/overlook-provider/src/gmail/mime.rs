@@ -59,6 +59,29 @@ pub fn build_raw(account: &Account, draft: &Draft, in_reply_to: Option<&Message>
 mod tests {
     use super::*;
 
+    fn decoded_part(raw: &str, mime: &str) -> String {
+        let start = raw.find(&format!("Content-Type: {mime}")).expect("MIME alternative");
+        let (headers, body) = raw[start..].split_once("\r\n\r\n").expect("part headers");
+        let body = body.split("\r\n--").next().unwrap();
+        let bytes = if headers.contains("base64") {
+            use base64::Engine;
+            base64::engine::general_purpose::STANDARD.decode(body.replace(['\r', '\n'], "")).unwrap()
+        } else if headers.contains("quoted-printable") {
+            let bytes = body.as_bytes();
+            let mut decoded = Vec::new();
+            let mut i = 0;
+            while i < bytes.len() {
+                if bytes[i..].starts_with(b"=\r\n") { i += 3; }
+                else if bytes[i] == b'=' && i + 2 < bytes.len() {
+                    decoded.push(u8::from_str_radix(&body[i + 1..i + 3], 16).unwrap());
+                    i += 3;
+                } else { decoded.push(bytes[i]); i += 1; }
+            }
+            decoded
+        } else { body.as_bytes().to_vec() };
+        String::from_utf8(bytes).unwrap()
+    }
+
     #[test]
     fn builds_plain_message_with_threading() {
         let account = Account {
@@ -109,5 +132,14 @@ mod tests {
         assert!(raw.contains("Content-Type: multipart/alternative"), "{raw}");
         assert!(raw.contains("Content-Type: text/plain") && raw.contains("Content-Type: text/html"), "{raw}");
         assert!(raw.contains("<p>Looks great"), "{raw}");
+        assert!(decoded_part(&raw, "text/plain").contains("Looks great — thanks!"));
+        assert!(decoded_part(&raw, "text/html").contains("Looks great — thanks!"));
+
+        draft.body_text = "**Café — 東京 👋**\nCrème brûlée".into();
+        let raw = String::from_utf8(build_raw(&account, &draft, None, "<unicode@overlook.example>").unwrap()).unwrap();
+        assert!(decoded_part(&raw, "text/plain").contains("Café — 東京 👋"));
+        let html = decoded_part(&raw, "text/html");
+        assert!(html.contains("<strong>Café — 東京 👋</strong><br>"), "{html}");
+        assert!(html.contains("Crème brûlée"), "{html}");
     }
 }

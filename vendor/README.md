@@ -1,16 +1,19 @@
 # Vendored crates
 
-`gpui-base` is a copy of the crates.io release named in its `Cargo.toml` (Apache-2.0), wired in
-through `[patch.crates-io]` in the workspace `Cargo.toml`. Every change is marked "Overlook patch"
-in `src/text/format/html.rs`; nothing else is modified. The patches make the HTML view render mail
-the way a browser-based client does:
+`gpui-base` is based on the crates.io release named in its `Cargo.toml` (Apache-2.0),
+wired in through `[patch.crates-io]` in the root workspace. Overlook's native mail
+formatting changes are in `src/text/format/html.rs`, `src/text/format/html/style.rs`,
+`src/text/node.rs`, `src/text/inline.rs`, and `src/text/inline_flow.rs`.
 
-- `<br>` is a hard line break inside a paragraph (upstream dropped it inline and made it an
-  empty block at block level), so Gmail's `<div>`-and-`<br>` bodies keep their lines.
-- The running text in a block is flushed only before a block-level child, so inline runs and
-  line breaks inside a `<blockquote>` or list item stay one paragraph.
-- `<hr>` renders as a rule, `<pre>` as a code block that keeps its lines, and `<ol start>` is honoured.
+They preserve hard breaks and HTML flow/paragraph distinctions, resolve bounded
+inherited presentation, shape mixed-size text without code-chip decoration, preserve
+list boundaries, and distinguish authored HTML table headers and footers. Markdown
+keeps its own layout defaults. This is not a browser-equivalent HTML/CSS engine.
 
-To upgrade: copy the new release here, re-apply the marked hunks, run `cargo test --workspace`,
-and re-check `llm-docs/overlook-native-app.md#rendering`. Delete this directory and the patch entry
-when upstream ships equivalents.
+See [native capabilities and limits](gpui-base/HTML_FORMATTING.md) and the
+[full formatting review](../docs/message-formatting.md).
+
+To upgrade: review and reapply these changes, run both `cargo test --workspace` and
+`cargo test --manifest-path vendor/gpui-base/Cargo.toml --lib --features test-support`,
+and visually review the synthetic email corpus. Do not remove the patch until upstream
+provides equivalent parsing, layout, selection, and security-policy integration.

@@ -12,6 +12,8 @@ serde_json = { workspace = true }
 thiserror = { workspace = true }
 uuid = { workspace = true }
 ammonia = { workspace = true }
+# Named-color lookup only; no stylesheet engine.
+cssparser = { version = "0.38", default-features = false }
 jiff = { workspace = true }
 html5ever = "0.27"
 markup5ever_rcdom = "0.3"

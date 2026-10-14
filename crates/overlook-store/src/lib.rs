@@ -1879,8 +1879,10 @@ mod tests {
     fn settings_round_trip_and_recipients() {
         let store = Store::open_in_memory().unwrap();
         seeded(&store);
-        store.set_setting("appearance", &AppearancePreference::Dark).unwrap();
-        assert_eq!(store.setting::<AppearancePreference>("appearance").unwrap(), Some(AppearancePreference::Dark));
+        for pref in AppearancePreference::ALL {
+            store.set_setting("appearance", &pref).unwrap();
+            assert_eq!(store.setting::<AppearancePreference>("appearance").unwrap(), Some(pref));
+        }
         assert_eq!(store.setting::<AppearancePreference>("nope").unwrap(), None);
         let recipients = store.known_recipients(&AccountId::from("acct-1"), "ma", 5).unwrap();
         assert_eq!(recipients[0].email, "maya@northstar.example");

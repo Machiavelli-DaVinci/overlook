@@ -1216,12 +1216,16 @@ impl MailWindow {
 
     /// Writes a printable page for the message and opens it in the browser, which prints.
     pub(crate) fn print_message(&mut self, message: Message, window: &mut Window, cx: &mut Context<Self>) {
-        use overlook_core::sanitize::{escape_html, sanitize_html, text_to_html, RemoteContent};
+        use overlook_core::sanitize::{clean_only, escape_html, text_to_html, RemoteContent};
+        let allow_remote = self.remote_allowed.contains(&message.id) || self.prefs.remote_images == RemoteImages::Allow;
+        let policy = if allow_remote { RemoteContent::Allowed } else { RemoteContent::Blocked };
         let body = match (&message.body.html, &message.body.text) {
-            (Some(h), _) => sanitize_html(h, RemoteContent::Allowed).html,
+            // Printing includes all visible history, not just the unfolded reader body.
+            (Some(h), _) => clean_only(h, policy),
             (None, Some(t)) => text_to_html(t),
             (None, None) => String::new(),
         };
+        let body = self.resolve_inline_images(&message, body);
         let to = message.to.iter().map(Address::to_header).collect::<Vec<_>>().join(", ");
         let page = format!(
             "<!DOCTYPE html><html><head><meta charset=\"utf-8\"><title>{subject}</title><style>body{{font:15px/1.5 -apple-system,Segoe UI,Inter,sans-serif;color:#111;max-width:760px;margin:40px auto;padding:0 24px}}.h{{border-bottom:1px solid #ccc;padding-bottom:12px;margin-bottom:20px;font-size:13px;color:#444}}.h b{{color:#111}}h1{{font-size:22px;margin:0 0 12px}}blockquote{{margin:0 0 0 .8ex;border-left:2px solid #ccc;padding-left:1ex;color:#555}}table{{border-collapse:collapse}}td,th{{border:1px solid #ddd;padding:4px 8px}}@media print{{body{{margin:0}}}}</style></head><body><h1>{subject}</h1><div class=\"h\"><div><b>From:</b> {from}</div><div><b>To:</b> {to}</div><div><b>Date:</b> {date}</div></div>{body}<script>window.print()</script></body></html>",
@@ -2121,10 +2125,7 @@ impl MailWindow {
         let this = cx.entity().downgrade();
         let this2 = cx.entity().downgrade();
 
-        let appearance_icon = match p.resolved {
-            ResolvedTheme::Light => "sun",
-            ResolvedTheme::Dark => "moon",
-        };
+        let appearance_icon = if p.is_dark() { "moon" } else { "sun" };
 
         TitleBar::new()
             .h(px(64.))

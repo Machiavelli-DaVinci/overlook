@@ -540,7 +540,7 @@ impl Element for InlineFlow {
                         state.set_text(text.clone());
                     }
 
-                    let is_code = highlights.iter().any(|(_, h)| h.font_size_scale.is_some());
+                    let is_code = highlights.iter().any(|(_, h)| h.code_chip);
                     let padding = if is_code {
                         px(INLINE_CODE_PADDING)
                     } else {
@@ -945,7 +945,7 @@ fn layout_measured_flow(
                         let segment_font_size = font_size * scale;
                         let shaped_line =
                             shape_line(subtext.clone(), segment_font_size, &runs, window);
-                        let is_code = highlights.iter().any(|(_, h)| h.font_size_scale.is_some());
+                        let is_code = highlights.iter().any(|(_, h)| h.code_chip);
                         let padding = if is_code {
                             px(INLINE_CODE_PADDING * 2.)
                         } else {
@@ -1031,7 +1031,12 @@ fn layout_measured_flow(
             item_start = item_end;
         }
 
-        let mut x = Pixels::ZERO;
+        let alignment_width = wrap_width.unwrap_or(line_width).max(line_width);
+        let mut x = match text_style.text_align {
+            gpui::TextAlign::Left => Pixels::ZERO,
+            gpui::TextAlign::Center => (alignment_width - line_width) / 2.,
+            gpui::TextAlign::Right => alignment_width - line_width,
+        };
         for mut fragment in line_fragments {
             // Give a text run's glyph box equal leading on both sides, as
             // much as the line allows: its glyphs are painted centered in the
@@ -1094,7 +1099,11 @@ fn layout_measured_flow(
             fragments.push(positioned);
         }
 
-        max_width = max_width.max(line_width);
+        max_width = max_width.max(if text_style.text_align == gpui::TextAlign::Left {
+            line_width
+        } else {
+            alignment_width
+        });
         y += line_ascent + line_descent;
     }
 
@@ -1366,8 +1375,7 @@ fn shaped_spans(
                             &runs,
                             window,
                         ));
-                        let padding = if highlights.iter().any(|(_, h)| h.font_size_scale.is_some())
-                        {
+                        let padding = if highlights.iter().any(|(_, h)| h.code_chip) {
                             px(INLINE_CODE_PADDING * 2.)
                         } else {
                             Pixels::ZERO
@@ -1477,7 +1485,7 @@ fn push_text_wrap_fragments<'a>(
                 )
                 .width
         };
-        let padding = if highlight.font_size_scale.is_some() {
+        let padding = if highlight.code_chip {
             px(INLINE_CODE_PADDING * 2.)
         } else {
             Pixels::ZERO
@@ -1817,6 +1825,67 @@ mod tests {
     }
 
     #[test]
+    fn mixed_size_flow_aligns_glyphs_and_selection_bounds() {
+        use super::super::inline::test_fonts::{BODY, WideMonoTextSystem};
+        use gpui::{AbsoluteLength, Empty, TestApp, TextAlign};
+        let mut app = TestApp::with_text_system(Arc::new(WideMonoTextSystem));
+        let mut window = app.open_window(|_, _| Empty);
+        let mut style = TextStyle {
+            font_family: BODY.into(),
+            font_size: AbsoluteLength::Pixels(px(10.)),
+            ..Default::default()
+        };
+        let items = vec![
+            MeasureItem::Text {
+                text: "A".into(),
+                links: vec![],
+                highlights: vec![],
+            },
+            MeasureItem::Text {
+                text: "B".into(),
+                links: vec![],
+                highlights: vec![(
+                    0..1,
+                    InlineHighlight {
+                        font_size_scale: Some(1.2),
+                        ..Default::default()
+                    },
+                )],
+            },
+        ];
+        let left = window.update(|_, window, cx| {
+            layout_flow(&items, &[None, None], &style, Some(px(200.)), window, cx)
+        });
+        for (align, factor) in [(TextAlign::Center, 0.5), (TextAlign::Right, 1.)] {
+            style.text_align = align;
+            let layout = window.update(|_, window, cx| {
+                layout_flow(&items, &[None, None], &style, Some(px(200.)), window, cx)
+            });
+            assert_eq!(layout.size.width, px(200.));
+            let offset = (px(200.) - left.size.width) * factor;
+            for (before, after) in left.fragments.iter().zip(&layout.fragments) {
+                let (
+                    PositionedFragment::Text {
+                        origin: a,
+                        selection_bounds: sa,
+                        ..
+                    },
+                    PositionedFragment::Text {
+                        origin: b,
+                        selection_bounds: sb,
+                        ..
+                    },
+                ) = (before, after)
+                else {
+                    panic!("text fragments expected")
+                };
+                assert_eq!(b.x - a.x, offset);
+                assert_eq!(sb.origin.x - sa.origin.x, offset);
+            }
+        }
+    }
+
+    #[test]
     fn inline_image_without_explicit_size_scales_intrinsic_ratio_to_line_height() {
         let line_height = px(20.);
         let intrinsic_size = size(px(160.), px(40.));
@@ -1859,6 +1928,7 @@ mod tests {
             style: HighlightStyle::default(),
             font_family: Some(SharedString::from(MONO)),
             font_size_scale: None,
+            code_chip: false,
         };
         let items = vec![
             MeasureItem::Text {
@@ -1993,6 +2063,45 @@ mod tests {
     }
 
     #[test]
+    fn authored_font_size_changes_glyphs_without_code_chip_padding() {
+        use super::super::inline::test_fonts::{BODY, WideMonoTextSystem};
+        use gpui::{Empty, TestApp};
+        let mut app = TestApp::with_text_system(Arc::new(WideMonoTextSystem));
+        let mut window = app.open_window(|_, _| Empty);
+        let style = TextStyle {
+            font_family: BODY.into(),
+            font_size: px(16.).into(),
+            ..Default::default()
+        };
+        let sized = vec![MeasureItem::Text {
+            text: "sized".into(),
+            links: vec![],
+            highlights: vec![(
+                0..5,
+                InlineHighlight {
+                    font_size_scale: Some(2.),
+                    ..Default::default()
+                },
+            )],
+        }];
+        let plain = vec![MeasureItem::Text {
+            text: "sized".into(),
+            links: vec![],
+            highlights: vec![],
+        }];
+        window.update(|_, window, cx| {
+            let actual = layout_flow(&sized, &[None], &style, None, window, cx);
+            let mut larger = style.clone();
+            larger.font_size = px(32.).into();
+            let expected = layout_flow(&plain, &[None], &larger, None, window, cx);
+            assert_eq!(actual.size.width, expected.size.width);
+            assert!(actual.fragments.iter().any(
+                |f| matches!(f, PositionedFragment::Text { font_size, .. } if *font_size == px(32.))
+            ));
+        });
+    }
+
+    #[test]
     fn inline_code_line_is_as_tall_as_a_plain_line_when_glyphs_overflow_it() {
         use super::super::inline::test_fonts::{BODY, MONO, WideMonoTextSystem};
         use gpui::{Empty, TestApp};
@@ -2013,6 +2122,7 @@ mod tests {
                 InlineHighlight {
                     font_family: Some(MONO.into()),
                     font_size_scale: Some(0.875),
+                    code_chip: true,
                     ..Default::default()
                 },
             )],
@@ -2049,6 +2159,7 @@ mod tests {
                     InlineHighlight {
                         font_family: Some(MONO.into()),
                         font_size_scale: Some(0.875),
+                        code_chip: true,
                         ..Default::default()
                     },
                 )],
@@ -2110,6 +2221,7 @@ mod tests {
                                     InlineHighlight {
                                         font_family: Some(MONO.into()),
                                         font_size_scale: Some(0.875),
+                                        code_chip: true,
                                         ..Default::default()
                                     },
                                 )],

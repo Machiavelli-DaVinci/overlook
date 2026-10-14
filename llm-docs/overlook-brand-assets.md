@@ -43,7 +43,7 @@ Generated landscape artwork was created with the built-in image generation tool.
 
 ## Maintaining the kit
 
-The selected brand direction is the baseline for implementation. Keep the existing assets and semantic tokens consistent with [the brand specification](overlook-brand.md); avoid inventing additional v1 themes or replacing approved typography in isolated screens.
+The selected brand direction is the baseline for implementation. Keep the existing assets and semantic tokens consistent with [the brand specification](overlook-brand.md); keep app colorways centralized in `crates/overlook-app/src/theme.rs` rather than inventing screen-specific palettes or replacing approved typography. The static brand preview still illustrates the original Light/Dark palettes.
 
 The ready-to-use artwork and HTML need no build step. To regenerate:
 

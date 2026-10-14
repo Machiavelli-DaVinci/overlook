@@ -2209,6 +2209,7 @@ dependencies = [
  "ashpd 0.13.13",
  "async-channel",
  "chrono",
+ "cssparser",
  "data-url",
  "futures",
  "gpui-pre",
@@ -4774,6 +4775,7 @@ name = "overlook-core"
 version = "0.4.2"
 dependencies = [
  "ammonia",
+ "cssparser",
  "html5ever 0.27.0",
  "jiff",
  "markdown",

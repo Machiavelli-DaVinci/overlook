@@ -1,10 +1,11 @@
 //! Structural clean-up of received HTML, run before sanitizing.
 //!
 //! Mail HTML carries things a browser hides or a client is expected to tidy: preheader text
-//! hidden with `display:none`, tracking pixels, `<title>` text, spacer blocks such as
-//! Gmail's `<div><br></div>` and Outlook's `<p>&nbsp;</p>`, `<center>` wrappers, and the
-//! quoted history of a reply. The native HTML view has no CSS, so these are resolved on
-//! the DOM here. The result is still untrusted HTML; `sanitize_html` cleans it afterwards.
+//! hidden with `display:none`, tracking pixels, `<title>` text, `<center>` wrappers, and the
+//! quoted history of a reply. The native HTML view supports only a bounded presentation
+//! subset, so visibility is resolved on the DOM here. Explicit blank blocks and hard breaks
+//! are sender content, not disposable spacers. The result is still untrusted HTML;
+//! `sanitize_html` cleans it afterwards.
 
 use html5ever::serialize::{serialize, SerializeOpts, TraversalScope};
 use html5ever::tendril::TendrilSink;
@@ -20,11 +21,10 @@ pub struct Prepared {
 }
 
 /// Elements removed with their content.
-const REMOVE: &[&str] = &["head", "title", "style", "script", "meta", "link", "noscript", "template", "iframe", "object", "embed", "svg", "math", "base"];
-/// Inline wrappers that carry no content of their own.
-const INLINE_WRAPPERS: &[&str] = &["span", "font", "b", "i", "u", "strong", "em", "small", "o:p", "a", "sup", "sub"];
-/// Elements that start on their own line, so a `<br>` next to them adds nothing.
-const BLOCKS: &[&str] = &["div", "p", "table", "ul", "ol", "li", "blockquote", "h1", "h2", "h3", "h4", "h5", "h6", "hr", "pre", "dl", "center"];
+const REMOVE: &[&str] = &[
+    "head", "title", "style", "script", "meta", "link", "noscript", "template", "iframe", "object",
+    "embed", "svg", "math", "base",
+];
 
 pub fn prepare(html: &str) -> Prepared {
     let dom = parse_document(RcDom::default(), ParseOpts::default()).one(html);
@@ -36,7 +36,10 @@ pub fn prepare(html: &str) -> Prepared {
         set_children(&holder, nodes);
         serialize_children(&holder)
     });
-    Prepared { html: serialize_children(&doc), quoted }
+    Prepared {
+        html: serialize_children(&doc),
+        quoted,
+    }
 }
 
 #[derive(Clone, Copy, Default)]
@@ -61,13 +64,17 @@ fn clean_children(node: &Handle, flags: &Flags) -> Vec<Handle> {
             }
             NodeData::Element { name, attrs, .. } => {
                 let local = name.local.to_string();
-                let attrs_vec = attrs.borrow().clone();
+                let mut attrs_vec = attrs.borrow().clone();
                 if REMOVE.contains(&local.as_str()) || is_hidden(&local, &attrs_vec) {
                     continue;
                 }
                 // The view has no baseline shift: digits and signs become the Unicode
                 // super/subscript glyphs (m², H₂O, footnote³); other text stays inline.
                 if local == "sup" || local == "sub" {
+                    // Resolve descendant visibility before converting glyphs; reading
+                    // raw subtree text can resurrect a hidden footnote or tracker.
+                    let visible = clean_children(child, flags);
+                    set_children(child, visible);
                     let text = subtree_text(child, 64);
                     match script_text(&text, local == "sup") {
                         Some(converted) => out.push(text_node(&converted)),
@@ -85,13 +92,18 @@ fn clean_children(node: &Handle, flags: &Flags) -> Vec<Handle> {
                     "dd" => ("div", false),
                     _ => (local.as_str(), false),
                 };
-                if matches!(new_name, "p" | "div") && is_blank(&children) {
-                    continue;
+                if local == "center" && !attrs_vec.iter().any(|a| &*a.name.local == "align") {
+                    attrs_vec.push(Attribute {
+                        name: QualName::new(None, ns!(), LocalName::from("align")),
+                        value: "center".into(),
+                    });
                 }
                 // Each embedded message (Outlook's From:/Sent: block, Gmail's "On … wrote:"
                 // or "Forwarded message" line) is set off with a rule, so a forwarded chain
                 // reads as separate messages. Not when the author already put one there.
-                if starts_embedded_message(child, &local, &attrs_vec) && !out.last().is_some_and(|n| is_named(n, &["hr"])) {
+                if starts_embedded_message(child, &local, &attrs_vec)
+                    && !out.last().is_some_and(|n| is_named(n, &["hr"]))
+                {
                     out.push(element("hr", vec![]));
                 }
                 if new_name != local || bold {
@@ -118,38 +130,11 @@ fn clean_children(node: &Handle, flags: &Flags) -> Vec<Handle> {
             _ => {}
         }
     }
-    trim_breaks(out)
+    out
 }
 
 fn is_named(node: &Handle, names: &[&str]) -> bool {
     matches!(&node.data, NodeData::Element { name, .. } if names.contains(&&*name.local))
-}
-
-/// Drops `<br>`s that only add blank lines: at the start of a block, at its end, and
-/// immediately before a block-level sibling, which starts on a new line anyway.
-fn trim_breaks(children: Vec<Handle>) -> Vec<Handle> {
-    let is_content = |n: &Handle| match &n.data {
-        NodeData::Text { contents } => !is_blank_text(&contents.borrow()),
-        NodeData::Element { .. } => !is_named(n, &["br"]),
-        _ => false,
-    };
-    let mut out: Vec<Handle> = Vec::with_capacity(children.len());
-    for (i, child) in children.iter().enumerate() {
-        if is_named(child, &["br"]) {
-            let before = out.iter().any(is_content);
-            let next = children[i + 1..].iter().find(|n| match &n.data {
-                NodeData::Text { contents } => !is_blank_text(&contents.borrow()),
-                NodeData::Element { .. } => !is_named(n, &["br"]),
-                _ => false,
-            });
-            let followed_by_block = next.is_none_or(|n| is_named(n, BLOCKS));
-            if !before || followed_by_block {
-                continue;
-            }
-        }
-        out.push(child.clone());
-    }
-    out
 }
 
 fn element(name: &str, attrs: Vec<Attribute>) -> Handle {
@@ -162,7 +147,9 @@ fn element(name: &str, attrs: Vec<Attribute>) -> Handle {
 }
 
 fn text_node(text: &str) -> Handle {
-    Node::new(NodeData::Text { contents: RefCell::new(text.into()) })
+    Node::new(NodeData::Text {
+        contents: RefCell::new(text.into()),
+    })
 }
 
 fn set_children(parent: &Handle, children: Vec<Handle>) {
@@ -173,11 +160,14 @@ fn set_children(parent: &Handle, children: Vec<Handle>) {
 }
 
 fn attr<'a>(attrs: &'a [Attribute], name: &str) -> Option<&'a str> {
-    attrs.iter().find(|a| &*a.name.local == name).map(|a| &*a.value)
+    attrs
+        .iter()
+        .find(|a| &*a.name.local == name)
+        .map(|a| &*a.value)
 }
 
 /// Whether an element would be invisible in a browser, or is a tracking pixel.
-fn is_hidden(local: &str, attrs: &[Attribute]) -> bool {
+pub(crate) fn is_hidden(local: &str, attrs: &[Attribute]) -> bool {
     if attr(attrs, "hidden").is_some() {
         return true;
     }
@@ -188,27 +178,104 @@ fn is_hidden(local: &str, attrs: &[Attribute]) -> bool {
         }
     }
     if local == "img" {
-        let dim = |n: &str| attr(attrs, n).and_then(|v| v.trim().trim_end_matches("px").parse::<f32>().ok());
+        let dim = |n: &str| {
+            attr(attrs, n).and_then(|v| v.trim().trim_end_matches("px").parse::<f32>().ok())
+        };
         if let (Some(w), Some(h)) = (dim("width"), dim("height")) {
             if w <= 1.0 && h <= 1.0 {
                 return true;
             }
         }
     }
-    let Some(style) = attr(attrs, "style") else { return false };
-    for decl in style.split(';') {
-        let Some((key, value)) = decl.split_once(':') else { continue };
-        let key = key.trim().to_ascii_lowercase();
+    let Some(style) = attr(attrs, "style") else {
+        return false;
+    };
+    let mut resolved: Vec<(String, String, bool)> = Vec::new();
+    let zero = |v: &str| {
+        let number = v.trim_end_matches(|c: char| c.is_ascii_alphabetic() || c == '%');
+        number.parse::<f32>().is_ok_and(|n| n == 0.)
+    };
+    for decl in style.split(';').take(128) {
+        let Some((key, value)) = decl.split_once(':') else {
+            continue;
+        };
+        let mut key = key.trim().to_ascii_lowercase();
         let value = value.trim().to_ascii_lowercase();
-        let value = value.trim_end_matches("!important").trim();
-        let zero = |v: &str| matches!(v, "0" | "0px" | "0pt" | "0em" | "0%" | "0.0");
+        let (value, important) = crate::sanitize::presentation::declaration_value(&value);
+        // Invalid declarations must not override an earlier valid hiding declaration.
+        let valid = match key.as_str() {
+            "display" => matches!(
+                value,
+                "none"
+                    | "block"
+                    | "inline"
+                    | "inline-block"
+                    | "flex"
+                    | "inline-flex"
+                    | "grid"
+                    | "inline-grid"
+                    | "table"
+                    | "table-row"
+                    | "table-cell"
+                    | "list-item"
+                    | "contents"
+                    | "flow-root"
+                    | "initial"
+                    | "inherit"
+                    | "unset"
+                    | "revert"
+            ),
+            "visibility" => matches!(
+                value,
+                "visible" | "hidden" | "collapse" | "initial" | "inherit" | "unset" | "revert"
+            ),
+            "overflow" | "overflow-y" => {
+                matches!(value, "visible" | "hidden" | "clip" | "scroll" | "auto")
+            }
+            "opacity" => value
+                .parse::<f32>()
+                .is_ok_and(|n| n.is_finite() && (0.0..=1.0).contains(&n)),
+            "mso-hide" => matches!(value, "all" | "none"),
+            "font-size" | "max-height" | "height" | "width" => {
+                value == "auto"
+                    || value == "none"
+                    || value
+                        .trim_end_matches(|c: char| c.is_ascii_alphabetic() || c == '%')
+                        .parse::<f32>()
+                        .is_ok_and(|n| n.is_finite() && n >= 0.)
+            }
+            _ => false,
+        };
+        // For this visibility check only the vertical component matters. Treat the
+        // supported one-value shorthand as the same property before resolving priority.
+        if key == "overflow" {
+            key = "overflow-y".to_owned();
+        }
+        if !valid
+            || resolved
+                .iter()
+                .any(|(k, _, i)| k == &key && *i && !important)
+        {
+            continue;
+        }
+        resolved.retain(|(k, _, _)| k != &key);
+        resolved.push((key, value.to_owned(), important));
+    }
+    let clipped = resolved
+        .iter()
+        .rev()
+        .find(|(k, _, _)| k == "overflow" || k == "overflow-y")
+        .is_some_and(|(_, v, _)| matches!(v.as_str(), "hidden" | "clip"));
+    for (key, value, _) in &resolved {
+        let value = value.as_str();
         let hidden = match key.as_str() {
             "display" => value == "none",
-            "visibility" => value == "hidden",
+            "visibility" => matches!(value, "hidden" | "collapse"),
             "opacity" => zero(value),
             "mso-hide" => value == "all",
-            "max-height" => zero(value),
+            "max-height" | "height" if local != "img" => clipped && zero(value),
             "font-size" => zero(value) || matches!(value, "1px" | "1pt"),
+            "width" | "height" if local == "img" => zero(value),
             _ => false,
         };
         if hidden {
@@ -229,7 +296,11 @@ fn script_text(text: &str, superscript: bool) -> Option<String> {
             let sup = ['⁰', '¹', '²', '³', '⁴', '⁵', '⁶', '⁷', '⁸', '⁹'];
             let sub = ['₀', '₁', '₂', '₃', '₄', '₅', '₆', '₇', '₈', '₉'];
             match c {
-                '0'..='9' => Some(if superscript { sup[c as usize - '0' as usize] } else { sub[c as usize - '0' as usize] }),
+                '0'..='9' => Some(if superscript {
+                    sup[c as usize - '0' as usize]
+                } else {
+                    sub[c as usize - '0' as usize]
+                }),
                 '+' => Some(if superscript { '⁺' } else { '₊' }),
                 '-' => Some(if superscript { '⁻' } else { '₋' }),
                 '(' => Some(if superscript { '⁽' } else { '₍' }),
@@ -242,20 +313,21 @@ fn script_text(text: &str, superscript: bool) -> Option<String> {
         .collect()
 }
 
-/// Whitespace, non-breaking spaces, and the invisible characters preheaders pad with.
+/// Whitespace and invisible padding, used only for quote detection (not block deletion).
 fn is_blank_text(s: &str) -> bool {
-    s.chars().all(|c| c.is_whitespace() || matches!(c, '\u{a0}' | '\u{200b}' | '\u{200c}' | '\u{200d}' | '\u{034f}' | '\u{feff}' | '\u{2007}' | '\u{202f}'))
-}
-
-/// A block that only spaces things out: text-free apart from breaks and empty inline wrappers.
-fn is_blank(children: &[Handle]) -> bool {
-    children.iter().all(|c| match &c.data {
-        NodeData::Text { contents } => is_blank_text(&contents.borrow()),
-        NodeData::Element { name, .. } => {
-            let local = name.local.to_string();
-            local == "br" || (INLINE_WRAPPERS.contains(&local.as_str()) && is_blank(&c.children.borrow()))
-        }
-        _ => true,
+    s.chars().all(|c| {
+        c.is_whitespace()
+            || matches!(
+                c,
+                '\u{a0}'
+                    | '\u{200b}'
+                    | '\u{200c}'
+                    | '\u{200d}'
+                    | '\u{034f}'
+                    | '\u{feff}'
+                    | '\u{2007}'
+                    | '\u{202f}'
+            )
     })
 }
 
@@ -291,8 +363,18 @@ fn linkified_nodes(text: &str, original: &Handle) -> Vec<Handle> {
             out.push(text_node(&rest[..start]));
         }
         let url = &rest[start..start + len];
-        let href = if url.starts_with("www.") { format!("https://{url}") } else { url.to_owned() };
-        let a = element("a", vec![Attribute { name: QualName::new(None, ns!(), LocalName::from("href")), value: href.into() }]);
+        let href = if url.starts_with("www.") {
+            format!("https://{url}")
+        } else {
+            url.to_owned()
+        };
+        let a = element(
+            "a",
+            vec![Attribute {
+                name: QualName::new(None, ns!(), LocalName::from("href")),
+                value: href.into(),
+            }],
+        );
         set_children(&a, vec![text_node(url)]);
         out.push(a);
         rest = &rest[start + len..];
@@ -312,7 +394,11 @@ pub fn find_url(s: &str) -> Option<(usize, usize)> {
     for needle in ["https://", "http://", "www."] {
         if let Some(i) = s.find(needle) {
             // A word boundary before it; "www." must not be part of a longer token.
-            let boundary = i == 0 || !s[..i].chars().next_back().is_some_and(|c| c.is_alphanumeric() || c == '/' || c == '.' || c == '@');
+            let boundary = i == 0
+                || !s[..i]
+                    .chars()
+                    .next_back()
+                    .is_some_and(|c| c.is_alphanumeric() || c == '/' || c == '.' || c == '@');
             if boundary && best.is_none_or(|b| i < b) {
                 best = Some(i);
             }
@@ -320,11 +406,14 @@ pub fn find_url(s: &str) -> Option<(usize, usize)> {
     }
     let start = best?;
     let tail = &s[start..];
-    let mut end = tail.find(|c: char| c.is_whitespace() || matches!(c, '<' | '>' | '"' | '\'' | '\u{a0}')).unwrap_or(tail.len());
+    let mut end = tail
+        .find(|c: char| c.is_whitespace() || matches!(c, '<' | '>' | '"' | '\'' | '\u{a0}'))
+        .unwrap_or(tail.len());
     // Trailing punctuation belongs to the sentence, not the link.
     while end > 0 {
         let c = tail[..end].chars().next_back().unwrap();
-        let unbalanced_paren = c == ')' && tail[..end].matches('(').count() < tail[..end].matches(')').count();
+        let unbalanced_paren =
+            c == ')' && tail[..end].matches('(').count() < tail[..end].matches(')').count();
         if matches!(c, '.' | ',' | ';' | ':' | '!' | '?' | '\'' | '"' | ']') || unbalanced_paren {
             end -= c.len_utf8();
         } else {
@@ -352,6 +441,12 @@ fn split_quote(node: &Handle) -> Option<Vec<Handle>> {
             if let Some(mut found) = split_quote(child) {
                 // Everything after the quote in document order goes with it, at every
                 // level: siblings that follow the ancestor holding the quote start too.
+                // Keep the ancestor's sender attributes on its split-off portion too.
+                if let NodeData::Element { name, attrs, .. } = &child.data {
+                    let wrapper = element(&name.local, attrs.borrow().clone());
+                    set_children(&wrapper, found);
+                    found = vec![wrapper];
+                }
                 found.extend(children[i + 1..].iter().cloned());
                 set_children(node, children[..=i].to_vec());
                 return Some(found);
@@ -388,14 +483,17 @@ fn starts_embedded_message(node: &Handle, local: &str, attrs: &[Attribute]) -> b
     match own {
         Some(Some(t)) => {
             let t = t.trim_start();
-            t.starts_with("-----Original Message-----") || t.starts_with("---------- Forwarded message")
+            t.starts_with("-----Original Message-----")
+                || t.starts_with("---------- Forwarded message")
         }
         _ => false,
     }
 }
 
 fn is_quote_start(node: &Handle) -> bool {
-    let NodeData::Element { name, attrs, .. } = &node.data else { return false };
+    let NodeData::Element { name, attrs, .. } = &node.data else {
+        return false;
+    };
     let attrs = attrs.borrow();
     let local = name.local.to_string();
     let class = attr(&attrs, "class").unwrap_or("").to_ascii_lowercase();
@@ -403,14 +501,21 @@ fn is_quote_start(node: &Handle) -> bool {
     match local.as_str() {
         "blockquote" => attr(&attrs, "type").is_some_and(|t| t.eq_ignore_ascii_case("cite")),
         "div" => {
-            if class.split_whitespace().any(|c| c == "gmail_quote" || c == "gmail_quote_container") {
+            if class
+                .split_whitespace()
+                .any(|c| c == "gmail_quote" || c == "gmail_quote_container")
+            {
                 // A forward is content, not history.
-                return !first_text_matching(node, "gmail_attr").is_some_and(|t| t.contains("Forwarded message"));
+                return !first_text_matching(node, "gmail_attr")
+                    .is_some_and(|t| t.contains("Forwarded message"));
             }
             // Outlook's "From: / Sent: / To:" header block is deliberately not a quote
             // marker: people annotate inside the text that follows it, and the header is
             // the context for those notes. It stays inline, as Gmail shows it.
-            class.contains("yahoo_quoted") || class.contains("moz-cite-prefix") || id == "divrplyfwdmsg" || id == "appendonsend"
+            class.contains("yahoo_quoted")
+                || class.contains("moz-cite-prefix")
+                || id == "divrplyfwdmsg"
+                || id == "appendonsend"
         }
         _ => false,
     }
@@ -419,7 +524,9 @@ fn is_quote_start(node: &Handle) -> bool {
 fn first_text_matching(node: &Handle, class: &str) -> Option<String> {
     for child in node.children.borrow().iter() {
         if let NodeData::Element { attrs, .. } = &child.data {
-            if attr(&attrs.borrow(), "class").is_some_and(|c| c.split_whitespace().any(|x| x == class)) {
+            if attr(&attrs.borrow(), "class")
+                .is_some_and(|c| c.split_whitespace().any(|x| x == class))
+            {
                 return Some(subtree_text(child, 400));
             }
         }
@@ -451,7 +558,10 @@ fn subtree_text(node: &Handle, limit: usize) -> String {
 
 fn serialize_children(node: &Handle) -> String {
     let mut buf = Vec::new();
-    let opts = SerializeOpts { traversal_scope: TraversalScope::ChildrenOnly(None), ..Default::default() };
+    let opts = SerializeOpts {
+        traversal_scope: TraversalScope::ChildrenOnly(None),
+        ..Default::default()
+    };
     let _ = serialize(&mut buf, &SerializableHandle::from(node.clone()), opts);
     String::from_utf8(buf).unwrap_or_default()
 }
@@ -462,76 +572,148 @@ mod tests {
 
     #[test]
     fn hides_what_a_browser_hides() {
-        let p = prepare(r#"<html><head><title>Title text</title></head><body><div style="display:none">pre</div><span style="font-size:0px">zero</span><div style="visibility:hidden">vis</div><div class="preheader">ph</div><img src="https://t/x.gif" width="1" height="1"><p>Visible</p></body></html>"#);
-        assert!(!p.html.contains("Title text") && !p.html.contains("pre<") && !p.html.contains("zero") && !p.html.contains("vis<") && !p.html.contains("ph<"));
+        let p = prepare(
+            r#"<html><head><title>Title text</title></head><body><div style="display:none">pre</div><span style="font-size:0px">zero</span><div style="visibility:hidden">vis</div><div class="preheader">ph</div><img src="https://t/x.gif" width="1" height="1"><p>Visible</p></body></html>"#,
+        );
+        assert!(
+            !p.html.contains("Title text")
+                && !p.html.contains("pre<")
+                && !p.html.contains("zero")
+                && !p.html.contains("vis<")
+                && !p.html.contains("ph<")
+        );
         assert!(!p.html.contains("<img"));
         assert!(p.html.contains("<p>Visible</p>"));
     }
 
     #[test]
-    fn removes_spacer_blocks_and_center() {
-        let p = prepare(r#"<div>a</div><div><br></div><p>&nbsp;</p><p><o:p>&nbsp;</o:p></p><center><h1>Head</h1></center><dl><dt>Term</dt><dd>Def</dd></dl>"#);
-        assert_eq!(p.html, "<html><body><div>a</div><div><h1>Head</h1></div><dl><div><b>Term</b></div><div>Def</div></dl></body></html>");
+    fn preserves_spacer_blocks_and_converts_center() {
+        let p = prepare(
+            r#"<div>a</div><div><br></div><p>&nbsp;</p><p><o:p>&nbsp;</o:p></p><center><h1>Head</h1></center><dl><dt>Term</dt><dd>Def</dd></dl>"#,
+        );
+        assert_eq!(p.html, "<html><body><div>a</div><div><br></div><p>&nbsp;</p><p><o:p>&nbsp;</o:p></p><div align=\"center\"><h1>Head</h1></div><dl><div><b>Term</b></div><div>Def</div></dl></body></html>");
     }
 
     #[test]
     fn links_bare_urls_outside_anchors() {
-        let p = prepare(r#"<p>See https://example.com/a?b=1. Also www.example.org, and <a href="https://x.y">https://x.y</a></p>"#);
-        assert!(p.html.contains(r#"<a href="https://example.com/a?b=1">https://example.com/a?b=1</a>."#), "{}", p.html);
-        assert!(p.html.contains(r#"<a href="https://www.example.org">www.example.org</a>,"#), "{}", p.html);
+        let p = prepare(
+            r#"<p>See https://example.com/a?b=1. Also www.example.org, and <a href="https://x.y">https://x.y</a></p>"#,
+        );
+        assert!(
+            p.html
+                .contains(r#"<a href="https://example.com/a?b=1">https://example.com/a?b=1</a>."#),
+            "{}",
+            p.html
+        );
+        assert!(
+            p.html
+                .contains(r#"<a href="https://www.example.org">www.example.org</a>,"#),
+            "{}",
+            p.html
+        );
         assert_eq!(p.html.matches("<a ").count(), 3);
     }
 
     #[test]
     fn preformatted_lines_survive() {
         let p = prepare("<pre>fn main() {\n    body\n}</pre>");
-        assert_eq!(p.html, "<html><body><pre>fn main() {<br>&nbsp;&nbsp;&nbsp;&nbsp;body<br>}</pre></body></html>");
+        assert_eq!(
+            p.html,
+            "<html><body><pre>fn main() {<br>&nbsp;&nbsp;&nbsp;&nbsp;body<br>}</pre></body></html>"
+        );
     }
 
     #[test]
     fn splits_gmail_quote_but_not_forwards() {
-        let p = prepare(r#"<div dir="ltr">New text<br><div class="gmail_quote"><div class="gmail_attr">On Mon, X wrote:</div><blockquote class="gmail_quote">old</blockquote></div></div>"#);
+        let p = prepare(
+            r#"<div dir="ltr">New text<br><div class="gmail_quote"><div class="gmail_attr">On Mon, X wrote:</div><blockquote class="gmail_quote">old</blockquote></div></div>"#,
+        );
         assert!(p.html.contains("New text") && !p.html.contains("old"));
-        assert!(p.quoted.as_deref().is_some_and(|q| q.contains("old") && q.contains("wrote:")));
-        let f = prepare(r#"<div dir="ltr">FYI<div class="gmail_quote"><div class="gmail_attr">---------- Forwarded message ---------<br>From: A</div><div>body</div></div></div>"#);
+        assert!(p
+            .quoted
+            .as_deref()
+            .is_some_and(|q| q.contains("old") && q.contains("wrote:")));
+        let f = prepare(
+            r#"<div dir="ltr">FYI<div class="gmail_quote"><div class="gmail_attr">---------- Forwarded message ---------<br>From: A</div><div>body</div></div></div>"#,
+        );
         assert!(f.quoted.is_none() && f.html.contains("body"));
     }
 
     #[test]
     fn splits_cite_blockquotes_and_outlook_headers() {
         let p = prepare(r#"<div>Reply</div><blockquote type="cite"><div>older</div></blockquote>"#);
-        assert!(p.quoted.as_deref().is_some_and(|q| q.contains("older")) && !p.html.contains("older"));
+        assert!(
+            p.quoted.as_deref().is_some_and(|q| q.contains("older")) && !p.html.contains("older")
+        );
         // Outlook's header block and what follows stay inline.
-        let o = prepare(r#"<div class="WordSection1"><p>Thanks</p><div style="border:none;border-top:solid #E1E1E1 1.0pt;padding:3.0pt 0in 0in 0in"><p><b>From:</b> A<br><b>Sent:</b> B</p></div><p>original</p></div>"#);
-        assert!(o.quoted.is_none() && o.html.contains("From:") && o.html.contains("original"), "{}", o.html);
+        let o = prepare(
+            r#"<div class="WordSection1"><p>Thanks</p><div style="border:none;border-top:solid #E1E1E1 1.0pt;padding:3.0pt 0in 0in 0in"><p><b>From:</b> A<br><b>Sent:</b> B</p></div><p>original</p></div>"#,
+        );
+        assert!(
+            o.quoted.is_none() && o.html.contains("From:") && o.html.contains("original"),
+            "{}",
+            o.html
+        );
         // A Gmail quote nested one level down takes the nodes after its ancestor with it.
-        let n = prepare(r#"<div><div>New<div class="gmail_quote"><blockquote class="gmail_quote">old</blockquote></div></div><p>trailing signature</p></div>"#);
-        assert!(n.html.contains("New") && !n.html.contains("old") && !n.html.contains("trailing"), "{}", n.html);
-        assert!(n.quoted.as_deref().is_some_and(|q| q.contains("old") && q.contains("trailing")));
+        let n = prepare(
+            r#"<div><div>New<div class="gmail_quote"><blockquote class="gmail_quote">old</blockquote></div></div><p>trailing signature</p></div>"#,
+        );
+        assert!(
+            n.html.contains("New") && !n.html.contains("old") && !n.html.contains("trailing"),
+            "{}",
+            n.html
+        );
+        assert!(n
+            .quoted
+            .as_deref()
+            .is_some_and(|q| q.contains("old") && q.contains("trailing")));
     }
 
     #[test]
-    fn trims_breaks_that_only_add_blank_lines() {
+    fn preserves_intentional_breaks() {
         let p = prepare("<div>FYI<br><br><div>next</div><br></div><div><br>lead<br>line<br></div>");
-        assert_eq!(p.html, "<html><body><div>FYI<div>next</div></div><div>lead<br>line</div></body></html>");
+        assert_eq!(p.html, "<html><body><div>FYI<br><br><div>next</div><br></div><div><br>lead<br>line<br></div></body></html>");
     }
 
     #[test]
     fn embedded_message_headers_get_a_rule() {
-        let o = prepare(r#"<div><p>Thanks</p><div style="border:none;border-top:solid #E1E1E1 1.0pt"><p><b>From:</b> A</p></div><p>original</p></div>"#);
+        let o = prepare(
+            r#"<div><p>Thanks</p><div style="border:none;border-top:solid #E1E1E1 1.0pt"><p><b>From:</b> A</p></div><p>original</p></div>"#,
+        );
         assert!(o.html.contains("<hr><div"), "{}", o.html);
-        let f = prepare(r#"<div dir="ltr">FYI<div class="gmail_quote"><div class="gmail_attr">---------- Forwarded message ---------<br>From: A</div><div>body</div></div></div>"#);
+        let f = prepare(
+            r#"<div dir="ltr">FYI<div class="gmail_quote"><div class="gmail_attr">---------- Forwarded message ---------<br>From: A</div><div>body</div></div></div>"#,
+        );
         assert_eq!(f.html.matches("<hr>").count(), 1, "{}", f.html);
         // Not doubled when the author already drew one.
-        let d = prepare(r#"<div><hr><div style="border-top:1px solid #ccc"><p>From: A</p></div></div>"#);
+        let d = prepare(
+            r#"<div><hr><div style="border-top:1px solid #ccc"><p>From: A</p></div></div>"#,
+        );
         assert_eq!(d.html.matches("<hr>").count(), 1, "{}", d.html);
     }
 
     #[test]
+    fn superscripts_never_resurrect_hidden_descendants() {
+        let p = prepare("<p>A<sup><span hidden>2</span></sup>B<sub><span style='display:none'>3</span></sub>C</p>");
+        assert!(p.html.contains("<p>ABC</p>"), "{}", p.html);
+        assert!(!p.html.contains('²') && !p.html.contains('₃'));
+    }
+
+    #[test]
     fn sup_and_sub_become_glyphs_when_possible() {
-        let p = prepare("<p>E=mc<sup>2</sup>, H<sub>2</sub>O, see note<sup>12</sup> and x<sup>th</sup></p>");
-        assert!(p.html.contains("E=mc²") && p.html.contains("H₂O") && p.html.contains("note¹²"), "{}", p.html);
-        assert!(p.html.contains("xth") && !p.html.contains("<sup>"), "{}", p.html);
+        let p = prepare(
+            "<p>E=mc<sup>2</sup>, H<sub>2</sub>O, see note<sup>12</sup> and x<sup>th</sup></p>",
+        );
+        assert!(
+            p.html.contains("E=mc²") && p.html.contains("H₂O") && p.html.contains("note¹²"),
+            "{}",
+            p.html
+        );
+        assert!(
+            p.html.contains("xth") && !p.html.contains("<sup>"),
+            "{}",
+            p.html
+        );
     }
 
     #[test]

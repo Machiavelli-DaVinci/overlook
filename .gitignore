@@ -1,4 +1,7 @@
 /target
+# Standalone vendored renderer tests; the app uses the root Cargo.lock.
+/vendor/gpui-base/target
+/vendor/gpui-base/Cargo.lock
 **/*.rs.bk
 *.sqlite
 *.sqlite-journal

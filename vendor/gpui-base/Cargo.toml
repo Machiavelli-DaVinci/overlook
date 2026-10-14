@@ -9,6 +9,9 @@
 # will likely look very different (and much more reasonable).
 # See Cargo.toml.orig for the original contents.
 
+# Keep the vendored crate independently testable from the host workspace.
+[workspace]
+
 [package]
 edition = "2024"
 name = "gpui-base"
@@ -75,6 +78,10 @@ version = "1"
 
 [dependencies.chrono]
 version = "0.4.38"
+
+[dependencies.cssparser]
+version = "0.38"
+default-features = false
 
 [dependencies.data-url]
 version = "0.3"

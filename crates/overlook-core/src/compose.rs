@@ -27,10 +27,7 @@ fn soft_breaks_to_br(html: &str) -> String {
     let mut out = String::with_capacity(html.len());
     let mut in_pre = false;
     let mut in_tag = false;
-    let bytes = html.as_bytes();
-    let mut i = 0;
-    while i < bytes.len() {
-        let c = bytes[i] as char;
+    for (i, c) in html.char_indices() {
         if c == '<' {
             in_tag = true;
             if html[i..].starts_with("<pre") {
@@ -45,7 +42,7 @@ fn soft_breaks_to_br(html: &str) -> String {
             // A newline right after a block close or before a block open is layout, not a break.
             let before = html[..i].trim_end_matches(' ');
             let after = html[i + 1..].trim_start_matches(' ');
-            if before.ends_with('>') || after.starts_with('<') {
+            if ends_at_block_boundary(before) || starts_at_block_boundary(after) {
                 out.push('\n');
             } else {
                 out.push_str("<br>\n");
@@ -53,9 +50,24 @@ fn soft_breaks_to_br(html: &str) -> String {
         } else {
             out.push(c);
         }
-        i += c.len_utf8();
     }
     out
+}
+
+// Inline markup is not a block boundary: **Hello** followed by a newline must
+// still produce a mail line break. Generated block separators and existing <br>
+// elements must not acquire an extra break.
+fn boundary_tag(tag: &str) -> bool {
+    let name = tag.trim_start_matches(['<', '/']).split(['>', ' ', '\t', '\n']).next().unwrap_or_default();
+    matches!(name, "p" | "div" | "br" | "hr" | "pre" | "blockquote" | "ul" | "ol" | "li" | "h1" | "h2" | "h3" | "h4" | "h5" | "h6" | "table" | "thead" | "tbody" | "tr" | "td" | "th")
+}
+
+fn ends_at_block_boundary(text: &str) -> bool {
+    text.ends_with('>') && text.rfind('<').is_some_and(|start| boundary_tag(&text[start..]))
+}
+
+fn starts_at_block_boundary(text: &str) -> bool {
+    text.starts_with('<') && boundary_tag(text)
 }
 
 /// The text part: the author's words with the formatting marks removed, links kept readable.
@@ -173,11 +185,17 @@ pub fn outgoing_bodies(draft: &Draft, source: Option<&Message>) -> OutgoingBodie
     let Some(source) = source.filter(|_| draft.include_quote) else {
         return OutgoingBodies { text, html };
     };
-    let source_text = source.body.text.clone().or_else(|| source.body.html.as_deref().map(html_to_text)).unwrap_or_else(|| source.snippet.clone());
     let source_html = match (&source.body.html, &source.body.text) {
         (Some(h), _) => clean_only(h, RemoteContent::Allowed),
         (None, Some(t)) => text_to_html(t),
         (None, None) => text_to_html(&source.snippet),
+    };
+    // Use the same visible source for both MIME alternatives. A provider-generated
+    // text derivative may predate our visibility/security policy.
+    let source_text = if source.body.html.is_some() {
+        html_to_text(&source_html)
+    } else {
+        source.body.text.clone().unwrap_or_else(|| source.snippet.clone())
     };
     match draft.kind {
         DraftKind::Forward => {
@@ -205,11 +223,39 @@ pub fn outgoing_bodies(draft: &Draft, source: Option<&Message>) -> OutgoingBodie
     OutgoingBodies { text, html }
 }
 
+/// Local quote previews enforce resource consent independently of the outgoing
+/// serialization. Keep the full visible history, rather than folding it for display.
+pub fn quote_preview(draft: &Draft, source: &Message, policy: RemoteContent) -> String {
+    outgoing_preview(&Draft { body_text: String::new(), ..draft.clone() }, Some(source), policy)
+}
+
+/// Preview a draft (including Outbox items) without bypassing local image consent.
+pub fn outgoing_preview(draft: &Draft, source: Option<&Message>, policy: RemoteContent) -> String {
+    clean_only(&outgoing_bodies(draft, source).html, policy)
+}
+
 #[cfg(test)]
 mod tests {
     use super::*;
     use crate::ids::*;
     use crate::model::{Address, Body};
+
+    #[test]
+    fn unicode_and_inline_soft_breaks_survive_rendering() {
+        let html = render_markdown("**Café — 東京 👋**\nCrème brûlée\n你好");
+        assert!(html.contains("<strong>Café — 東京 👋</strong><br>\nCrème brûlée<br>\n你好"), "{html}");
+        assert_eq!(soft_breaks_to_br("<pre>é\n東京 👋</pre>\n<p>Fin</p>"), "<pre>é\n東京 👋</pre>\n<p>Fin</p>");
+        assert_eq!(soft_breaks_to_br("<p>one<br>\ntwo</p>"), "<p>one<br>\ntwo</p>");
+    }
+
+    #[test]
+    fn authored_image_previews_also_require_local_resource_consent() {
+        let mut draft = Draft::new(AccountId::from("a"), DraftKind::New, 0);
+        draft.body_text = "![Image](https://images.example/preview.png)".into();
+        assert!(!outgoing_preview(&draft, None, RemoteContent::Blocked).contains("https://images.example/preview.png"));
+        assert!(outgoing_preview(&draft, None, RemoteContent::Allowed).contains("https://images.example/preview.png"));
+        assert!(outgoing_bodies(&draft, None).html.contains("https://images.example/preview.png"));
+    }
 
     #[test]
     fn renders_mail_markdown() {
@@ -276,6 +322,29 @@ mod tests {
         assert!(out.html.contains("<blockquote") && out.html.contains("Thursday works."), "{}", out.html);
         draft.include_quote = false;
         assert_eq!(outgoing_bodies(&draft, Some(&source())).text, "Thursday it is.");
+    }
+
+    #[test]
+    fn quotes_share_visible_content_but_preview_requires_remote_consent() {
+        let mut source = source();
+        source.body.html = Some("<div style=\"display:none\">Private preheader</div><p style=\"margin:0;font-size:10pt\">Café 東京</p><img src=\"https://images.example/logo.png\" alt=\"Logo\"><blockquote>Earlier history</blockquote>".into());
+        source.body.text = Some("Private preheader\nStale text derivative".into());
+        let mut draft = Draft::new(AccountId::from("a"), DraftKind::Reply, 0);
+        draft.include_quote = true;
+        let outgoing = outgoing_bodies(&draft, Some(&source));
+        assert!(!outgoing.html.contains("Private preheader"));
+        assert!(!outgoing.text.contains("Private preheader") && !outgoing.text.contains("Stale text"));
+        assert!(outgoing.text.contains("Café 東京") && outgoing.text.contains("Earlier history"));
+        assert!(outgoing.html.contains("font-size:10pt") && outgoing.html.contains("margin:0"));
+        assert!(outgoing.html.contains("https://images.example/logo.png"));
+        let preview = quote_preview(&draft, &source, RemoteContent::Blocked);
+        assert!(!preview.contains("https://images.example/logo.png"));
+        assert!(preview.contains("Earlier history"));
+        draft.body_text = "My **reply**".into();
+        let outbox = outgoing_preview(&draft, Some(&source), RemoteContent::Blocked);
+        assert!(outbox.contains("My <strong>reply</strong>"));
+        assert!(!outbox.contains("https://images.example/logo.png"));
+        assert!(quote_preview(&draft, &source, RemoteContent::Allowed).contains("https://images.example/logo.png"));
     }
 
     #[test]

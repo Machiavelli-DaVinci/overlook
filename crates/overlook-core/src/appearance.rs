@@ -1,7 +1,7 @@
 //! Appearance preference and theme resolution.
 //!
-//! V1 ships exactly two themes. "Follow system" is a preference that selects one of them;
-//! it is not a third theme.
+//! Explicit themes are independent of the desktop appearance. "Follow system"
+//! selects Light or Dark, with Light as the fallback.
 
 use serde::{Deserialize, Serialize};
 
@@ -11,14 +11,24 @@ use serde::{Deserialize, Serialize};
 pub enum AppearancePreference {
     Light,
     Dark,
+    Gray,
+    Blue,
+    White,
+    GrayWhite,
+    Pink,
     #[default]
     FollowSystem,
 }
 
 impl AppearancePreference {
-    pub const ALL: [AppearancePreference; 3] = [
+    pub const ALL: [AppearancePreference; 8] = [
         AppearancePreference::Light,
         AppearancePreference::Dark,
+        AppearancePreference::Gray,
+        AppearancePreference::Blue,
+        AppearancePreference::White,
+        AppearancePreference::GrayWhite,
+        AppearancePreference::Pink,
         AppearancePreference::FollowSystem,
     ];
 
@@ -27,6 +37,11 @@ impl AppearancePreference {
         match self {
             AppearancePreference::Light => "Light",
             AppearancePreference::Dark => "Dark",
+            AppearancePreference::Gray => "Gray",
+            AppearancePreference::Blue => "Blue",
+            AppearancePreference::White => "White",
+            AppearancePreference::GrayWhite => "Gray/White",
+            AppearancePreference::Pink => "Pink",
             AppearancePreference::FollowSystem => "Follow system",
         }
     }
@@ -35,6 +50,11 @@ impl AppearancePreference {
         match self {
             AppearancePreference::Light => "light",
             AppearancePreference::Dark => "dark",
+            AppearancePreference::Gray => "gray",
+            AppearancePreference::Blue => "blue",
+            AppearancePreference::White => "white",
+            AppearancePreference::GrayWhite => "gray-white",
+            AppearancePreference::Pink => "pink",
             AppearancePreference::FollowSystem => "follow-system",
         }
     }
@@ -43,16 +63,26 @@ impl AppearancePreference {
         match key {
             "light" => Some(AppearancePreference::Light),
             "dark" => Some(AppearancePreference::Dark),
+            "gray" => Some(AppearancePreference::Gray),
+            "blue" => Some(AppearancePreference::Blue),
+            "white" => Some(AppearancePreference::White),
+            "gray-white" => Some(AppearancePreference::GrayWhite),
+            "pink" => Some(AppearancePreference::Pink),
             "follow-system" | "system" => Some(AppearancePreference::FollowSystem),
             _ => None,
         }
     }
 
-    /// Resolves the preference to one of the two built-in themes.
+    /// Resolves the preference, consulting the desktop only for Follow system.
     pub fn resolve(self, system: SystemAppearance) -> ResolvedTheme {
         match self {
             AppearancePreference::Light => ResolvedTheme::Light,
             AppearancePreference::Dark => ResolvedTheme::Dark,
+            AppearancePreference::Gray => ResolvedTheme::Gray,
+            AppearancePreference::Blue => ResolvedTheme::Blue,
+            AppearancePreference::White => ResolvedTheme::White,
+            AppearancePreference::GrayWhite => ResolvedTheme::GrayWhite,
+            AppearancePreference::Pink => ResolvedTheme::Pink,
             AppearancePreference::FollowSystem => match system {
                 SystemAppearance::Dark => ResolvedTheme::Dark,
                 // Light is the documented fallback when the desktop has no preference or
@@ -71,11 +101,16 @@ pub enum SystemAppearance {
     Unknown,
 }
 
-/// One of the two built-in themes.
+/// A built-in theme.
 #[derive(Clone, Copy, Debug, PartialEq, Eq, Serialize, Deserialize)]
 pub enum ResolvedTheme {
     Light,
     Dark,
+    Gray,
+    Blue,
+    White,
+    GrayWhite,
+    Pink,
 }
 
 impl ResolvedTheme {
@@ -89,7 +124,7 @@ mod tests {
     use super::*;
 
     #[test]
-    fn follow_system_is_not_a_third_theme() {
+    fn follow_system_selects_light_or_dark() {
         assert_eq!(
             AppearancePreference::FollowSystem.resolve(SystemAppearance::Dark),
             ResolvedTheme::Dark
@@ -107,6 +142,38 @@ mod tests {
             AppearancePreference::Dark.resolve(SystemAppearance::Light),
             ResolvedTheme::Dark
         );
+    }
+
+    #[test]
+    fn explicit_themes_ignore_system() {
+        for (pref, theme, dark) in [
+            (AppearancePreference::Light, ResolvedTheme::Light, false),
+            (AppearancePreference::Dark, ResolvedTheme::Dark, true),
+            (AppearancePreference::Gray, ResolvedTheme::Gray, false),
+            (AppearancePreference::Blue, ResolvedTheme::Blue, false),
+            (AppearancePreference::White, ResolvedTheme::White, false),
+            (AppearancePreference::GrayWhite, ResolvedTheme::GrayWhite, false),
+            (AppearancePreference::Pink, ResolvedTheme::Pink, false),
+        ] {
+            for system in [SystemAppearance::Light, SystemAppearance::Dark, SystemAppearance::Unknown] {
+                assert_eq!(pref.resolve(system), theme);
+            }
+            assert_eq!(theme.is_dark(), dark);
+            let json = serde_json::to_string(&theme).unwrap();
+            assert_eq!(serde_json::from_str::<ResolvedTheme>(&json).unwrap(), theme);
+        }
+    }
+
+    #[test]
+    fn preferences_serialize_as_keys() {
+        for pref in AppearancePreference::ALL {
+            let json = serde_json::to_string(&pref).unwrap();
+            assert_eq!(json, format!("\"{}\"", pref.as_key()));
+            assert_eq!(serde_json::from_str::<AppearancePreference>(&json).unwrap(), pref);
+        }
+        assert_eq!(AppearancePreference::GrayWhite.label(), "Gray/White");
+        assert_eq!(AppearancePreference::GrayWhite.as_key(), "gray-white");
+        assert_eq!(AppearancePreference::default(), AppearancePreference::FollowSystem);
     }
 
     #[test]

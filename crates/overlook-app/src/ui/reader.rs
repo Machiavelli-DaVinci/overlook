@@ -20,7 +20,7 @@ use overlook_store::MailboxView;
 impl MailWindow {
     pub(super) fn render_reader(&self, cx: &mut Context<Self>) -> impl IntoElement {
         let p = *cx.palette();
-        let container = v_flex().size_full().bg(p.surface).min_w_0();
+        let container = v_flex().size_full().bg(p.message_surface()).min_w_0();
 
         if let Some(composer) = &self.composer {
             if composer.draft.kind == DraftKind::New || self.selected.is_none() {
@@ -603,7 +603,7 @@ impl MailWindow {
 
     /// Replaces `cid:` image references with the downloaded attachment as a `data:` URL,
     /// which the HTML view decodes inline. Images not downloaded yet stay as they are.
-    fn resolve_inline_images(&self, m: &Message, html: String) -> String {
+    pub(super) fn resolve_inline_images(&self, m: &Message, html: String) -> String {
         if !html.contains("cid:") {
             return html;
         }
@@ -648,9 +648,9 @@ impl MailWindow {
             if text.len() < 40 {
                 return false;
             }
-            // The first line or two of the earlier message, found inside the quote.
-            let probe: String = text.chars().take(120).collect();
-            quoted.contains(probe.trim())
+            // Only fold an exact redundant body. A matching prefix is insufficient:
+            // inline answers, annotations, and signatures must not disappear with history.
+            quoted == text
         })
     }
 
@@ -956,7 +956,11 @@ impl MailWindow {
                     .max_w(px(760.))
                     .child({
                         let source = d.in_reply_to.as_ref().and_then(|id| self.store.message(id).ok().flatten());
-                        let html = overlook_core::compose::outgoing_bodies(d, source.as_ref()).html;
+                        let allow_remote = self.prefs.remote_images == RemoteImages::Allow || source.as_ref().is_some_and(|m| self.remote_allowed.contains(&m.id));
+                        let policy = if allow_remote { RemoteContent::Allowed } else { RemoteContent::Blocked };
+                        let html = overlook_core::compose::outgoing_preview(d, source.as_ref(), policy);
+                        let html = overlook_core::sanitize::adapt_colors(&html, p.is_dark());
+                        let html = match source.as_ref() { Some(m) => self.resolve_inline_images(m, html), None => html };
                         TextView::html(SharedString::from(format!("outbox-{}", d.id)), html).selectable(true)
                     }),
             )

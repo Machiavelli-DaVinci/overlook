@@ -572,16 +572,17 @@ impl MailWindow {
         v_flex()
             .gap(px(22.))
             .child(section("Appearance", None))
-            .child(setting_row(
-                "Theme",
-                "Follow system picks Light or Dark from your desktop setting.",
-                choice(
-                    &[("Light", AppearancePreference::Light), ("Dark", AppearancePreference::Dark), ("Follow system", AppearancePreference::FollowSystem)],
-                    appearance,
-                    cx,
-                    |this, v, window, cx| this.set_appearance(v, window, cx),
-                ),
-            ))
+            .child(
+                v_flex()
+                    .gap(px(8.))
+                    .child(section("Theme", Some("Follow system picks Light or Dark from your desktop setting.")))
+                    .child(choice(
+                        &AppearancePreference::ALL.map(|pref| (pref.label(), pref)),
+                        appearance,
+                        cx,
+                        |this, v, window, cx| this.set_appearance(v, window, cx),
+                    )),
+            )
             .child(setting_row(
                 "Density",
                 "Compact fits more messages on screen.",
@@ -959,6 +960,8 @@ fn choice<T: Copy + PartialEq + 'static>(
     let p = *cx.palette();
     let on_select = std::rc::Rc::new(on_select);
     segmented(&p)
+        .flex_wrap()
+        .max_w_full()
         .children(options.iter().map(|(label, value)| {
             let value = *value;
             let on_select = on_select.clone();

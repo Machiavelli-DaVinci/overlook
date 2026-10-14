@@ -1,11 +1,14 @@
 //! Sanitization of received HTML.
 //!
-//! Received mail is untrusted. The sanitizer removes scripts, styles, forms, frames, event
+//! Received mail is untrusted. The sanitizer removes scripts, stylesheets, forms, frames, event
 //! handlers, and (by default) every remote resource. The output is safe to hand to the
 //! native HTML text view, which executes nothing, but the policy is enforced here so that
 //! no renderer ever sees the raw markup.
 
+use markup5ever_rcdom::{Handle, NodeData};
 use std::collections::HashSet;
+#[path = "presentation.rs"]
+pub(crate) mod presentation;
 
 /// Remote-content policy for a particular rendering.
 #[derive(Clone, Copy, Debug, PartialEq, Eq, Default)]
@@ -33,36 +36,129 @@ pub struct Sanitized {
 fn builder(policy: RemoteContent) -> ammonia::Builder<'static> {
     let mut builder = ammonia::Builder::default();
     let tags: HashSet<&str> = [
-        "a", "abbr", "b", "blockquote", "br", "caption", "center", "code", "dd", "del", "div",
-        "dl", "dt", "em", "font", "h1", "h2", "h3", "h4", "h5", "h6", "hr", "i", "img", "ins",
-        "kbd", "li", "ol", "p", "pre", "q", "s", "small", "span", "strike", "strong", "sub",
-        "sup", "table", "tbody", "td", "tfoot", "th", "thead", "tr", "u", "ul",
+        "a",
+        "abbr",
+        "b",
+        "blockquote",
+        "br",
+        "caption",
+        "center",
+        "code",
+        "dd",
+        "del",
+        "div",
+        "dl",
+        "dt",
+        "em",
+        "font",
+        "h1",
+        "h2",
+        "h3",
+        "h4",
+        "h5",
+        "h6",
+        "hr",
+        "i",
+        "img",
+        "ins",
+        "kbd",
+        "li",
+        "ol",
+        "p",
+        "pre",
+        "q",
+        "s",
+        "small",
+        "span",
+        "strike",
+        "strong",
+        "sub",
+        "sup",
+        "table",
+        "tbody",
+        "td",
+        "tfoot",
+        "th",
+        "thead",
+        "tr",
+        "u",
+        "ul",
     ]
     .into_iter()
     .collect();
     builder.tags(tags);
-    builder.rm_tags(["script", "style", "iframe", "object", "embed", "form", "input", "button", "link", "meta", "svg", "math", "video", "audio", "base"]);
-    builder.clean_content_tags(["script", "style", "iframe", "object", "embed", "svg", "math", "video", "audio", "noscript", "template"].into_iter().collect());
-    builder.generic_attributes(["title", "dir", "lang"].into_iter().collect());
+    builder.rm_tags([
+        "script", "style", "iframe", "object", "embed", "form", "input", "button", "link", "meta",
+        "svg", "math", "video", "audio", "base",
+    ]);
+    builder.clean_content_tags(
+        [
+            "script", "style", "iframe", "object", "embed", "svg", "math", "video", "audio",
+            "noscript", "template",
+        ]
+        .into_iter()
+        .collect(),
+    );
+    builder.generic_attributes(
+        ["title", "dir", "lang", "style", "align"]
+            .into_iter()
+            .collect(),
+    );
     builder.add_tag_attributes("a", ["href"]);
     builder.add_tag_attributes("img", ["src", "alt", "width", "height"]);
     builder.add_tag_attributes("td", ["colspan", "rowspan"]);
     builder.add_tag_attributes("th", ["colspan", "rowspan"]);
     builder.add_tag_attributes("ol", ["start"]);
-    // Only the text colour survives of an author's styling; everything else is layout.
-    for tag in ["span", "font", "b", "i", "strong", "em", "u", "p", "div", "li"] {
-        builder.add_tag_attributes(tag, ["style"]);
-    }
-    builder.add_tag_attributes("font", ["color"]);
+    // Inherited presentation belongs on blocks as well as inline wrappers.
+    builder.add_tag_attributes("font", ["color", "face", "size"]);
     builder.link_rel(Some("noopener noreferrer"));
     builder.url_schemes(["http", "https", "mailto", "cid"].into_iter().collect());
     builder.strip_comments(true);
     let blocked = policy == RemoteContent::Blocked;
     builder.attribute_filter(move |element, attribute, value| {
         if attribute == "style" {
-            return color_only_style(value).map(Into::into);
+            return presentation::safe_style(value).map(Into::into);
         }
-        if blocked && element == "img" && attribute == "src" && !value.starts_with("cid:") {
+        if attribute == "align" {
+            let value = value.trim().to_ascii_lowercase();
+            return matches!(value.as_str(), "left" | "right" | "center" | "justify")
+                .then(|| value.into());
+        }
+        if matches!(element, "td" | "th") && matches!(attribute, "colspan" | "rowspan") {
+            // Spans are presentation hints, not permission to allocate unbounded cells.
+            let span = value.trim().parse::<u32>().ok().filter(|n| *n > 0)?;
+            return Some(span.min(64).to_string().into());
+        }
+        if element == "font" {
+            let safe = match attribute {
+                "color" => presentation::color(value),
+                "face" => presentation::font_family(value),
+                "size" => matches!(
+                    value.trim(),
+                    "1" | "2"
+                        | "3"
+                        | "4"
+                        | "5"
+                        | "6"
+                        | "7"
+                        | "+1"
+                        | "+2"
+                        | "+3"
+                        | "-1"
+                        | "-2"
+                        | "-3"
+                ),
+                _ => true,
+            };
+            if !safe {
+                return None;
+            }
+        }
+        if blocked
+            && element == "img"
+            && attribute == "src"
+            && !value.to_ascii_lowercase().starts_with("cid:")
+        {
             return None;
         }
         Some(value.into())
@@ -71,11 +167,16 @@ fn builder(policy: RemoteContent) -> ammonia::Builder<'static> {
 }
 
 /// Cleans HTML without the structural pre-pass: scripts, handlers, and disallowed tags are
-/// removed, but the quoted history, hidden blocks, and layout stay as they are. Used when an
+/// removed along with hidden content, but quoted history and layout stay intact. Used when an
 /// original message is quoted in a reply or forward, where the recipient should get the whole
 /// thing.
 pub fn clean_only(html: &str, policy: RemoteContent) -> String {
-    builder(policy).clean(html).to_string()
+    let dom = presentation::visible_document(html);
+    let clean = builder(policy)
+        .clean(&presentation::serialize_body(&dom))
+        .to_string();
+    // Canonical serialization keeps equivalent entity spellings stable across passes.
+    presentation::serialize_body(&presentation::document(&clean))
 }
 
 pub fn sanitize_html(html: &str, policy: RemoteContent) -> Sanitized {
@@ -88,8 +189,12 @@ pub fn sanitize_html(html: &str, policy: RemoteContent) -> Sanitized {
     let html = prepared.html.as_str();
 
     let builder = builder(policy);
-    let mut clean = flatten_tables(&builder.clean(html).to_string());
-    let mut quoted = prepared.quoted.as_deref().map(|q| flatten_tables(&builder.clean(q).to_string()));
+    let root_preserved = presentation::serialize_body(&presentation::document(html));
+    let mut clean = flatten_tables(&builder.clean(&root_preserved).to_string());
+    let mut quoted = prepared.quoted.as_deref().map(|q| {
+        let q = presentation::serialize_body(&presentation::document(q));
+        flatten_tables(&builder.clean(&q).to_string())
+    });
     let mut text = html_to_text(&clean);
     if let Some(q) = &quoted {
         let quoted_text = html_to_text(q);
@@ -105,234 +210,195 @@ pub fn sanitize_html(html: &str, policy: RemoteContent) -> Sanitized {
             quoted = None;
         }
     }
-    Sanitized { html: clean, quoted, blocked_remote, text }
+    Sanitized {
+        html: clean,
+        quoted,
+        blocked_remote,
+        text,
+    }
 }
 
 /// Rewrites tables into block flow: each row becomes a block, cells are separated by a
-/// wide gap. Email relies on nested layout tables that the native HTML view cannot lay
+/// wide gap and cells retain their sender attributes on block wrappers. Email relies on
+/// nested layout tables that the native HTML view cannot lay
 /// out yet; without this step adjacent cells run together. Column alignment of real
 /// data tables is lost, which is a known foundation gap.
 pub fn flatten_tables(html: &str) -> String {
-    const CELL_GAP: &str = "\u{a0}\u{a0}\u{a0}\u{a0}";
-    let mut out = String::with_capacity(html.len());
-    let mut rest = html;
-    let mut cell_open = false;
-    let mut first_cell_in_row = true;
-    while let Some(start) = rest.find('<') {
-        out.push_str(&rest[..start]);
-        let tag_rest = &rest[start..];
-        let Some(end) = tag_rest.find('>') else {
-            out.push_str(tag_rest);
-            return out;
-        };
-        let tag = &tag_rest[..=end];
-        let lower = tag.to_ascii_lowercase();
-        let name: String = lower
-            .trim_start_matches('<')
-            .trim_start_matches('/')
-            .chars()
-            .take_while(|c| c.is_ascii_alphanumeric())
-            .collect();
-        let closing = lower.starts_with("</");
-        if name == "table" && !closing {
-            // A real data table (headers, or a consistent small grid of short cells) is kept
-            // for the view's table layout; layout tables fall through and are flattened.
-            if let Some(block_len) = table_block_len(tag_rest) {
-                let block = &tag_rest[..block_len];
-                if is_data_table(block) {
-                    out.push_str(block);
-                    rest = &tag_rest[block_len..];
+    fn render(n: &Handle, out: &mut String, flatten: bool) {
+        match &n.data {
+            NodeData::Text { contents } => out.push_str(&escape_html(&contents.borrow())),
+            NodeData::Element { name, attrs, .. } => {
+                let local = &*name.local;
+                let flatten = if local == "table" {
+                    !is_data_table(n)
+                } else {
+                    flatten
+                };
+                let replacement = if flatten {
+                    match local {
+                        "table" | "tbody" | "thead" | "tfoot" | "tr" | "td" | "th" => "div",
+                        "caption" => "p",
+                        _ => local,
+                    }
+                } else {
+                    local
+                };
+                out.push('<');
+                out.push_str(replacement);
+                for a in attrs.borrow().iter() {
+                    // Table-only attributes have no meaning on a flattened div/p.
+                    // Carry only presentation that is valid on the replacement node.
+                    if replacement != local
+                        && !matches!(&*a.name.local, "title" | "dir" | "lang" | "style" | "align")
+                    {
+                        continue;
+                    }
+                    out.push(' ');
+                    out.push_str(&a.name.local);
+                    out.push_str("=\"");
+                    out.push_str(&escape_html(&a.value));
+                    out.push('"');
+                }
+                out.push('>');
+                let mut cells = 0;
+                for c in n.children.borrow().iter() {
+                    if flatten
+                        && local == "tr"
+                        && matches!(&c.data, NodeData::Element { name, .. } if matches!(&*name.local, "td" | "th"))
+                    {
+                        if cells > 0 {
+                            out.push_str("\u{a0}\u{a0}\u{a0}\u{a0}");
+                        }
+                        cells += 1;
+                    }
+                    render(c, out, flatten);
+                }
+                if !matches!(local, "br" | "hr" | "img") {
+                    out.push_str("</");
+                    out.push_str(replacement);
+                    out.push('>');
+                }
+            }
+            NodeData::Document => {
+                for c in n.children.borrow().iter() {
+                    render(c, out, flatten);
+                }
+            }
+            _ => {}
+        }
+    }
+    let dom = presentation::document(html);
+    let mut out = String::new();
+    presentation::walk(&dom.document, &mut |n| {
+        if matches!(&n.data, NodeData::Element { name, .. } if &*name.local == "body") {
+            for c in n.children.borrow().iter() {
+                render(c, &mut out, false);
+            }
+        }
+    });
+    // Transformations can change HTML's adoption-agency/foster-parenting behavior
+    // (notably anchors around table layouts). Normalize the resulting tree now.
+    presentation::serialize_body(&presentation::document(&out))
+}
+
+/// Classify actual cells, not tag-like strings or the tail of an entire row.
+fn is_data_table(table: &Handle) -> bool {
+    let mut rows = Vec::new();
+    let mut nested_or_image = false;
+    presentation::walk(table, &mut |n| {
+        if let NodeData::Element { name, .. } = &n.data {
+            if &*name.local == "img" || (&*name.local == "table" && !std::rc::Rc::ptr_eq(n, table))
+            {
+                nested_or_image = true;
+            }
+            if &*name.local == "tr" {
+                rows.push(n.clone());
+            }
+        }
+    });
+    if nested_or_image || rows.len() < 2 {
+        return false;
+    }
+    let mut counts = Vec::new();
+    let (mut cells, mut total, mut longest, mut header) = (0, 0, 0, false);
+    for row in rows {
+        let mut count = 0usize;
+        for cell in row.children.borrow().iter() {
+            if let NodeData::Element { name, attrs, .. } = &cell.data {
+                if !matches!(&*name.local, "td" | "th") {
                     continue;
                 }
+                header |= &*name.local == "th";
+                let span = attrs
+                    .borrow()
+                    .iter()
+                    .find(|a| &*a.name.local == "colspan")
+                    .and_then(|a| a.value.parse::<usize>().ok())
+                    .unwrap_or(1)
+                    .clamp(1, 1000);
+                count = count.saturating_add(span);
+                let mut text = String::new();
+                presentation::walk(cell, &mut |n| {
+                    if let NodeData::Text { contents } = &n.data {
+                        text.push_str(&contents.borrow());
+                    }
+                });
+                let len = text.trim().chars().count();
+                longest = longest.max(len);
+                total += len;
+                cells += 1;
             }
         }
-        match name.as_str() {
-            "table" | "tbody" | "thead" | "tfoot" | "caption" => {
-                if name == "caption" {
-                    out.push_str(if closing { "</p>" } else { "<p>" });
-                }
-            }
-            "tr" => {
-                if closing {
-                    if cell_open {
-                        cell_open = false;
-                    }
-                    out.push_str("</div>");
-                } else {
-                    out.push_str("<div>");
-                    first_cell_in_row = true;
-                }
-            }
-            "td" | "th" => {
-                if closing {
-                    cell_open = false;
-                    if name == "th" {
-                        out.push_str("</strong>");
-                    }
-                } else {
-                    if !first_cell_in_row {
-                        out.push_str(CELL_GAP);
-                    }
-                    first_cell_in_row = false;
-                    cell_open = true;
-                    if name == "th" {
-                        out.push_str("<strong>");
-                    }
-                }
-            }
-            _ => out.push_str(tag),
-        }
-        rest = &tag_rest[end + 1..];
+        counts.push(count);
     }
-    out.push_str(rest);
-    out
+    let first = counts[0];
+    let consistent = (2..=8).contains(&first) && counts.iter().all(|&n| n == first);
+    consistent && (header || (cells > 0 && longest <= 160 && total / cells <= 60))
 }
 
-/// Length of the `<table …>…</table>` element starting at `s`, nesting-aware.
-fn table_block_len(s: &str) -> Option<usize> {
-    let lower = s.to_ascii_lowercase();
-    let mut depth = 0usize;
-    let mut i = 0;
-    while let Some(off) = lower[i..].find("<table").or_else(|| lower[i..].find("</table")).map(|o| o) {
-        // Take whichever comes first.
-        let open = lower[i..].find("<table").map(|o| i + o);
-        let close = lower[i..].find("</table").map(|o| i + o);
-        let _ = off;
-        let (pos, is_open) = match (open, close) {
-            (Some(o), Some(c)) if o < c => (o, true),
-            (_, Some(c)) => (c, false),
-            (Some(o), None) => (o, true),
-            (None, None) => return None,
-        };
-        let end = lower[pos..].find('>').map(|e| pos + e + 1)?;
-        if is_open {
-            depth += 1;
-        } else {
-            depth = depth.checked_sub(1)?;
-            if depth == 0 {
-                return Some(end);
-            }
-        }
-        i = end;
-    }
-    None
-}
-
-/// Whether a table carries data rather than layout: it has header cells, or it is a small
-/// consistent grid of short texts with no nested tables or images.
-fn is_data_table(block: &str) -> bool {
-    let lower = block.to_ascii_lowercase();
-    if lower.matches("<table").count() > 1 || lower.contains("<img") {
-        return false;
-    }
-    let rows: Vec<&str> = lower.split("<tr").skip(1).collect();
-    if rows.len() < 2 {
-        return false;
-    }
-    let mut cell_counts = Vec::new();
-    let mut longest = 0usize;
-    let mut total = 0usize;
-    let mut cells = 0usize;
-    for row in &rows {
-        // Spanning cells count for the columns they cover.
-        let mut n = 0usize;
-        for cell in row.split("<td").chain(row.split("<th")).skip(1) {
-            let tag = cell.split('>').next().unwrap_or("");
-            let span = tag.split("colspan=").nth(1).map(|v| v.trim_start_matches(['"', '\'']).chars().take_while(|c| c.is_ascii_digit()).collect::<String>()).and_then(|d| d.parse::<usize>().ok()).unwrap_or(1);
-            n += span.max(1);
-        }
-        cell_counts.push(n);
-        for cell in row.split("<td").chain(row.split("<th")).skip(1) {
-            let text = html_to_text(cell.split_once('>').map(|(_, t)| t).unwrap_or(""));
-            let len = text.trim().chars().count();
-            longest = longest.max(len);
-            total += len;
-            cells += 1;
-        }
-    }
-    let has_header = lower.contains("<th");
-    let first = cell_counts[0];
-    let consistent = first >= 2 && first <= 8 && cell_counts.iter().all(|&n| n == first || n == 0);
-    let short = cells > 0 && longest <= 160 && total / cells <= 60;
-    (has_header && consistent) || (consistent && short)
-}
-
-/// `color: …` from a style attribute, or nothing: the only declaration the reader keeps.
-fn color_only_style(style: &str) -> Option<String> {
-    for decl in style.split(';') {
-        let Some((key, value)) = decl.split_once(':') else { continue };
-        if key.trim().eq_ignore_ascii_case("color") {
-            let value = value.trim().trim_end_matches("!important").trim();
-            if !value.is_empty() && value.len() <= 40 && value.chars().all(|c| c.is_ascii_alphanumeric() || matches!(c, '#' | '(' | ')' | ',' | ' ' | '.' | '%')) {
-                return Some(format!("color:{value}"));
-            }
-        }
-    }
-    None
-}
-
-/// Rewrites explicit text colours so they stay readable on the current theme: dark colours
-/// are lightened for the dark theme, near-white ones darkened for the light theme. Hue is
-/// kept, so red stays red.
+/// Adapt only actual color attributes/declarations; sender text and URLs are untouched.
 pub fn adapt_colors(html: &str, dark: bool) -> String {
-    let mut out = String::with_capacity(html.len());
-    let mut rest = html;
-    while let Some(i) = rest.find("color").map(|i| i) {
-        // Match `color:` inside style, or `color="` on <font>.
-        let after = &rest[i + 5..];
-        let (sep_len, quote_end) = if after.starts_with(':') {
-            (1, [';', '"', '\''])
-        } else if after.starts_with("=\"") {
-            (2, ['"', '"', '"'])
-        } else {
-            out.push_str(&rest[..i + 5]);
-            rest = after;
-            continue;
-        };
-        let value_start = i + 5 + sep_len;
-        let value_end = rest[value_start..].find(|c: char| quote_end.contains(&c)).map(|e| value_start + e).unwrap_or(rest.len());
-        let value = rest[value_start..value_end].trim();
-        let replaced = parse_hex_color(value).map(|(r, g, b)| adapt_rgb(r, g, b, dark)).map(|(r, g, b)| format!("#{r:02x}{g:02x}{b:02x}"));
-        out.push_str(&rest[..value_start]);
-        match replaced {
-            Some(c) => out.push_str(&c),
-            None => out.push_str(&rest[value_start..value_end]),
-        }
-        rest = &rest[value_end..];
-    }
-    out.push_str(rest);
-    out
-}
-
-fn parse_hex_color(value: &str) -> Option<(u8, u8, u8)> {
-    let v = value.trim().to_ascii_lowercase();
-    let named = match v.as_str() {
-        "red" => Some((0xff, 0, 0)),
-        "darkred" | "maroon" => Some((0x8b, 0, 0)),
-        "green" => Some((0, 0x80, 0)),
-        "blue" => Some((0, 0, 0xff)),
-        "navy" => Some((0, 0, 0x80)),
-        "orange" => Some((0xff, 0xa5, 0)),
-        "purple" => Some((0x80, 0, 0x80)),
-        "gray" | "grey" => Some((0x80, 0x80, 0x80)),
-        "black" | "windowtext" => Some((0, 0, 0)),
-        "white" => Some((0xff, 0xff, 0xff)),
-        _ => None,
+    let dom = presentation::document(html);
+    let adapt = |value: &str| {
+        presentation::parse_color(value).map(|(r, g, b, alpha)| {
+            let (r, g, b) = adapt_rgb(r, g, b, dark);
+            match alpha {
+                Some(a) => format!("rgba({r},{g},{b},{a})"),
+                None => format!("#{r:02x}{g:02x}{b:02x}"),
+            }
+        })
     };
-    if named.is_some() {
-        return named;
-    }
-    if let Some(inner) = v.strip_prefix("rgb(").or_else(|| v.strip_prefix("rgba(")) {
-        let p: Vec<u8> = inner.trim_end_matches(')').split(',').take(3).filter_map(|x| x.trim().parse::<f32>().ok()).map(|f| f.clamp(0., 255.) as u8).collect();
-        return (p.len() == 3).then(|| (p[0], p[1], p[2]));
-    }
-    let hex = v.strip_prefix('#')?;
-    let hex: String = if hex.len() == 3 { hex.chars().flat_map(|c| [c, c]).collect() } else { hex.to_owned() };
-    if hex.len() != 6 {
-        return None;
-    }
-    let n = u32::from_str_radix(&hex, 16).ok()?;
-    Some(((n >> 16) as u8, (n >> 8) as u8, n as u8))
+    presentation::walk(&dom.document, &mut |n| {
+        if let NodeData::Element { attrs, .. } = &n.data {
+            for a in attrs.borrow_mut().iter_mut() {
+                if &*a.name.local == "color" {
+                    if let Some(v) = adapt(&a.value) {
+                        a.value = v.into();
+                    }
+                } else if &*a.name.local == "style" {
+                    let style = a
+                        .value
+                        .split(';')
+                        .map(|decl| {
+                            if let Some((key, value)) = decl.split_once(':') {
+                                if key.trim().eq_ignore_ascii_case("color") {
+                                    let (value, important) = presentation::declaration_value(value);
+                                    if let Some(v) = adapt(value) {
+                                        let priority = if important { " !important" } else { "" };
+                                        return format!("{key}:{v}{priority}");
+                                    }
+                                }
+                            }
+                            decl.to_owned()
+                        })
+                        .collect::<Vec<_>>()
+                        .join(";");
+                    a.value = style.into();
+                }
+            }
+        }
+    });
+    presentation::serialize_body(&dom)
 }
 
 /// Adjusts lightness only, in HSL, so the hue the author chose is kept.
@@ -342,7 +408,11 @@ fn adapt_rgb(r: u8, g: u8, b: u8, dark: bool) -> (u8, u8, u8) {
     let min = rf.min(gf).min(bf);
     let l = (max + min) / 2.;
     let d = max - min;
-    let s = if d == 0. { 0. } else { d / (1. - (2. * l - 1.).abs()) };
+    let s = if d == 0. {
+        0.
+    } else {
+        d / (1. - (2. * l - 1.).abs())
+    };
     let h = if d == 0. {
         0.
     } else if max == rf {
@@ -354,9 +424,17 @@ fn adapt_rgb(r: u8, g: u8, b: u8, dark: bool) -> (u8, u8, u8) {
     };
     let h = if h < 0. { h + 360. } else { h };
     let new_l: f32 = if dark && l < 0.45 {
-        if s < 0.15 { 0.82 } else { 0.68 }
+        if s < 0.15 {
+            0.82
+        } else {
+            0.68
+        }
     } else if !dark && l > 0.8 {
-        if s < 0.15 { 0.25 } else { 0.38 }
+        if s < 0.15 {
+            0.25
+        } else {
+            0.38
+        }
     } else {
         return (r, g, b);
     };
@@ -372,211 +450,166 @@ fn adapt_rgb(r: u8, g: u8, b: u8, dark: bool) -> (u8, u8, u8) {
         240..=299 => (x, 0., c),
         _ => (c, 0., x),
     };
-    (((r1 + m) * 255.).round() as u8, ((g1 + m) * 255.).round() as u8, ((b1 + m) * 255.).round() as u8)
+    (
+        ((r1 + m) * 255.).round() as u8,
+        ((g1 + m) * 255.).round() as u8,
+        ((b1 + m) * 255.).round() as u8,
+    )
 }
 
 fn count_remote(html: &str) -> usize {
-    let lower = html.to_ascii_lowercase();
+    let dom = presentation::document(html);
     let mut count = 0;
-    for needle in ["src=\"http", "src='http", "src=http"] {
-        count += lower.matches(needle).count();
-    }
+    presentation::walk(&dom.document, &mut |n| {
+        if let NodeData::Element { name, attrs, .. } = &n.data {
+            if &*name.local == "img"
+                && attrs.borrow().iter().any(|a| {
+                    &*a.name.local == "src" && {
+                        let src = a.value.trim().to_ascii_lowercase();
+                        src.starts_with("http://")
+                            || src.starts_with("https://")
+                            || src.starts_with("//")
+                    }
+                })
+            {
+                count += 1;
+            }
+        }
+    });
     count
 }
 
-/// Very small HTML-to-text conversion for previews, quoting, and the search index. Not a
-/// layout engine: it preserves paragraph breaks and list markers and drops tags.
+/// Parsed HTML-to-text conversion. Active and invisible subtrees are never indexed.
 pub fn html_to_text(html: &str) -> String {
-    let mut out = String::with_capacity(html.len());
-    let mut in_tag = false;
-    let mut tag = String::new();
-    let mut chars = html.chars().peekable();
-    while let Some(c) = chars.next() {
-        if in_tag {
-            if c == '>' {
-                in_tag = false;
-                let name: String = tag
-                    .trim_start_matches('/')
-                    .chars()
-                    .take_while(|c| c.is_ascii_alphanumeric())
-                    .collect::<String>()
-                    .to_ascii_lowercase();
-                let closing = tag.starts_with('/');
-                match name.as_str() {
-                    "br" => out.push('\n'),
-                    "p" | "div" | "tr" | "h1" | "h2" | "h3" | "h4" | "h5" | "h6" | "blockquote"
-                    | "pre" | "table" | "ul" | "ol" => {
-                        if !out.ends_with("\n\n") && !out.is_empty() {
-                            if out.ends_with('\n') {
-                                out.push('\n');
-                            } else {
-                                out.push_str("\n\n");
-                            }
-                        }
-                    }
-                    "li" if !closing => {
-                        if !out.ends_with('\n') && !out.is_empty() {
-                            out.push('\n');
-                        }
-                        out.push_str("• ");
-                    }
-                    "td" | "th" if closing => out.push('\t'),
-                    _ => {}
-                }
-                tag.clear();
+    fn boundary(out: &mut String) {
+        if !out.is_empty() && !out.ends_with("\n\n") {
+            if out.ends_with('\n') {
+                out.push('\n');
             } else {
-                tag.push(c);
+                out.push_str("\n\n");
             }
-            continue;
         }
-        match c {
-            '<' => in_tag = true,
-            '&' => {
-                let mut entity = String::new();
-                while let Some(&n) = chars.peek() {
-                    if n == ';' || entity.len() > 8 {
-                        break;
+    }
+    fn render(n: &Handle, out: &mut String, pre: bool) {
+        match &n.data {
+            NodeData::Text { contents } => {
+                for c in contents.borrow().chars() {
+                    if pre {
+                        out.push(c);
+                    } else if c.is_whitespace() {
+                        if !out.is_empty() && !out.ends_with([' ', '\n']) {
+                            out.push(' ');
+                        }
+                    } else {
+                        out.push(c);
                     }
-                    entity.push(n);
-                    chars.next();
-                }
-                if chars.peek() == Some(&';') {
-                    chars.next();
-                }
-                out.push_str(&decode_entity(&entity));
-            }
-            _ => out.push(c),
-        }
-    }
-    collapse_whitespace(&out)
-}
-
-fn decode_entity(entity: &str) -> String {
-    match entity {
-        "amp" => "&".into(),
-        "lt" => "<".into(),
-        "gt" => ">".into(),
-        "quot" => "\"".into(),
-        "apos" | "#39" => "'".into(),
-        "nbsp" => " ".into(),
-        "mdash" => "—".into(),
-        "ndash" => "–".into(),
-        "hellip" => "…".into(),
-        "rsquo" => "’".into(),
-        "lsquo" => "‘".into(),
-        "ldquo" => "“".into(),
-        "rdquo" => "”".into(),
-        "copy" => "©".into(),
-        other => {
-            if let Some(num) = other.strip_prefix('#') {
-                let code = if let Some(hex) = num.strip_prefix(['x', 'X']) {
-                    u32::from_str_radix(hex, 16).ok()
-                } else {
-                    num.parse().ok()
-                };
-                if let Some(ch) = code.and_then(char::from_u32) {
-                    return ch.to_string();
                 }
             }
-            format!("&{other};")
-        }
-    }
-}
-
-fn collapse_whitespace(s: &str) -> String {
-    let mut out = String::with_capacity(s.len());
-    let mut newlines = 0;
-    let mut space = false;
-    for c in s.chars() {
-        match c {
-            '\n' => {
-                newlines += 1;
-                space = false;
-                if newlines <= 2 {
+            NodeData::Element { name, attrs, .. } => {
+                let local = &*name.local;
+                if local == "br" {
                     out.push('\n');
+                    return;
+                }
+                let block = matches!(
+                    local,
+                    "p" | "div"
+                        | "tr"
+                        | "h1"
+                        | "h2"
+                        | "h3"
+                        | "h4"
+                        | "h5"
+                        | "h6"
+                        | "blockquote"
+                        | "pre"
+                        | "table"
+                        | "ul"
+                        | "ol"
+                );
+                if block {
+                    boundary(out);
+                }
+                if local == "li" {
+                    if !out.is_empty() && !out.ends_with('\n') {
+                        out.push('\n');
+                    }
+                    out.push_str("• ");
+                }
+                let pre = pre
+                    || local == "pre"
+                    || attrs.borrow().iter().any(|a| {
+                        &*a.name.local == "style"
+                            && presentation::safe_style(&a.value).is_some_and(|s| {
+                                s.split(';').any(|d| {
+                                    matches!(d, "white-space:pre" | "white-space:pre-wrap")
+                                })
+                            })
+                    });
+                for c in n.children.borrow().iter() {
+                    render(c, out, pre);
+                }
+                if block {
+                    boundary(out);
+                }
+                if matches!(local, "td" | "th") {
+                    out.push('\t');
                 }
             }
-            c if c.is_whitespace() => {
-                if !space && newlines == 0 {
-                    out.push(' ');
+            NodeData::Document => {
+                for c in n.children.borrow().iter() {
+                    render(c, out, pre);
                 }
-                space = true;
             }
-            c => {
-                newlines = 0;
-                space = false;
-                out.push(c);
-            }
+            _ => {}
         }
     }
+    let dom = presentation::visible_document(html);
+    let mut out = String::new();
+    render(&dom.document, &mut out, false);
     out.trim().to_owned()
 }
 
 /// Converts plain text to safe HTML for display in the HTML view.
 ///
-/// Blank lines separate paragraphs; single newlines become `<br>`. Lines quoted with `>`
+/// Line breaks, blank runs, and indentation are preserved with wrapping. Lines quoted with `>`
 /// are grouped into (nested) blockquotes with the markers removed, the way a mail client
 /// shows a plain-text reply. Bare URLs become links.
 pub fn text_to_html(text: &str) -> String {
-    let mut out = String::new();
+    if text.is_empty() {
+        return String::new();
+    }
+    // Plain text owns its line spacing and indentation. Do not reinterpret blank
+    // runs as generic HTML paragraphs (which acquire renderer-specific margins).
+    let mut out = String::from("<div style=\"white-space:pre-wrap\">");
     let mut depth = 0usize;
-    let mut open_paragraph = false;
-    let mut first_in_block = true;
-    let mut pending_blank = false;
-
-    for raw in text.lines() {
-        let (line_depth, body) = strip_quote_markers(raw);
-        if body.trim().is_empty() {
-            pending_blank = true;
-            continue;
+    for (index, raw) in text.split('\n').enumerate() {
+        let (line_depth, body) = strip_quote_markers(raw.strip_suffix('\r').unwrap_or(raw));
+        if line_depth == depth && index > 0 {
+            out.push_str("<br>");
         }
-        if line_depth != depth {
-            if open_paragraph {
-                out.push_str("</p>");
-                open_paragraph = false;
-            }
-            while depth > line_depth {
-                out.push_str("</blockquote>");
-                depth -= 1;
-            }
-            while depth < line_depth {
-                out.push_str("<blockquote>");
-                depth += 1;
-            }
-            first_in_block = true;
-            pending_blank = false;
+        while depth > line_depth {
+            out.push_str("</blockquote>");
+            depth -= 1;
         }
-        if depth == 0 {
-            if pending_blank && open_paragraph {
-                out.push_str("</p>");
-                open_paragraph = false;
-            }
-            let marker = body.trim_start();
-            if !open_paragraph && (marker.starts_with("---------- Forwarded message") || marker.starts_with("-----Original Message-----")) {
-                out.push_str("<hr>");
-            }
-            if !open_paragraph {
-                out.push_str("<p>");
-                open_paragraph = true;
-                first_in_block = true;
-            }
-            if !first_in_block {
-                out.push_str("<br>");
-            }
-        } else if !first_in_block {
-            out.push_str(if pending_blank { "<br><br>" } else { "<br>" });
+        while depth < line_depth {
+            out.push_str("<blockquote>");
+            depth += 1;
+        }
+        let marker = body.trim_start();
+        if line_depth == 0
+            && (marker.starts_with("---------- Forwarded message")
+                || marker.starts_with("-----Original Message-----"))
+        {
+            out.push_str("<hr>");
         }
         out.push_str(&linkify_escaped(body));
-        first_in_block = false;
-        pending_blank = false;
-    }
-    if open_paragraph {
-        out.push_str("</p>");
     }
     while depth > 0 {
         out.push_str("</blockquote>");
         depth -= 1;
     }
+    out.push_str("</div>");
     out
 }
 
@@ -588,7 +621,7 @@ fn strip_quote_markers(line: &str) -> (usize, &str) {
         depth += 1;
         rest = after.strip_prefix(' ').unwrap_or(after);
     }
-    (depth, rest)
+    (depth, if depth == 0 { line } else { rest })
 }
 
 /// Escapes text for HTML, turning bare URLs into links.
@@ -598,8 +631,16 @@ fn linkify_escaped(text: &str) -> String {
     while let Some((start, len)) = crate::prepass::find_url(rest) {
         out.push_str(&escape_html(&rest[..start]));
         let url = &rest[start..start + len];
-        let href = if url.starts_with("www.") { format!("https://{url}") } else { url.to_owned() };
-        out.push_str(&format!("<a href=\"{}\">{}</a>", escape_html(&href), escape_html(url)));
+        let href = if url.starts_with("www.") {
+            format!("https://{url}")
+        } else {
+            url.to_owned()
+        };
+        out.push_str(&format!(
+            "<a href=\"{}\">{}</a>",
+            escape_html(&href),
+            escape_html(url)
+        ));
         rest = &rest[start + len..];
     }
     out.push_str(&escape_html(rest));
@@ -623,6 +664,334 @@ pub fn escape_html(s: &str) -> String {
 #[cfg(test)]
 mod tests {
     use super::*;
+
+    #[test]
+    fn sender_presentation_is_bounded_and_inherited() {
+        let input = r##"<blockquote style="color:#123456;font-size:1.2rem;font-family:'Example Sans', serif;font-weight:700;font-style:oblique;text-decoration:underline;text-align:justify;line-height:150%;margin:0 2em 12pt 4px;margin-top:1rem;margin-bottom:0;white-space:pre-wrap;position:fixed;background:url(https://bad.invalid/x);--x:red"><p>Child</p></blockquote><font face="Example Sans,serif" size="+2" color="navy">Legacy</font>"##;
+        let s = sanitize_html(input, RemoteContent::Blocked);
+        for expected in [
+            "font-size:1.2rem",
+            "font-family:'example sans', serif",
+            "font-weight:700",
+            "font-style:oblique",
+            "text-decoration:underline",
+            "text-align:justify",
+            "line-height:150%",
+            "margin:1rem 2em 0 4px",
+            "white-space:pre-wrap",
+            "<p>Child</p>",
+            "size=\"+2\"",
+        ] {
+            assert!(s.html.contains(expected), "missing {expected}: {}", s.html);
+        }
+        assert!(
+            !s.html.contains("position")
+                && !s.html.contains("bad.invalid")
+                && !s.html.contains("--x")
+        );
+        assert_eq!(sanitize_html(&s.html, RemoteContent::Blocked).html, s.html);
+    }
+
+    #[test]
+    fn rejects_active_and_unbounded_style_values() {
+        for style in [
+            "font-size:999999px",
+            "font-size:-1em",
+            "margin:-2px",
+            "margin:999rem",
+            "line-height:NaN",
+            "font-family:url(x)",
+            "color:expression(alert(1))",
+            "color:#12",
+            "font-weight:950",
+            "white-space:nowrap",
+            "font-size:var(--size)",
+            "font-family:&#x5c;65vil",
+            "color:rgb(999,0,0)",
+            "font-family:'",
+        ] {
+            let html = clean_only(
+                &format!("<p style=\"{style}\">safe</p>"),
+                RemoteContent::Blocked,
+            );
+            assert!(!html.contains("style="), "{style}: {html}");
+        }
+        let safe = clean_only(
+            r#"<font face="url(x)" size="999" color="url(x)">safe</font>"#,
+            RemoteContent::Blocked,
+        );
+        assert_eq!(safe, "<font>safe</font>");
+    }
+
+    #[test]
+    fn full_history_quote_removes_hidden_without_restructuring() {
+        let input = r#"<div style="display:none">secret</div><table><tr><td>new</td></tr></table><div class="gmail_quote"><blockquote type="cite">old</blockquote></div><p hidden>also secret</p><img width="1" height="1" src="https://t.invalid/pixel">"#;
+        let html = clean_only(input, RemoteContent::Allowed);
+        assert!(html.contains("<table>") && html.contains("new") && html.contains("old"));
+        assert!(!html.contains("secret") && !html.contains("pixel"));
+        assert_eq!(clean_only(&html, RemoteContent::Allowed), html);
+    }
+
+    #[test]
+    fn text_extraction_never_exposes_active_or_hidden_subtrees() {
+        let text = html_to_text(
+            r#"<style>secret-css</style><script>secret-js <p>x</script><p>A &lt;script&gt; literal</p><div hidden>secret-hidden</div><svg><text>secret-svg</text></svg><template>secret-template</template><p>B"#,
+        );
+        assert_eq!(text, "A <script> literal\n\nB");
+        assert!(!html_to_text("<script>unterminated").contains("unterminated"));
+        assert_eq!(
+            html_to_text("<p>a<br><span><br><br></span>b</p>"),
+            "a\n\n\nb"
+        );
+        assert_eq!(html_to_text("<pre>a  b\n  c</pre>"), "a  b\n  c");
+    }
+
+    #[test]
+    fn root_presentation_is_safe_and_idempotent() {
+        let input = r#"<html dir="rtl" lang="ar" style="color:navy;position:fixed" onclick="bad()"><body lang="en" style="font-size:12pt;background:url(https://bad.invalid)"><p>Hello</p></body></html>"#;
+        let expected = r#"<div dir="rtl" lang="ar" style="color:navy"><div lang="en" style="font-size:12pt"><p>Hello</p></div></div>"#;
+        for clean in [
+            clean_only(input, RemoteContent::Blocked),
+            sanitize_html(input, RemoteContent::Blocked).html,
+        ] {
+            assert_eq!(clean, expected);
+            assert_eq!(clean_only(&clean, RemoteContent::Blocked), expected);
+            assert_eq!(sanitize_html(&clean, RemoteContent::Blocked).html, expected);
+        }
+        assert_eq!(
+            clean_only("<html><body><p>x</p></body></html>", RemoteContent::Blocked),
+            "<p>x</p>"
+        );
+        assert_eq!(
+            adapt_colors(input, true),
+            r#"<div dir="rtl" lang="ar" style="color:#5c5cff"><div lang="en" style="font-size:12pt"><p>Hello</p></div></div>"#
+        );
+    }
+
+    #[test]
+    fn split_history_preserves_root_inheritance_exactly() {
+        let s = sanitize_html(
+            r#"<html dir="rtl" style="color:navy"><body lang="ar"><p>new</p><blockquote type="cite"><p>old</p></blockquote></body></html>"#,
+            RemoteContent::Blocked,
+        );
+        assert_eq!(
+            s.html,
+            r#"<div dir="rtl" style="color:navy"><div lang="ar"><p>new</p></div></div>"#
+        );
+        let quoted = s.quoted.unwrap();
+        assert_eq!(
+            quoted,
+            r#"<div dir="rtl" style="color:navy"><div lang="ar"><blockquote><p>old</p></blockquote></div></div>"#
+        );
+        assert_eq!(clean_only(&quoted, RemoteContent::Blocked), quoted);
+    }
+
+    #[test]
+    fn safe_side_margins_have_the_same_bounds_as_other_margins() {
+        assert_eq!(
+            clean_only(
+                r#"<p style="margin-left:8px;margin-right:8px">x</p>"#,
+                RemoteContent::Blocked
+            ),
+            r#"<p style="margin-left:8px;margin-right:8px">x</p>"#
+        );
+        assert_eq!(
+            clean_only(
+                r#"<p style="margin-left:-1px;margin-right:999px">x</p>"#,
+                RemoteContent::Blocked
+            ),
+            "<p>x</p>"
+        );
+    }
+
+    #[test]
+    fn inline_priority_is_resolved_before_stripping_important() {
+        let input = r#"<p style="color:red !important;color:blue;font-size:12pt ! important;font-size:18pt;color:green !important">x</p>"#;
+        let expected = r#"<p style="font-size:12pt;color:green">x</p>"#;
+        assert_eq!(clean_only(input, RemoteContent::Blocked), expected);
+        assert_eq!(sanitize_html(input, RemoteContent::Blocked).html, expected);
+        assert_eq!(clean_only(expected, RemoteContent::Blocked), expected);
+    }
+
+    #[test]
+    fn visibility_uses_winning_declarations_and_requires_clipping() {
+        for style in [
+            "display:none;display:block",
+            "visibility:hidden;visibility:visible",
+            "opacity:0;opacity:1",
+            "font-size:0;font-size:12pt",
+            "max-height:0",
+            "max-height:0;overflow:visible",
+            "height:0;overflow:hidden;overflow:visible",
+            "display:block !important;display:none",
+            "height:0;overflow-y:visible !important;overflow:hidden",
+        ] {
+            let input = format!("<div style=\"{style}\">Visible</div>");
+            assert_eq!(html_to_text(&input), "Visible", "{style}");
+            assert_eq!(
+                sanitize_html(&input, RemoteContent::Blocked).text,
+                "Visible",
+                "{style}"
+            );
+            assert!(
+                clean_only(&input, RemoteContent::Blocked).contains(">Visible</div>"),
+                "{style}"
+            );
+        }
+        for style in [
+            "display:none !important;display:block",
+            "display:none;display:bogus",
+            "max-height:0;overflow:hidden",
+            "height:0;overflow-y:clip",
+            "height:0;overflow:hidden !important;overflow-y:visible",
+            "opacity:0 ! important;opacity:1",
+        ] {
+            let input = format!("<div style=\"{style}\">Secret</div><p>Visible</p>");
+            assert_eq!(html_to_text(&input), "Visible", "{style}");
+            assert_eq!(
+                clean_only(&input, RemoteContent::Blocked),
+                "<p>Visible</p>",
+                "{style}"
+            );
+            assert_eq!(
+                sanitize_html(&input, RemoteContent::Blocked).html,
+                "<p>Visible</p>",
+                "{style}"
+            );
+        }
+    }
+
+    #[test]
+    fn color_policy_and_adaptation_agree_and_preserve_alpha() {
+        for (name, (r, g, b)) in cssparser::color::all_named_colors() {
+            assert!(presentation::color(name), "{name}");
+            assert_eq!(
+                presentation::parse_color(name),
+                Some((r, g, b, None)),
+                "{name}"
+            );
+        }
+        assert_eq!(presentation::parse_color("maroon"), Some((128, 0, 0, None)));
+        let input = r#"<p style="color:rgba(0,0,0,0.25)">x</p><font color="rgba(100%,100%,100%,0)">y</font><span style="color:darkslategray">z</span>"#;
+        let clean = clean_only(input, RemoteContent::Blocked);
+        assert_eq!(clean, input);
+        let dark = adapt_colors(&clean, true);
+        assert_eq!(
+            dark,
+            r#"<p style="color:rgba(209,209,209,0.25)">x</p><font color="rgba(255,255,255,0)">y</font><span style="color:#99c2c2">z</span>"#
+        );
+        assert_eq!(adapt_colors(&dark, true), dark);
+        assert_eq!(
+            adapt_colors(r#"<p style="color:rgba(255,255,255,.5)">x</p>"#, false),
+            r#"<p style="color:rgba(64,64,64,.5)">x</p>"#
+        );
+    }
+
+    #[test]
+    fn color_adaptation_does_not_rewrite_text_or_link_values() {
+        let input = r##"<p>color:#000000; color="#ffffff" <a href="https://example.invalid/?color:#000000" title="color:#000000">color:#000000</a><span style="font-size:12pt;color:#000000">x</span><font color='#000000'>y</font></p>"##;
+        let html = adapt_colors(input, true);
+        assert!(html.contains("color:#000000; color=\"#ffffff\""));
+        assert!(html.contains("href=\"https://example.invalid/?color:#000000\""));
+        assert!(html.contains("title=\"color:#000000\""));
+        assert!(html.contains("font-size:12pt;color:#d1d1d1"));
+        assert!(html.contains("<font color=\"#d1d1d1\">"));
+    }
+
+    #[test]
+    fn flattened_layout_attributes_and_anchor_structure_are_stable() {
+        let input = "<a href='https://example.test'><table align='center' width='600'><tr><td align='left' colspan='2'><p>Newsletter copy with enough text to represent a layout cell and not a numeric data grid.</p></td></tr></table></a>";
+        let first = sanitize_html(input, RemoteContent::Blocked);
+        assert!(first.html.contains("align=\"center\"") && first.html.contains("align=\"left\""));
+        assert!(!first.html.contains("colspan="));
+        assert_eq!(
+            sanitize_html(&first.html, RemoteContent::Blocked).html,
+            first.html
+        );
+        assert_eq!(
+            clean_only(&first.html, RemoteContent::Blocked),
+            clean_only(
+                &clean_only(&first.html, RemoteContent::Blocked),
+                RemoteContent::Blocked
+            )
+        );
+    }
+
+    #[test]
+    fn margin_shorthand_and_longhand_priority_is_resolved_per_side() {
+        for (input, expected) in [
+            ("margin-top:0!important;margin:40px", "margin:0 40px 40px"),
+            ("margin:5px!important;margin-top:40px", "margin:5px"),
+            (
+                "margin:5px;margin-top:10px!important;margin:20px!important",
+                "margin:20px",
+            ),
+        ] {
+            let html = clean_only(&format!("<p style='{input}'>X</p>"), RemoteContent::Blocked);
+            assert!(html.contains(expected), "{input}: {html}");
+            assert_eq!(clean_only(&html, RemoteContent::Blocked), html);
+        }
+    }
+
+    #[test]
+    fn table_spans_cannot_request_unbounded_layout() {
+        let clean = clean_only(
+            "<table><tr><td colspan='999999999' rowspan='0'>cell</td></tr></table>",
+            RemoteContent::Blocked,
+        );
+        assert!(clean.contains("colspan=\"64\""));
+        assert!(!clean.contains("rowspan="));
+        assert_eq!(clean_only(&clean, RemoteContent::Blocked), clean);
+    }
+
+    #[test]
+    fn counts_real_remote_images_not_text_or_attributes() {
+        let s = sanitize_html(
+            r#"<p>src=&quot;https://fake.invalid&quot;</p><a href="https://example.invalid/src=http">link</a><img SRC = 'HTTPS://example.invalid/a'><img src=//example.invalid/b><img src=cid:local><img width=1 height=1 src=https://example.invalid/pixel>"#,
+            RemoteContent::Blocked,
+        );
+        assert_eq!(s.blocked_remote, 2);
+    }
+
+    #[test]
+    fn tables_use_real_cells_and_nested_row_state() {
+        let one_column = "<table><tr><td>a</td></tr><tr><td>b</td></tr></table>";
+        assert!(!flatten_tables(one_column).contains("<table"));
+        let nested =
+            "<table><tr><td><table><tr><td>inner</td></tr></table></td><td>outer</td></tr></table>";
+        let flat = flatten_tables(nested);
+        assert!(
+            flat.contains("&nbsp;&nbsp;&nbsp;&nbsp;<div>outer"),
+            "{flat}"
+        );
+        assert_eq!(flatten_tables(&flat), flat);
+        let malformed = "<table><tr><td title='>'>a<td>b<tr><td>c<td>d</table>";
+        let html = sanitize_html(malformed, RemoteContent::Blocked).html;
+        assert!(html.contains("<table") && html.contains("<td"), "{html}");
+        assert_eq!(sanitize_html(&html, RemoteContent::Blocked).html, html);
+    }
+
+    #[test]
+    fn blank_blocks_and_inline_wrapped_hard_breaks_survive() {
+        let input = "<p><br><span><br></span>x<br></p><p></p><div><span><br></span></div><p>&nbsp;</p><div><br>tail<br></div>";
+        let html = sanitize_html(input, RemoteContent::Blocked).html;
+        assert_eq!(html, input);
+        assert_eq!(sanitize_html(&html, RemoteContent::Blocked).html, html);
+    }
+
+    #[test]
+    fn split_history_keeps_inherited_sender_presentation() {
+        let s = sanitize_html(
+            r#"<div style="color:red;font-size:12pt"><p>new</p><blockquote type="cite"><p>old</p></blockquote></div>"#,
+            RemoteContent::Blocked,
+        );
+        assert!(s.html.contains("color:red;font-size:12pt"));
+        assert!(s
+            .quoted
+            .as_deref()
+            .unwrap()
+            .contains("color:red;font-size:12pt"));
+    }
 
     #[test]
     fn strips_scripts_and_handlers() {
@@ -650,7 +1019,9 @@ mod tests {
 
     #[test]
     fn text_extraction_keeps_structure() {
-        let text = html_to_text("<p>Hi&nbsp;Jason,</p><ul><li>One</li><li>Two &amp; three</li></ul><p>Bye</p>");
+        let text = html_to_text(
+            "<p>Hi&nbsp;Jason,</p><ul><li>One</li><li>Two &amp; three</li></ul><p>Bye</p>",
+        );
         assert_eq!(text, "Hi Jason,\n\n• One\n• Two & three\n\nBye");
     }
 
@@ -661,21 +1032,49 @@ mod tests {
             "<table><tr><th>Area</th><th>Done</th></tr><tr><td>Design</td><td>5</td></tr></table>",
             RemoteContent::Blocked,
         );
-        assert!(s.html.starts_with("<table>") && s.html.contains("<th>Area</th>"), "{}", s.html);
+        assert!(
+            s.html.starts_with("<table>") && s.html.contains("<th>Area</th>"),
+            "{}",
+            s.html
+        );
         // Layout tables (nested, long prose) become block flow with gaps between cells.
         let nested = sanitize_html("<table><tr><td><p>Hello there, this is a long paragraph of newsletter copy that runs on well past the length of any data cell and keeps going.</p><table><tr><td><p>Another long paragraph of copy inside the nested layout table that is also far too long for a data cell.</p></td><td>b</td></tr></table></td></tr></table>", RemoteContent::Blocked);
         assert!(!nested.html.contains("<table"), "{}", nested.html);
-        assert!(nested.html.contains("<p>Hello there") && nested.html.contains("\u{a0}\u{a0}\u{a0}\u{a0}b"), "{}", nested.html);
+        assert!(
+            nested.html.contains("<p>Hello there")
+                && nested.html.contains("&nbsp;&nbsp;&nbsp;&nbsp;<div>b"),
+            "{}",
+            nested.html
+        );
     }
 
     #[test]
     fn text_colour_survives_and_adapts() {
-        let s = sanitize_html(r##"<p>Topic <span style="color:red; font-size:11pt; mso-fareast-language:EN-US">careful</span> and <font color="#1F497D" face="Calibri">navy</font></p>"##, RemoteContent::Blocked);
-        assert!(s.html.contains(r#"<span style="color:red">careful</span>"#), "{}", s.html);
-        assert!(s.html.contains(r##"<font color="#1F497D">navy</font>"##), "{}", s.html);
+        let s = sanitize_html(
+            r##"<p>Topic <span style="color:red; font-size:11pt; mso-fareast-language:EN-US">careful</span> and <font color="#1F497D" face="Calibri">navy</font></p>"##,
+            RemoteContent::Blocked,
+        );
+        assert!(
+            s.html
+                .contains(r#"<span style="color:red;font-size:11pt">careful</span>"#),
+            "{}",
+            s.html
+        );
+        assert!(
+            s.html
+                .contains(r##"<font color="#1F497D" face="Calibri">navy</font>"##),
+            "{}",
+            s.html
+        );
         let dark = adapt_colors(&s.html, true);
-        assert!(dark.contains("color:#ff0000") || dark.contains("color:red"), "{dark}");
-        assert!(!dark.contains("#1F497D") && !dark.contains("#1f497d"), "{dark}");
+        assert!(
+            dark.contains("color:#ff0000") || dark.contains("color:red"),
+            "{dark}"
+        );
+        assert!(
+            !dark.contains("#1F497D") && !dark.contains("#1f497d"),
+            "{dark}"
+        );
         let light = adapt_colors(r##"<span style="color:#ffffff">x</span>"##, false);
         assert!(!light.contains("#ffffff"), "{light}");
     }
@@ -684,7 +1083,11 @@ mod tests {
     fn data_tables_are_kept_and_layout_tables_flattened() {
         let invoice = r#"<table border="1"><thead><tr><th>Item</th><th>Qty</th></tr></thead><tbody><tr><td>Lamp</td><td>2</td></tr><tr><td>Cable</td><td>1</td></tr></tbody></table>"#;
         let s = sanitize_html(invoice, RemoteContent::Blocked);
-        assert!(s.html.contains("<table") && s.html.contains("<th>Item</th>"), "{}", s.html);
+        assert!(
+            s.html.contains("<table") && s.html.contains("<th>Item</th>"),
+            "{}",
+            s.html
+        );
         let layout = r#"<table width="600"><tr><td><p>A long paragraph of newsletter copy that goes on and on and on and on and on and on, well past the length any data cell would ever have in a real table of figures.</p><table><tr><td>inner</td></tr></table></td></tr></table>"#;
         let s = sanitize_html(layout, RemoteContent::Blocked);
         assert!(!s.html.contains("<table"), "{}", s.html);
@@ -695,8 +1098,14 @@ mod tests {
     fn breaks_are_kept_for_the_view() {
         // The HTML view (vendored gpui-base) renders <br> as a hard line break, so the
         // sanitizer leaves it alone; the text extraction keeps it as a newline.
-        let s = sanitize_html("<p>Thanks,<br>Maya<br><small>Design Director</small></p><div>a<br>b</div>", RemoteContent::Blocked);
-        assert_eq!(s.html, "<p>Thanks,<br>Maya<br><small>Design Director</small></p><div>a<br>b</div>");
+        let s = sanitize_html(
+            "<p>Thanks,<br>Maya<br><small>Design Director</small></p><div>a<br>b</div>",
+            RemoteContent::Blocked,
+        );
+        assert_eq!(
+            s.html,
+            "<p>Thanks,<br>Maya<br><small>Design Director</small></p><div>a<br>b</div>"
+        );
         assert_eq!(s.text, "Thanks,\nMaya\nDesign Director\n\na\nb");
     }
 
@@ -708,11 +1117,27 @@ mod tests {
     }
 
     #[test]
+    fn plain_text_preserves_blank_runs_indentation_and_terminal_breaks() {
+        let html = text_to_html("\n  Café\t東京\n\n\nlast\n");
+        assert_eq!(
+            html,
+            "<div style=\"white-space:pre-wrap\"><br>  Café\t東京<br><br><br>last<br></div>"
+        );
+        let clean = sanitize_html(&html, RemoteContent::Blocked);
+        assert_eq!(clean.html.matches("<br>").count(), 5);
+        assert!(clean.html.contains("  Café\t東京"));
+        assert_eq!(
+            text_to_html("one\r\ntwo"),
+            "<div style=\"white-space:pre-wrap\">one<br>two</div>"
+        );
+    }
+
+    #[test]
     fn text_round_trips_to_html() {
         let html = text_to_html("Hello <you>\nsecond line\n\n> quoted one\n> quoted two\n>\n> > nested\n\nAfter https://ex.com/a.");
         assert_eq!(
             html,
-            "<p>Hello &lt;you&gt;<br>second line</p><blockquote>quoted one<br>quoted two<blockquote>nested</blockquote></blockquote><p>After <a href=\"https://ex.com/a\">https://ex.com/a</a>.</p>"
+            "<div style=\"white-space:pre-wrap\">Hello &lt;you&gt;<br>second line<br><blockquote>quoted one<br>quoted two<br><blockquote>nested</blockquote></blockquote><br>After <a href=\"https://ex.com/a\">https://ex.com/a</a>.</div>"
         );
     }
 }

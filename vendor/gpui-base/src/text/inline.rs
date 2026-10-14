@@ -38,12 +38,14 @@ pub(super) struct InlineHighlight {
     pub(super) style: HighlightStyle,
     pub(super) font_family: Option<SharedString>,
     pub(super) font_size_scale: Option<f32>,
+    pub(super) code_chip: bool,
 }
 
 impl InlineHighlight {
     /// Layers `other` over `self`, the way [`HighlightStyle::highlight`] does.
     fn highlight(mut self, other: &InlineHighlight) -> Self {
         self.style = self.style.highlight(other.style);
+        self.code_chip |= other.code_chip;
         if other.font_family.is_some() {
             self.font_family = other.font_family.clone();
         }
@@ -60,6 +62,7 @@ impl From<HighlightStyle> for InlineHighlight {
             style,
             font_family: None,
             font_size_scale: None,
+            code_chip: false,
         }
     }
 }
@@ -1990,6 +1993,7 @@ mod tests {
             style,
             font_family: Some(SharedString::from("Mono")),
             font_size_scale: None,
+            code_chip: false,
         }
     }
 

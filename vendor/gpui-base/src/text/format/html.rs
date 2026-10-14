@@ -15,6 +15,9 @@ use crate::text::node::{
     TextMark,
 };
 
+mod style;
+pub(crate) use style::HtmlParagraphStyle;
+
 const BLOCK_ELEMENTS: [&str; 35] = [
     "html",
     "body",
@@ -59,7 +62,9 @@ pub(crate) fn parse(source: &str, cx: &mut NodeContext) -> Result<ParsedDocument
         ..Default::default()
     };
 
-    let bytes = cleanup_html(&source);
+    // Collapse HTML whitespace in the AST, not in a minifier: authored pre-wrap
+    // must survive and whitespace runs can span inline element boundaries.
+    let bytes = source.as_bytes();
     let mut cursor = std::io::Cursor::new(bytes);
     // Ref
     // https://github.com/servo/html5ever/blob/main/rcdom/examples/print-rcdom.rs
@@ -135,41 +140,63 @@ pub(super) fn mark_color_from_values(color: Option<&str>, style: Option<&str>) -
 /// Overlook patch: CSS colours as mail uses them: `#rgb`, `#rrggbb`, `rgb(r, g, b)` and the
 /// common names.
 pub(super) fn parse_css_color(value: &str) -> Option<Hsla> {
-    let v = value.trim().trim_end_matches("!important").trim().to_ascii_lowercase();
+    let v = value
+        .trim()
+        .trim_end_matches("!important")
+        .trim()
+        .to_ascii_lowercase();
     if let Some(hex) = v.strip_prefix('#') {
         let hex = hex.trim();
-        let expanded: String = if hex.len() == 3 { hex.chars().flat_map(|c| [c, c]).collect() } else { hex.to_owned() };
+        let expanded: String = if hex.len() == 3 {
+            hex.chars().flat_map(|c| [c, c]).collect()
+        } else {
+            hex.to_owned()
+        };
         if expanded.len() != 6 {
             return None;
         }
-        return u32::from_str_radix(&expanded, 16).ok().map(|n| gpui::rgb(n).into());
+        return u32::from_str_radix(&expanded, 16)
+            .ok()
+            .map(|n| gpui::rgb(n).into());
     }
     if let Some(inner) = v.strip_prefix("rgb(").or_else(|| v.strip_prefix("rgba(")) {
-        let parts: Vec<u32> = inner.trim_end_matches(')').split(',').take(3).filter_map(|p| p.trim().parse::<f32>().ok()).map(|f| f.clamp(0., 255.) as u32).collect();
-        if parts.len() == 3 {
-            return Some(gpui::rgb((parts[0] << 16) | (parts[1] << 8) | parts[2]).into());
+        let inner = inner.strip_suffix(')')?;
+        let parts: Vec<_> = inner.split(',').map(str::trim).collect();
+        let has_alpha = v.starts_with("rgba(");
+        if parts.len() != if has_alpha { 4 } else { 3 } {
+            return None;
         }
-        return None;
+        let channel = |value: &str| -> Option<u32> {
+            let (number, factor) = value
+                .strip_suffix('%')
+                .map(|n| (n, 2.55))
+                .unwrap_or((value, 1.));
+            let number = number.parse::<f32>().ok()?;
+            number
+                .is_finite()
+                .then(|| (number * factor).clamp(0., 255.).round() as u32)
+        };
+        let (r, g, b) = (channel(parts[0])?, channel(parts[1])?, channel(parts[2])?);
+        let alpha = if has_alpha {
+            parts[3].parse::<f32>().ok()?
+        } else {
+            1.
+        };
+        if !alpha.is_finite() {
+            return None;
+        }
+        return Some(
+            gpui::rgb((r << 16) | (g << 8) | b)
+                .alpha(alpha.clamp(0., 1.))
+                .into(),
+        );
     }
-    let named = match v.as_str() {
-        "red" => 0xff0000,
-        "darkred" | "maroon" => 0x8b0000,
-        "green" => 0x008000,
-        "darkgreen" => 0x006400,
-        "blue" => 0x0000ff,
-        "navy" => 0x000080,
-        "orange" => 0xffa500,
-        "darkorange" => 0xff8c00,
-        "purple" => 0x800080,
-        "gray" | "grey" => 0x808080,
-        "darkgray" | "darkgrey" => 0xa9a9a9,
-        "teal" => 0x008080,
-        "brown" => 0xa52a2a,
-        "magenta" | "fuchsia" => 0xff00ff,
-        "black" | "windowtext" => 0x000000,
-        _ => return None,
+    let (r, g, b) = if v == "windowtext" {
+        (0, 0, 0)
+    } else {
+        cssparser::color::parse_named_color(&v).ok()?
     };
-    Some(gpui::rgb(named).into())
+    Some(gpui::rgb((u32::from(r) << 16) | (u32::from(g) << 8) | u32::from(b)).into())
 }
 
 fn parse_mark_color(value: &str) -> Option<Hsla> {
@@ -271,6 +298,12 @@ fn parse_table_row(table: &mut Table, node: &Rc<Node>) {
     }
 
     if count > 0 {
+        let header = node.children.borrow().iter().any(|child| {
+            matches!(&child.data, NodeData::Element { name, .. } if name.local == local_name!("th"))
+        });
+        if let Some(headers) = &mut table.html_headers {
+            headers.push(header);
+        }
         table.children.push(row);
     }
 }
@@ -280,10 +313,17 @@ fn parse_table_cell(
     node: &Rc<Node>,
     attrs: &RefCell<Vec<html5ever::Attribute>>,
 ) {
-    let mut paragraph = Paragraph::default();
+    let mut paragraph = Paragraph {
+        html_style: Some(style::resolve(node).paragraph),
+        ..Default::default()
+    };
     for child in node.children.borrow().iter() {
+        if is_block_child(child) && !paragraph.is_empty() {
+            paragraph.push_str("\n");
+        }
         parse_paragraph(&mut paragraph, child);
     }
+    normalize_whitespace(&mut paragraph);
     let width = attr_width_height(attrs).0;
     let table_cell = node::TableCell {
         children: paragraph,
@@ -292,9 +332,14 @@ fn parse_table_cell(
     row.children.push(table_cell);
     // Overlook patch: a spanning cell is followed by empty cells so the columns after it
     // stay aligned (the content does not stretch, but nothing shifts left).
-    let span = attr_value(attrs, local_name!("colspan")).and_then(|v| v.trim().parse::<usize>().ok()).unwrap_or(1);
+    let span = attr_value(attrs, local_name!("colspan"))
+        .and_then(|v| v.trim().parse::<usize>().ok())
+        .unwrap_or(1);
     for _ in 1..span.min(16) {
-        row.children.push(node::TableCell { children: Paragraph::default(), width: None });
+        row.children.push(node::TableCell {
+            children: Paragraph::default(),
+            width: None,
+        });
     }
 }
 
@@ -319,6 +364,9 @@ fn trim_text(text: &str) -> String {
 }
 
 fn parse_paragraph(paragraph: &mut Paragraph, node: &Rc<Node>) {
+    paragraph
+        .html_style
+        .get_or_insert_with(|| style::resolve(node).paragraph);
     fn push_merged(
         paragraph: &mut Paragraph,
         text: String,
@@ -331,13 +379,20 @@ fn parse_paragraph(paragraph: &mut Paragraph, node: &Rc<Node>) {
         let mut node = InlineNode::new(text).marks(marks);
         if let Some(new_mark) = new_mark {
             let len = node.text.len();
+            let start = len - node.text.trim_start_matches(' ').len();
+            let end = node.text.trim_end_matches(' ').len().max(start);
             if let Some(last) = node.marks.last_mut()
+                && start == 0
+                && end == len
                 && last.0.start == 0
                 && last.0.end == len
             {
-                last.1.merge(new_mark);
+                let child = last.1.clone();
+                last.1 = new_mark;
+                last.1.merge(child);
             } else {
-                node.marks.push((0..node.text.len(), new_mark));
+                // Ancestor marks are the base layer; child declarations win.
+                node.marks.insert(0, (start..end, new_mark));
             }
         }
         paragraph.push(node);
@@ -351,10 +406,20 @@ fn parse_paragraph(paragraph: &mut Paragraph, node: &Rc<Node>) {
         let mut merged_text = String::new();
         let mut merged_marks = Vec::new();
 
+        let mut child_paragraph = Paragraph::default();
         for child in node.children.borrow().iter() {
-            let mut child_paragraph = Paragraph::default();
-            parse_paragraph(&mut child_paragraph, &child);
-
+            parse_paragraph(&mut child_paragraph, child);
+        }
+        if child_paragraph
+            .html_style
+            .as_ref()
+            .is_some_and(|s| s.preserve)
+        {
+            if let Some(style) = &mut paragraph.html_style {
+                style.preserve = true;
+            }
+        }
+        {
             for node in child_paragraph.children {
                 let offset = merged_text.len();
                 merged_text.push_str(&node.text);
@@ -385,7 +450,7 @@ fn parse_paragraph(paragraph: &mut Paragraph, node: &Rc<Node>) {
     match &node.data {
         NodeData::Text { contents } => {
             let part = &contents.borrow();
-            paragraph.push_str(&part);
+            style::push_text(paragraph, node, &part);
         }
         NodeData::Element { name, attrs, .. } => match name.local {
             // Overlook patch: a <br> inside inline content is a hard line break, like the
@@ -426,8 +491,18 @@ fn parse_paragraph(paragraph: &mut Paragraph, node: &Rc<Node>) {
                 let color = attr_value(&attrs, local_name!("color"))
                     .as_deref()
                     .and_then(parse_css_color)
-                    .or_else(|| attr_value(&attrs, local_name!("style")).and_then(|css| style_attrs(&css).get("color").and_then(|v| parse_css_color(v))));
-                merge_children_with_mark(node, paragraph, color.map(|c| TextMark::default().color(c)));
+                    .or_else(|| {
+                        attr_value(&attrs, local_name!("style")).and_then(|css| {
+                            style_attrs(&css)
+                                .get("color")
+                                .and_then(|v| parse_css_color(v))
+                        })
+                    });
+                merge_children_with_mark(
+                    node,
+                    paragraph,
+                    color.map(|c| TextMark::default().color(c)),
+                );
             }
             local_name!("a") => {
                 let link_mark = LinkMark {
@@ -482,10 +557,7 @@ fn parse_node(
 ) -> Option<BlockNode> {
     match node.data {
         NodeData::Text { ref contents } => {
-            let text = contents.borrow().to_string();
-            if text.len() > 0 {
-                paragraph.push_str(&text);
-            }
+            style::push_text(paragraph, node, &contents.borrow());
 
             None
         }
@@ -585,35 +657,30 @@ fn parse_node(
                 } else {
                     None
                 };
+                let mut before = vec![];
+                consume_paragraph(&mut before, paragraph);
                 let children = consume_children_nodes(node, paragraph, cx);
-                Some(BlockNode::List {
+                let list = BlockNode::List {
                     children,
                     ordered,
                     start,
                     span: None,
-                })
+                };
+                if before.is_empty() {
+                    Some(list)
+                } else {
+                    before.push(list);
+                    Some(BlockNode::Root {
+                        children: before,
+                        span: None,
+                    })
+                }
             }
             local_name!("li") => {
                 let mut children = vec![];
                 consume_paragraph(&mut children, paragraph);
 
-                for child in node.children.borrow().iter() {
-                    let mut child_paragraph = Paragraph::default();
-                    if let Some(child_node) = parse_node(child, &mut child_paragraph, cx) {
-                        children.push(child_node);
-                    }
-                    if child_paragraph.text_len() > 0 {
-                        // If last child is paragraph, merge child
-                        if let Some(last_child) = children.last_mut() {
-                            if let BlockNode::Paragraph(last_paragraph) = last_child {
-                                last_paragraph.merge(child_paragraph);
-                                continue;
-                            }
-                        }
-
-                        children.push(BlockNode::Paragraph(child_paragraph));
-                    }
-                }
+                children.extend(consume_children_nodes(node, paragraph, cx));
 
                 consume_paragraph(&mut children, paragraph);
 
@@ -628,12 +695,16 @@ fn parse_node(
                 let mut children = vec![];
                 consume_paragraph(&mut children, paragraph);
 
-                let mut table = Table::default();
+                let mut table = Table {
+                    html_headers: Some(vec![]),
+                    ..Default::default()
+                };
                 for child in node.children.borrow().iter() {
                     match child.data {
                         NodeData::Element { ref name, .. }
                             if name.local == local_name!("tbody")
-                                || name.local == local_name!("thead") =>
+                                || name.local == local_name!("thead")
+                                || name.local == local_name!("tfoot") =>
                         {
                             for sub_child in child.children.borrow().iter() {
                                 parse_table_row(&mut table, &sub_child);
@@ -658,11 +729,22 @@ fn parse_node(
                 }
             }
             local_name!("blockquote") => {
+                let mut before = vec![];
+                consume_paragraph(&mut before, paragraph);
                 let children = consume_children_nodes(node, paragraph, cx);
-                Some(BlockNode::Blockquote {
+                let quote = BlockNode::Blockquote {
                     children,
                     span: None,
-                })
+                };
+                if before.is_empty() {
+                    Some(quote)
+                } else {
+                    before.push(quote);
+                    Some(BlockNode::Root {
+                        children: before,
+                        span: None,
+                    })
+                }
             }
             local_name!("style") | local_name!("script") => None,
             // Overlook patch: <hr> is a rule, not an empty block.
@@ -674,7 +756,10 @@ fn parse_node(
                     Some(rule)
                 } else {
                     children.push(rule);
-                    Some(BlockNode::Root { children, span: None })
+                    Some(BlockNode::Root {
+                        children,
+                        span: None,
+                    })
                 }
             }
             // Overlook patch: <pre> keeps its line structure and renders as a code block.
@@ -693,7 +778,10 @@ fn parse_node(
                     Some(block)
                 } else {
                     children.push(block);
-                    Some(BlockNode::Root { children, span: None })
+                    Some(BlockNode::Root {
+                        children,
+                        span: None,
+                    })
                 }
             }
             _ => {
@@ -706,6 +794,7 @@ fn parse_node(
 
                     // Insert before text as a node -- The "Hello"
                     consume_paragraph(&mut children, paragraph);
+                    paragraph.html_style = Some(style::resolve(node).paragraph);
 
                     // Inner of the block element -- The "Inner text of block element"
                     for child in node.children.borrow().iter() {
@@ -714,6 +803,7 @@ fn parse_node(
                         }
                     }
                     consume_paragraph(&mut children, paragraph);
+                    paragraph.html_style = None;
 
                     if children.is_empty() {
                         None
@@ -749,12 +839,13 @@ fn parse_node(
 }
 
 fn consume_children_nodes(
-    node: &Node,
+    node: &Rc<Node>,
     paragraph: &mut Paragraph,
     cx: &mut NodeContext,
 ) -> Vec<BlockNode> {
     let mut children = vec![];
     consume_paragraph(&mut children, paragraph);
+    paragraph.html_style = Some(style::resolve(node).paragraph);
     for child in node.children.borrow().iter() {
         // Overlook patch: flush the running text only before a block child, so inline
         // runs and <br> line breaks inside a blockquote or list item stay one paragraph.
@@ -766,6 +857,7 @@ fn consume_children_nodes(
         }
     }
     consume_paragraph(&mut children, paragraph);
+    paragraph.html_style = None;
 
     children
 }
@@ -799,11 +891,56 @@ fn collect_preformatted(node: &Rc<Node>, out: &mut String) {
 }
 
 fn consume_paragraph(children: &mut Vec<BlockNode>, paragraph: &mut Paragraph) {
+    normalize_whitespace(paragraph);
     if paragraph.is_empty() {
         return;
     }
 
     children.push(BlockNode::Paragraph(paragraph.take()));
+}
+
+/// Collapse across element boundaries while remapping UTF-8 mark offsets.
+fn normalize_whitespace(paragraph: &mut Paragraph) {
+    if paragraph.html_style.as_ref().is_some_and(|s| s.preserve) {
+        return;
+    }
+    let mut space = true;
+    for node in &mut paragraph.children {
+        if node.image.is_some() {
+            space = false;
+            continue;
+        }
+        let mut offsets = vec![0; node.text.len() + 1];
+        let mut text = String::new();
+        for (ix, ch) in node.text.char_indices() {
+            offsets[ix] = text.len();
+            if ch != ' ' || !space {
+                text.push(ch);
+            }
+            space = ch == ' ' || ch == '\n';
+            offsets[ix + ch.len_utf8()] = text.len();
+        }
+        for (range, _) in &mut node.marks {
+            range.start = offsets[range.start.min(node.text.len())];
+            range.end = offsets[range.end.min(node.text.len())];
+        }
+        node.text = text.into();
+    }
+    if let Some(node) = paragraph
+        .children
+        .iter_mut()
+        .rev()
+        .find(|n| !n.text.is_empty() || n.image.is_some())
+    {
+        if node.image.is_none() {
+            let len = node.text.trim_end_matches(' ').len();
+            node.text = node.text[..len].to_owned().into();
+            for (range, _) in &mut node.marks {
+                range.end = range.end.min(len);
+                range.start = range.start.min(len);
+            }
+        }
+    }
 }
 
 #[cfg(test)]
@@ -817,6 +954,200 @@ mod tests {
     };
 
     use super::trim_text;
+
+    fn paragraphs<'a>(node: &'a BlockNode, out: &mut Vec<&'a Paragraph>) {
+        match node {
+            BlockNode::Paragraph(p) => out.push(p),
+            BlockNode::Heading { children, .. } => out.push(children),
+            BlockNode::Root { children, .. }
+            | BlockNode::List { children, .. }
+            | BlockNode::ListItem { children, .. }
+            | BlockNode::Blockquote { children, .. } => {
+                for child in children {
+                    paragraphs(child, out);
+                }
+            }
+            _ => {}
+        }
+    }
+
+    #[test]
+    fn html_paragraphs_have_distinct_bounded_spacing_and_inherit_typography() {
+        let document = super::parse(r#"<div style="font-size:15pt;line-height:1.8;color:red;text-align:right"><div>a</div><p style="margin:2px 3px 4px;margin-top:2000px">b</p><div style="font-size:150%;margin-bottom:-10px">c</div></div>"#, &mut NodeContext::default()).unwrap();
+        let mut ps = vec![];
+        paragraphs(&document.blocks[0], &mut ps);
+        assert_eq!(ps.len(), 3);
+        let styles: Vec<_> = ps.iter().map(|p| p.html_style.as_ref().unwrap()).collect();
+        assert_eq!((styles[0].margin_top, styles[0].margin_bottom), (0., 0.));
+        assert_eq!((styles[1].margin_top, styles[1].margin_bottom), (96., 4.));
+        assert_eq!(styles[0].font_size, 20.);
+        assert_eq!(styles[0].line_height, 1.8);
+        assert_eq!(styles[0].align, "right");
+        assert_eq!(styles[2].font_size, 30.);
+        assert_eq!(styles[2].margin_bottom, 0.);
+        assert_eq!(
+            ps[0].children[0].marks.last().unwrap().1.color,
+            super::parse_css_color("red")
+        );
+    }
+
+    #[test]
+    fn authored_units_font_attributes_and_decorations() {
+        let document = super::parse(r##"<div style="font-size:20px;line-height:24pt"><p style="font-size:150%;margin-top:2em;margin:1rem 0 50%">x</p><div><font face="Example" size="7" color="#123">y</font><span style="text-decoration:underline line-through">z</span></div></div>"##, &mut NodeContext::default()).unwrap();
+        let mut ps = vec![];
+        paragraphs(&document.blocks[0], &mut ps);
+        let style = ps[0].html_style.as_ref().unwrap();
+        assert_eq!(style.font_size, 30.);
+        assert_eq!(style.margin_top, 16.);
+        assert!((style.margin_bottom - 15.).abs() < 0.01);
+        assert!((style.line_height * style.font_size - 32.).abs() < 0.01);
+        let y = &ps[1].children[0].marks.last().unwrap().1;
+        assert_eq!(y.font_family.as_deref(), Some("Example"));
+        assert_eq!(y.font_size_scale, Some(48. / 20.));
+        assert_eq!(y.color, super::parse_css_color("#123"));
+        let z = ps[1].children[1].marks.last().unwrap();
+        assert!(z.1.underline && z.1.strikethrough);
+        let document = super::parse(
+            "<p style='font-size:10000rem;line-height:NaN;margin:infpx'>x</p>",
+            &mut NodeContext::default(),
+        )
+        .unwrap();
+        let mut ps = vec![];
+        paragraphs(&document.blocks[0], &mut ps);
+        assert_eq!(ps[0].html_style.as_ref().unwrap().font_size, 64.);
+        assert!(ps[0].html_style.as_ref().unwrap().margin_top.is_finite());
+    }
+
+    #[test]
+    fn nested_inline_typography_child_wins() {
+        let document = super::parse(r#"<p><b style="color:red"><span style="color:blue;font-size:200%;font-weight:normal;font-style:italic;font-family:Example">child</span></b></p>"#, &mut NodeContext::default()).unwrap();
+        let mut ps = vec![];
+        paragraphs(&document.blocks[0], &mut ps);
+        let mark = &ps[0].children[0].marks.last().unwrap().1;
+        assert_eq!(mark.color, super::parse_css_color("blue"));
+        assert_eq!(mark.font_size_scale, Some(2.));
+        assert_eq!(mark.font_weight, Some(gpui::FontWeight::NORMAL));
+        assert_eq!(mark.font_style, Some(gpui::FontStyle::Italic));
+        assert_eq!(mark.font_family.as_deref(), Some("Example"));
+    }
+
+    #[test]
+    fn whitespace_breaks_and_list_block_boundaries() {
+        let document = super::parse("<div> a <span> b </span> c<br>d </div><ul><li>before<p>inside</p>after<br>end<ul><li>nested</li></ul>tail</li></ul><div>last</div>", &mut NodeContext::default()).unwrap();
+        let mut ps = vec![];
+        paragraphs(&document.blocks[0], &mut ps);
+        let texts: Vec<_> = ps.iter().map(|p| p.text().to_string()).collect();
+        assert_eq!(
+            texts,
+            [
+                "a b c\nd",
+                "before",
+                "inside",
+                "after\nend",
+                "nested",
+                "tail",
+                "last"
+            ]
+        );
+        let document = super::parse(
+            "<div style='white-space:pre-wrap'> a  b\n c</div>",
+            &mut NodeContext::default(),
+        )
+        .unwrap();
+        let mut ps = vec![];
+        paragraphs(&document.blocks[0], &mut ps);
+        assert_eq!(ps[0].text(), " a  b\n c");
+    }
+
+    #[test]
+    fn html_table_headers_are_explicit_and_footer_survives() {
+        let document = super::parse("<table><tbody><tr><td>body</td></tr><tr><th>header</th></tr></tbody><tfoot><tr><td>footer</td></tr></tfoot></table>", &mut NodeContext::default()).unwrap();
+        let BlockNode::Table(table) = &document.blocks[0] else {
+            panic!("expected table")
+        };
+        assert_eq!(table.html_headers, Some(vec![false, true, false]));
+        assert_eq!(table.children.len(), 3);
+        assert_eq!(table.table_data().headers, ["header"]);
+        assert_eq!(table.table_data().rows, [vec!["body"], vec!["footer"]]);
+    }
+
+    #[test]
+    fn horizontal_spacing_relative_fonts_and_full_color_policy() {
+        let doc = super::parse("<p align='right' style='margin:1px 2px 3px 4px;margin-left:6px'><font size='+1'>up</font><font size='-1'>down</font><small>small</small></p>", &mut NodeContext::default()).unwrap();
+        let mut ps = vec![];
+        paragraphs(&doc.blocks[0], &mut ps);
+        let style = ps[0].html_style.as_ref().unwrap();
+        assert_eq!(
+            (
+                style.margin_top,
+                style.margin_right,
+                style.margin_bottom,
+                style.margin_left
+            ),
+            (1., 2., 3., 6.)
+        );
+        assert_eq!(style.align, "right");
+        let reset = super::parse("<div style='line-height:40px;text-align:center'><p style='line-height:normal;text-align:left'>reset</p></div>", &mut NodeContext::default()).unwrap();
+        let mut resets = vec![];
+        paragraphs(&reset.blocks[0], &mut resets);
+        let reset_style = resets[0].html_style.as_ref().unwrap();
+        assert_eq!(reset_style.line_height, 1.4);
+        assert_eq!(reset_style.align, "left");
+        for (text, scale) in [("up", 18. / 16.), ("down", 13. / 16.), ("small", 0.8333333)] {
+            let node = ps[0]
+                .children
+                .iter()
+                .find(|n| n.text.as_ref() == text)
+                .unwrap();
+            let actual = node
+                .marks
+                .iter()
+                .find_map(|(_, m)| m.font_size_scale)
+                .unwrap();
+            assert!((actual - scale).abs() < 0.001);
+        }
+        let rgba = gpui::Rgba::from(super::parse_css_color("rgba(100%,0%,50%,0.25)").unwrap());
+        assert!((rgba.r - 1.).abs() < 0.001 && (rgba.b - 128. / 255.).abs() < 0.001);
+        assert!((rgba.a - 0.25).abs() < 0.001);
+        assert!(super::parse_css_color("rebeccapurple").is_some());
+        assert!(super::parse_css_color("rgb(1,2,3,4)").is_none());
+    }
+
+    #[test]
+    fn html_semantic_defaults_override_inheritance_but_not_explicit_css() {
+        let doc = super::parse("<div style='font-family:Example Sans;font-weight:normal'><h1>Heading</h1><h1 style='font-weight:normal'>Plain heading</h1><p><code>code</code><code style='font-family:Example Sans'>styled</code></p></div>", &mut NodeContext::default()).unwrap();
+        let mut ps = vec![];
+        paragraphs(&doc.blocks[0], &mut ps);
+        for (text, weight) in [
+            ("Heading", gpui::FontWeight::BOLD),
+            ("Plain heading", gpui::FontWeight::NORMAL),
+        ] {
+            let node = ps
+                .iter()
+                .flat_map(|p| &p.children)
+                .find(|n| n.text.as_ref() == text)
+                .unwrap();
+            assert_eq!(node.marks[0].1.font_weight, Some(weight));
+        }
+        let code = ps
+            .iter()
+            .flat_map(|p| &p.children)
+            .find(|n| n.text.as_ref() == "code")
+            .unwrap();
+        let mark = &code.marks[0].1;
+        assert!(mark.code);
+        assert!(mark.font_family.is_none());
+        assert_eq!(mark.font_size_scale, Some(1.));
+        let styled = ps
+            .iter()
+            .flat_map(|p| &p.children)
+            .find(|n| n.text.as_ref() == "styled")
+            .unwrap();
+        assert_eq!(
+            styled.marks[0].1.font_family.as_deref(),
+            Some("Example Sans")
+        );
+    }
 
     #[test]
     fn test_cleanup_html() {
@@ -890,7 +1221,7 @@ mod tests {
         assert_eq!(
             node.to_markdown(),
             indoc::indoc! {r#"
-            and *code italic* text
+            and *`code` italic* text
 
             ![Example](https://example.com/image.png "Example Image")
 
