@@ -2,8 +2,8 @@
 
 use super::api::{ApiError, GmailClient};
 use super::mapping::{self, base64url_encode, gmail_id, label_from_json, message_from_json};
-use super::mime::build_raw;
-use crate::{draft_message_id, BoxFuture, MailProvider, MailboxSnapshot, ProviderError, RemoteChanges, SendContext, SendOutcome, SentReceipt};
+use crate::outgoing::build_raw;
+use crate::{draft_message_id, AppliedChanges, BoxFuture, MailProvider, MailboxSnapshot, ProviderError, RemoteChanges, SendContext, SendOutcome, SentReceipt};
 use overlook_core::time::Timestamp;
 use overlook_core::*;
 use serde_json::{json, Value};
@@ -469,12 +469,13 @@ impl MailProvider for GmailProvider {
                 labels,
                 upserts,
                 deleted: deleted.iter().map(|id| mapping::local_message_id(&account.id, id)).collect(),
+                message_ids: Vec::new(),
                 checkpoint: Some(new_checkpoint),
             })
         })
     }
 
-    fn apply(&self, account: &Account, op: &PendingOperation, messages: &[Message], labels: &[Label]) -> BoxFuture<'_, Result<(), ProviderError>> {
+    fn apply(&self, account: &Account, op: &PendingOperation, messages: &[Message], labels: &[Label]) -> BoxFuture<'_, Result<AppliedChanges, ProviderError>> {
         let account = account.clone();
         let op = op.clone();
         let ids = Self::gmail_ids(&account, messages);
@@ -521,7 +522,7 @@ impl MailProvider for GmailProvider {
                 kind if kind.is_calendar() => return Err(ProviderError::Rejected("calendar operations go through the calendar provider".into())),
                 _ => {}
             }
-            Ok(())
+            Ok(AppliedChanges::default())
         })
     }
 

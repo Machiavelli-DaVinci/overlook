@@ -7,6 +7,10 @@
 //!
 //! Protected data (drafts, Outbox items, outgoing attachments, pending operations) lives in
 //! its own tables and is never touched by cache eviction.
+//!
+//! Downloaded mail is a replaceable cache for Gmail and IMAP accounts, where the server keeps
+//! the primary copy. For POP3 accounts the local store *is* the primary copy: nothing may
+//! evict their messages. Any eviction routine must check [`Store::is_local_primary`] first.
 
 mod schema;
 
@@ -234,6 +238,11 @@ impl Store {
                 let mut existing = load_messages(tx, "WHERE m.id=?1", params![incoming.id.0])?.pop();
                 let mut merged = incoming.clone();
                 if let Some(local) = existing.take() {
+                    if merged.conversation_id.0.is_empty() {
+                        // A header-only refresh from a provider without thread ids keeps the
+                        // conversation the message was threaded into.
+                        merged.conversation_id = local.conversation_id.clone();
+                    }
                     if !merged.body.is_cached() {
                         merged.body = local.body;
                     }
@@ -904,6 +913,120 @@ impl Store {
         })
     }
 
+    // ---------------------------------------------------------- server settings
+
+    /// IMAP/POP3/SMTP server settings for an account. `None` for Gmail and Sample accounts,
+    /// or before setup finished. Passwords are in the keyring, never here.
+    pub fn servers(&self, account: &AccountId) -> Result<Option<MailServers>> {
+        self.with_conn(|c| {
+            let raw: Option<String> = c.query_row("SELECT servers_json FROM account_servers WHERE account_id=?1", [&account.0], |r| r.get(0)).optional()?;
+            Ok(match raw {
+                Some(json) => Some(serde_json::from_str(&json)?),
+                None => None,
+            })
+        })
+    }
+
+    pub fn set_servers(&self, account: &AccountId, servers: &MailServers) -> Result<()> {
+        self.with_conn(|c| {
+            c.execute(
+                "INSERT INTO account_servers(account_id, servers_json) VALUES(?1,?2) ON CONFLICT(account_id) DO UPDATE SET servers_json=excluded.servers_json",
+                params![account.0, serde_json::to_string(servers)?],
+            )?;
+            Ok(())
+        })
+    }
+
+    /// Whether this device holds the only copy of the account's mail (POP3). Eviction must
+    /// never touch such accounts.
+    pub fn is_local_primary(&self, account: &AccountId) -> Result<bool> {
+        self.with_conn(|c| {
+            let provider: Option<String> = c.query_row("SELECT provider FROM accounts WHERE id=?1", [&account.0], |r| r.get(0)).optional()?;
+            Ok(provider.as_deref().and_then(ProviderKind::from_key) == Some(ProviderKind::Pop3))
+        })
+    }
+
+    // ------------------------------------------------- identity and threading
+
+    /// All messages of the account with this Message-ID, newest first. Several can exist
+    /// legitimately (a Sent copy and a received copy; a message mid-move seen in two folders).
+    pub fn messages_by_rfc_id(&self, account: &AccountId, rfc_id: &str) -> Result<Vec<Message>> {
+        self.with_conn(|c| load_messages(c, "WHERE m.account_id=?1 AND m.rfc_message_id=?2", params![account.0, rfc_id]))
+    }
+
+    /// The newest message of the account with this Message-ID.
+    pub fn message_by_rfc_id(&self, account: &AccountId, rfc_id: &str) -> Result<Option<Message>> {
+        Ok(self.messages_by_rfc_id(account, rfc_id)?.into_iter().next())
+    }
+
+    /// The local id of the message the provider knows by `provider_id`, if any.
+    pub fn message_id_for_provider_id(&self, account: &AccountId, provider_id: &ProviderId) -> Result<Option<MessageId>> {
+        self.with_conn(|c| {
+            Ok(c.query_row("SELECT id FROM messages WHERE account_id=?1 AND provider_id=?2", params![account.0, provider_id.0], |r| r.get::<_, String>(0))
+                .optional()?
+                .map(MessageId))
+        })
+    }
+
+    /// The conversation a Message-ID belongs to: the conversation of the message that
+    /// carries it, or of any stored message that replies to or references it. This is the
+    /// lookup `overlook_core::threading::assign_conversations` needs, and the second clause
+    /// is what lets a parent downloaded after its reply join the reply's conversation.
+    pub fn conversation_for_rfc_id(&self, account: &AccountId, rfc_id: &str) -> Result<Option<ConversationId>> {
+        self.with_conn(|c| {
+            let direct: Option<String> = c
+                .query_row(
+                    "SELECT conversation_id FROM messages WHERE account_id=?1 AND (rfc_message_id=?2 OR in_reply_to=?2) ORDER BY date DESC LIMIT 1",
+                    params![account.0, rfc_id],
+                    |r| r.get(0),
+                )
+                .optional()?;
+            if let Some(conv) = direct {
+                return Ok(Some(ConversationId(conv)));
+            }
+            let quoted = serde_json::to_string(rfc_id)?;
+            let pattern = format!("%{}%", quoted.replace('\\', "\\\\").replace('%', "\\%").replace('_', "\\_"));
+            let via_references: Option<String> = c
+                .query_row(
+                    "SELECT conversation_id FROM messages WHERE account_id=?1 AND references_json LIKE ?2 ESCAPE '\\' ORDER BY date DESC LIMIT 1",
+                    params![account.0, pattern],
+                    |r| r.get(0),
+                )
+                .optional()?;
+            Ok(via_references.map(ConversationId))
+        })
+    }
+
+    /// Provider ids of every message carrying `label`. For IMAP this is the local view of a
+    /// folder, diffed against the server's UID list to find deletions.
+    pub fn provider_ids_for_label(&self, label: &LabelId) -> Result<Vec<ProviderId>> {
+        self.with_conn(|c| {
+            let mut stmt = c.prepare("SELECT m.provider_id FROM messages m JOIN message_labels ml ON ml.message_id = m.id WHERE ml.label_id=?1 AND m.provider_id IS NOT NULL ORDER BY m.date DESC")?;
+            let rows = stmt.query_map([&label.0], |r| Ok(ProviderId(r.get(0)?)))?;
+            Ok(rows.collect::<std::result::Result<Vec<_>, _>>()?)
+        })
+    }
+
+    /// Records provider-side identity changes reported after an operation was applied
+    /// (an IMAP move gives the message a new UID in a new folder). Each message gets the new
+    /// provider id and exactly that label, since a message lives in one folder.
+    pub fn apply_provider_id_changes(&self, changes: &[(MessageId, ProviderId, LabelId)]) -> Result<()> {
+        if changes.is_empty() {
+            return Ok(());
+        }
+        self.with_tx(|tx| {
+            for (message, provider_id, label) in changes {
+                let n = tx.execute("UPDATE messages SET provider_id=?2 WHERE id=?1", params![message.0, provider_id.0])?;
+                if n == 0 {
+                    continue;
+                }
+                tx.execute("DELETE FROM message_labels WHERE message_id=?1", [&message.0])?;
+                tx.execute("INSERT OR IGNORE INTO message_labels(message_id, label_id) VALUES(?1,?2)", params![message.0, label.0])?;
+            }
+            Ok(())
+        })
+    }
+
     // ----------------------------------------------------------------- settings
 
     pub fn setting<T: serde::de::DeserializeOwned>(&self, key: &str) -> Result<Option<T>> {
@@ -1160,15 +1283,16 @@ fn upsert_message_tx(tx: &Connection, m: &Message) -> Result<()> {
     tx.execute(
         "INSERT INTO messages(id, account_id, conversation_id, provider_id, from_json, to_json, cc_json, bcc_json, reply_to_json,
             subject, snippet, body_text, body_html, search_text, date, is_read, is_starred, is_outgoing, rfc_message_id, in_reply_to,
-            category, is_important, focus_override, invitation_json)
-         VALUES(?1,?2,?3,?4,?5,?6,?7,?8,?9,?10,?11,?12,?13,?14,?15,?16,?17,?18,?19,?20,?21,?22,?23,?24)
+            category, is_important, focus_override, invitation_json, references_json)
+         VALUES(?1,?2,?3,?4,?5,?6,?7,?8,?9,?10,?11,?12,?13,?14,?15,?16,?17,?18,?19,?20,?21,?22,?23,?24,?25)
          ON CONFLICT(id) DO UPDATE SET conversation_id=excluded.conversation_id, provider_id=excluded.provider_id,
             from_json=excluded.from_json, to_json=excluded.to_json, cc_json=excluded.cc_json, bcc_json=excluded.bcc_json,
             reply_to_json=excluded.reply_to_json, subject=excluded.subject, snippet=excluded.snippet,
             body_text=excluded.body_text, body_html=excluded.body_html, search_text=excluded.search_text, date=excluded.date,
             is_read=excluded.is_read, is_starred=excluded.is_starred, is_outgoing=excluded.is_outgoing,
             rfc_message_id=excluded.rfc_message_id, in_reply_to=excluded.in_reply_to,
-            category=excluded.category, is_important=excluded.is_important, focus_override=excluded.focus_override, invitation_json=excluded.invitation_json",
+            category=excluded.category, is_important=excluded.is_important, focus_override=excluded.focus_override, invitation_json=excluded.invitation_json,
+            references_json=excluded.references_json",
         params![
             m.id.0,
             m.account_id.0,
@@ -1194,6 +1318,7 @@ fn upsert_message_tx(tx: &Connection, m: &Message) -> Result<()> {
             m.is_important,
             m.focus_override,
             m.invitation.as_ref().map(serde_json::to_string).transpose()?,
+            if m.references.is_empty() { None } else { Some(serde_json::to_string(&m.references)?) },
         ],
     )?;
     tx.execute("DELETE FROM message_labels WHERE message_id=?1", [&m.id.0])?;
@@ -1363,7 +1488,7 @@ fn load_messages(c: &Connection, where_clause: &str, args: impl rusqlite::Params
     let sql = format!(
         "SELECT m.id, m.account_id, m.conversation_id, m.provider_id, m.from_json, m.to_json, m.cc_json, m.bcc_json, m.reply_to_json,
                 m.subject, m.snippet, m.body_text, m.body_html, m.date, m.is_read, m.is_starred, m.is_outgoing, m.rfc_message_id, m.in_reply_to,
-                m.category, m.is_important, m.focus_override, m.invitation_json
+                m.category, m.is_important, m.focus_override, m.invitation_json, m.references_json
          FROM messages m {where_clause} ORDER BY m.date DESC"
     );
     let mut stmt = c.prepare(&sql)?;
@@ -1390,6 +1515,7 @@ fn load_messages(c: &Connection, where_clause: &str, args: impl rusqlite::Params
                 is_outgoing: r.get(16)?,
                 rfc_message_id: r.get(17)?,
                 in_reply_to: r.get(18)?,
+                references_json: r.get(23)?,
                 category: r.get(19)?,
                 is_important: r.get(20)?,
                 focus_override: r.get(21)?,
@@ -1457,6 +1583,7 @@ struct RawMessage {
     is_outgoing: bool,
     rfc_message_id: Option<String>,
     in_reply_to: Option<String>,
+    references_json: Option<String>,
     category: Option<String>,
     is_important: bool,
     focus_override: Option<bool>,
@@ -1486,6 +1613,7 @@ impl RawMessage {
             attachments: Vec::new(),
             rfc_message_id: self.rfc_message_id,
             in_reply_to: self.in_reply_to,
+            references: self.references_json.as_deref().and_then(|j| serde_json::from_str(j).ok()).unwrap_or_default(),
             category: self.category,
             is_important: self.is_important,
             focus_override: self.focus_override,
@@ -1728,6 +1856,7 @@ mod tests {
             attachments: vec![],
             rfc_message_id: None,
             in_reply_to: None,
+            references: Vec::new(),
             category: None,
             is_important: false,
             focus_override: None,
@@ -2064,5 +2193,136 @@ mod tests {
         assert_eq!(store.view_count(&acct, "jason@example.com", &MailboxView::Kind(LabelKind::Inbox), None).unwrap(), 1);
         store.apply_change(&acct, LocalChange::Untrash { message_ids: vec![MessageId::from("m1")] }).unwrap();
         assert_eq!(store.view_count(&acct, "jason@example.com", &MailboxView::Kind(LabelKind::Inbox), None).unwrap(), 2);
+    }
+
+    #[test]
+    fn server_settings_round_trip_and_cascade() {
+        let store = Store::open_in_memory().unwrap();
+        seeded(&store);
+        let acct = AccountId::from("acct-1");
+        assert!(store.servers(&acct).unwrap().is_none());
+        let servers = MailServers {
+            incoming: ServerEndpoint::new("imap.example.com", 993, Security::Tls, "jason@example.com"),
+            outgoing: ServerEndpoint::new("smtp.example.com", 587, Security::StartTls, "jason@example.com"),
+            pop3: None,
+            imap: Some(ImapPolicy::default()),
+        };
+        store.set_servers(&acct, &servers).unwrap();
+        assert_eq!(store.servers(&acct).unwrap(), Some(servers.clone()));
+        let changed = MailServers { pop3: Some(Pop3Policy { delete_after_days: Some(30), ..Default::default() }), ..servers };
+        store.set_servers(&acct, &changed).unwrap();
+        assert_eq!(store.servers(&acct).unwrap().unwrap().pop3.unwrap().delete_after_days, Some(30));
+        store.delete_account(&acct).unwrap();
+        assert!(store.servers(&acct).unwrap().is_none(), "settings go with the account");
+    }
+
+    #[test]
+    fn local_primary_is_pop3_only() {
+        let store = Store::open_in_memory().unwrap();
+        seeded(&store);
+        assert!(!store.is_local_primary(&AccountId::from("acct-1")).unwrap());
+        let pop = Account { id: AccountId::from("pop3:j"), provider: ProviderKind::Pop3, ..account() };
+        store.upsert_account(&pop).unwrap();
+        assert!(store.is_local_primary(&pop.id).unwrap());
+        assert!(!store.is_local_primary(&AccountId::from("nobody")).unwrap());
+    }
+
+    #[test]
+    fn v11_tables_accept_folder_and_pop3_rows() {
+        let store = Store::open_in_memory().unwrap();
+        seeded(&store);
+        store
+            .with_conn(|c| {
+                c.execute("INSERT INTO imap_folders(account_id, path, uidvalidity, highest_uid, delimiter, special_use) VALUES('acct-1','INBOX',17,42,'/','\\Inbox')", [])?;
+                c.execute("INSERT INTO pop3_seen(account_id, uidl, seen_at) VALUES('acct-1','UIDL-1',5)", [])?;
+                Ok(())
+            })
+            .unwrap();
+        store.delete_account(&AccountId::from("acct-1")).unwrap();
+        let (folders, seen): (i64, i64) = store
+            .with_conn(|c| Ok((c.query_row("SELECT COUNT(*) FROM imap_folders", [], |r| r.get(0))?, c.query_row("SELECT COUNT(*) FROM pop3_seen", [], |r| r.get(0))?)))
+            .unwrap();
+        assert_eq!((folders, seen), (0, 0), "cursor rows cascade with the account");
+    }
+
+    #[test]
+    fn references_persist_and_message_ids_resolve() {
+        let store = Store::open_in_memory().unwrap();
+        seeded(&store);
+        let acct = AccountId::from("acct-1");
+        let mut root = message("r1", "Plan", "root", &["label-inbox"]);
+        root.rfc_message_id = Some("<root@x>".into());
+        root.provider_id = Some(ProviderId("INBOX\u{1f}7\u{1f}100".into()));
+        root.conversation_id = ConversationId::from("conv-root");
+        let mut reply = message("r2", "Re: Plan", "reply", &["label-inbox"]);
+        reply.rfc_message_id = Some("<reply@x>".into());
+        reply.in_reply_to = Some("<root@x>".into());
+        reply.references = vec!["<grandparent@x>".into(), "<root@x>".into()];
+        reply.conversation_id = ConversationId::from("conv-root");
+        reply.date = 2_000_000;
+        let mut sent_copy = message("r3", "Plan", "root", &["label-sent"]);
+        sent_copy.rfc_message_id = Some("<root@x>".into());
+        sent_copy.provider_id = Some(ProviderId("Sent\u{1f}3\u{1f}9".into()));
+        sent_copy.conversation_id = ConversationId::from("conv-root");
+        sent_copy.date = 999;
+        store.upsert_messages(&[root, reply, sent_copy]).unwrap();
+
+        assert_eq!(store.message(&MessageId::from("r2")).unwrap().unwrap().references, vec!["<grandparent@x>".to_owned(), "<root@x>".to_owned()]);
+        assert!(store.message(&MessageId::from("r1")).unwrap().unwrap().references.is_empty());
+
+        let both = store.messages_by_rfc_id(&acct, "<root@x>").unwrap();
+        assert_eq!(both.iter().map(|m| m.id.as_str()).collect::<Vec<_>>(), vec!["r1", "r3"], "newest first");
+        assert_eq!(store.message_by_rfc_id(&acct, "<root@x>").unwrap().unwrap().id.as_str(), "r1");
+        assert!(store.message_by_rfc_id(&acct, "<missing@x>").unwrap().is_none());
+        assert_eq!(store.message_id_for_provider_id(&acct, &ProviderId("Sent\u{1f}3\u{1f}9".into())).unwrap(), Some(MessageId::from("r3")));
+        assert!(store.message_id_for_provider_id(&acct, &ProviderId("nope".into())).unwrap().is_none());
+
+        // Threading lookup: by own id, by being replied to, and by appearing in References.
+        assert_eq!(store.conversation_for_rfc_id(&acct, "<reply@x>").unwrap(), Some(ConversationId::from("conv-root")));
+        assert_eq!(store.conversation_for_rfc_id(&acct, "<grandparent@x>").unwrap(), Some(ConversationId::from("conv-root")));
+        assert_eq!(store.conversation_for_rfc_id(&acct, "<grand%@x>").unwrap(), None, "LIKE wildcards are escaped");
+        assert_eq!(store.conversation_for_rfc_id(&acct, "<nobody@x>").unwrap(), None);
+
+        // Folder contents by provider id.
+        let inbox = store.provider_ids_for_label(&LabelId::from("label-inbox")).unwrap();
+        assert_eq!(inbox, vec![ProviderId("INBOX\u{1f}7\u{1f}100".into())], "r2 has no provider id and is skipped");
+        assert_eq!(store.provider_ids_for_label(&LabelId::from("label-sent")).unwrap().len(), 1);
+    }
+
+    #[test]
+    fn provider_id_changes_move_the_message() {
+        let store = Store::open_in_memory().unwrap();
+        seeded(&store);
+        let acct = AccountId::from("acct-1");
+        let mut m = message("mv", "Moving", "body", &["label-inbox"]);
+        m.provider_id = Some(ProviderId("INBOX\u{1f}7\u{1f}5".into()));
+        store.upsert_messages(&[m]).unwrap();
+        store
+            .apply_provider_id_changes(&[
+                (MessageId::from("mv"), ProviderId("Projects\u{1f}2\u{1f}31".into()), LabelId::from("label-user")),
+                (MessageId::from("ghost"), ProviderId("x".into()), LabelId::from("label-user")),
+            ])
+            .unwrap();
+        let moved = store.message(&MessageId::from("mv")).unwrap().unwrap();
+        assert_eq!(moved.provider_id.as_ref().unwrap().as_str(), "Projects\u{1f}2\u{1f}31");
+        assert_eq!(moved.label_ids.iter().map(|l| l.as_str()).collect::<Vec<_>>(), vec!["label-user"]);
+        assert!(store.message_id_for_provider_id(&acct, &ProviderId("INBOX\u{1f}7\u{1f}5".into())).unwrap().is_none());
+    }
+
+    #[test]
+    fn merge_keeps_local_conversation_for_header_only_refresh() {
+        let store = Store::open_in_memory().unwrap();
+        seeded(&store);
+        let mut m = message("t1", "Threaded", "body", &["label-inbox"]);
+        m.conversation_id = ConversationId::from("conv-threaded");
+        store.upsert_messages(&[m.clone()]).unwrap();
+        let mut refresh = m.clone();
+        refresh.conversation_id = ConversationId(String::new());
+        refresh.body = Body::default();
+        refresh.is_read = true;
+        store.merge_remote_messages(&[refresh], &BTreeSet::new()).unwrap();
+        let stored = store.message(&MessageId::from("t1")).unwrap().unwrap();
+        assert_eq!(stored.conversation_id.as_str(), "conv-threaded");
+        assert!(stored.is_read && stored.body.is_cached());
     }
 }

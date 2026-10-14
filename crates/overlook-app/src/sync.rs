@@ -6,6 +6,7 @@
 //! reconciled before any retry. Runs on a background thread; the window reloads from the
 //! store afterwards.
 
+use overlook_core::threading::assign_conversations;
 use overlook_core::time::now;
 use overlook_core::*;
 use overlook_provider::{CalendarProvider, MailProvider, ProviderError, SendContext, SendOutcome};
@@ -153,13 +154,87 @@ fn coverage_key(account: &AccountId) -> String {
 fn enqueue(store: &Store, account: &AccountId, ids: Vec<ProviderId>, only_missing: bool) {
     let mut backlog = backlog(store, account);
     for pid in ids {
-        let local = MessageId(format!("{}:{}", account.0, pid.0));
-        let present = store.message(&local).ok().flatten().is_some();
+        let present = store.message_id_for_provider_id(account, &pid).ok().flatten().is_some();
         if (!only_missing || !present) && !backlog.contains(&pid) {
             backlog.push(pid);
         }
     }
     save_backlog(store, account, &backlog);
+}
+
+/// Queues bodies for messages a provider reported header-only (`RemoteChanges::message_ids`).
+/// Unlike [`enqueue`], a row that exists without a cached body is still queued.
+fn enqueue_bodies(store: &Store, account: &AccountId, ids: Vec<ProviderId>) {
+    let mut backlog = backlog(store, account);
+    for pid in ids {
+        let cached = store
+            .message_id_for_provider_id(account, &pid)
+            .ok()
+            .flatten()
+            .and_then(|id| store.message(&id).ok().flatten())
+            .is_some_and(|m| m.body.is_cached());
+        if !cached && !backlog.contains(&pid) {
+            backlog.push(pid);
+        }
+    }
+    save_backlog(store, account, &backlog);
+}
+
+/// Lines downloaded messages up with what is already stored, for providers whose local
+/// ids are minted on first sight and whose conversations are not supplied (IMAP, POP3).
+/// Gmail ids and thread ids are deterministic, so every step is a no-op for Gmail.
+///
+/// 1. A message whose provider id is already stored under another local id adopts that id
+///    (a body download completing a header-only row).
+/// 2. A new message whose Message-ID belongs to a message vanishing in the same cycle is
+///    that message after a move made elsewhere: it keeps the local id and leaves `deleted`.
+/// 3. A message without a conversation keeps the conversation its row already has;
+///    the rest are threaded by `In-Reply-To` / `References` against the store.
+fn reconcile_incoming(store: &Store, account: &AccountId, messages: &mut [Message], deleted: &mut Vec<MessageId>) {
+    let vanished: Vec<Message> = if deleted.is_empty() || messages.iter().all(|m| m.rfc_message_id.is_none()) {
+        Vec::new()
+    } else {
+        deleted.iter().filter_map(|id| store.message(id).ok().flatten()).collect()
+    };
+    for m in messages.iter_mut() {
+        let mut existing = store.message(&m.id).ok().flatten();
+        if existing.is_none() {
+            if let Some(pid) = &m.provider_id {
+                if let Ok(Some(local)) = store.message_id_for_provider_id(account, pid) {
+                    if local != m.id {
+                        rename_message(m, local.clone());
+                        existing = store.message(&local).ok().flatten();
+                    }
+                }
+            }
+        }
+        if existing.is_none() {
+            if let Some(rfc) = &m.rfc_message_id {
+                if let Some(moved) = vanished.iter().find(|v| v.rfc_message_id.as_deref() == Some(rfc.as_str()) && v.provider_id != m.provider_id) {
+                    info!("message {} moved at the provider; keeping local id {}", rfc, moved.id);
+                    deleted.retain(|d| d != &moved.id);
+                    rename_message(m, moved.id.clone());
+                    existing = Some(moved.clone());
+                }
+            }
+        }
+        if m.conversation_id.0.is_empty() {
+            if let Some(local) = &existing {
+                m.conversation_id = local.conversation_id.clone();
+            }
+        }
+    }
+    if messages.iter().any(|m| m.conversation_id.0.is_empty()) {
+        assign_conversations(messages, |rfc_id| store.conversation_for_rfc_id(account, rfc_id).ok().flatten());
+    }
+}
+
+fn rename_message(m: &mut Message, id: MessageId) {
+    for (n, a) in m.attachments.iter_mut().enumerate() {
+        a.message_id = id.clone();
+        a.id = AttachmentId(format!("{}:att-{n}", id.0));
+    }
+    m.id = id;
 }
 
 fn state_for(err: &ProviderError) -> SyncState {
@@ -198,13 +273,14 @@ fn drain_backlog(store: &Store, provider: &dyn MailProvider, account: &Account, 
         let protected = store.pending_message_ids(acct).unwrap_or_default();
         let take = ids.len().min(DOWNLOAD_BATCH);
         let batch: Vec<ProviderId> = ids[..take].to_vec();
-        let messages = match pollster_block(provider.fetch_messages(account, &batch, &labels)) {
+        let mut messages = match pollster_block(provider.fetch_messages(account, &batch, &labels)) {
             Ok(m) => m,
             Err(e) => {
                 save_backlog(store, acct, &ids);
                 return Err(e);
             }
         };
+        reconcile_incoming(store, acct, &mut messages, &mut Vec::new());
         store.merge_remote_messages(&messages, &protected).map_err(|e| ProviderError::Temporary(e.to_string()))?;
         outcome.downloaded += messages.len();
         ids.drain(..take);
@@ -221,8 +297,9 @@ fn download(store: &Store, provider: &dyn MailProvider, account: &Account, outco
     let have_messages = store.message_count(acct).unwrap_or(0) > 0 || !backlog(store, acct).is_empty();
 
     let full = |outcome: &mut SyncOutcome| -> Result<usize, ProviderError> {
-        let snapshot = pollster_block(provider.fetch_snapshot(account))?;
+        let mut snapshot = pollster_block(provider.fetch_snapshot(account))?;
         store.replace_labels(acct, &snapshot.labels).map_err(|e| ProviderError::Temporary(e.to_string()))?;
+        reconcile_incoming(store, acct, &mut snapshot.messages, &mut Vec::new());
         store.merge_remote_messages(&snapshot.messages, &protected).map_err(|e| ProviderError::Temporary(e.to_string()))?;
         store.set_checkpoint(acct, snapshot.checkpoint.as_deref()).map_err(|e| ProviderError::Temporary(e.to_string()))?;
         outcome.downloaded += snapshot.messages.len();
@@ -240,8 +317,9 @@ fn download(store: &Store, provider: &dyn MailProvider, account: &Account, outco
         if covered >= COVERAGE_VERSION {
             return Ok(());
         }
-        let snapshot = pollster_block(provider.fetch_snapshot(account))?;
+        let mut snapshot = pollster_block(provider.fetch_snapshot(account))?;
         store.replace_labels(acct, &snapshot.labels).map_err(|e| ProviderError::Temporary(e.to_string()))?;
+        reconcile_incoming(store, acct, &mut snapshot.messages, &mut Vec::new());
         store.merge_remote_messages(&snapshot.messages, &protected).map_err(|e| ProviderError::Temporary(e.to_string()))?;
         // Version 3 added category/importance hints to the mapping: refresh what is stored.
         enqueue(store, acct, snapshot.message_ids, covered >= 4);
@@ -252,10 +330,13 @@ fn download(store: &Store, provider: &dyn MailProvider, account: &Account, outco
 
     match checkpoint {
         Some(cp) if have_messages => match pollster_block(provider.fetch_changes(account, &cp)) {
-            Ok(changes) => {
+            Ok(mut changes) => {
                 if let Some(labels) = &changes.labels {
                     store.replace_labels(acct, labels).map_err(|e| ProviderError::Temporary(e.to_string()))?;
                 }
+                // A message that vanished from one folder and appeared in another is a move,
+                // not a deletion plus a new message.
+                reconcile_incoming(store, acct, &mut changes.upserts, &mut changes.deleted);
                 store.merge_remote_messages(&changes.upserts, &protected).map_err(|e| ProviderError::Temporary(e.to_string()))?;
                 if !changes.deleted.is_empty() {
                     // Respect remote deletions even if a local change was pending on them.
@@ -265,6 +346,9 @@ fn download(store: &Store, provider: &dyn MailProvider, account: &Account, outco
                     store.set_checkpoint(acct, Some(new_cp)).map_err(|e| ProviderError::Temporary(e.to_string()))?;
                 }
                 outcome.downloaded += changes.upserts.len();
+                if !changes.message_ids.is_empty() {
+                    enqueue_bodies(store, acct, std::mem::take(&mut changes.message_ids));
+                }
                 drain_backlog(store, provider, account, outcome)?;
                 extend_coverage(outcome)?;
                 // One-time: re-fetch messages whose calendar part was stored before
@@ -498,7 +582,10 @@ pub async fn run_sync(store: Arc<Store>, provider: Arc<dyn MailProvider>, calend
             kind => {
                 let messages: Vec<Message> = kind.message_ids().iter().filter_map(|id| store.message(id).ok().flatten()).collect();
                 match provider.apply(&account, &op, &messages, &labels).await {
-                    Ok(()) => {
+                    Ok(applied) => {
+                        if let Err(e) = store.apply_provider_id_changes(&applied.provider_ids) {
+                            warn!("could not record provider id changes: {e}");
+                        }
                         let _ = store.set_operation_state(&op.id, OperationState::Applied, None);
                         outcome.applied += 1;
                     }
@@ -675,5 +762,201 @@ mod tests {
         let outcome = block_on(run_sync(store.clone(), arc(&provider), None, account.clone()));
         assert!(outcome.sent.is_empty());
         assert_eq!(store.drafts(&account.id, false).unwrap().len(), 1);
+    }
+
+    // ---------------------------------------------------------------- scripted provider
+
+    use overlook_provider::{AppliedChanges, BoxFuture, MailboxSnapshot, RemoteChanges, SentReceipt};
+    use std::collections::{BTreeSet, HashMap};
+    use std::sync::Mutex;
+
+    /// A provider shaped like IMAP: local ids minted on first sight, no thread ids, header-only
+    /// changes with bodies downloaded later, and provider ids that change on move.
+    #[derive(Default)]
+    struct Scripted {
+        snapshot: Mutex<MailboxSnapshot>,
+        changes: Mutex<Option<RemoteChanges>>,
+        bodies: Mutex<HashMap<String, Message>>,
+        applied: Mutex<AppliedChanges>,
+        fetched: Mutex<Vec<String>>,
+    }
+
+    impl MailProvider for Scripted {
+        fn kind(&self) -> ProviderKind {
+            ProviderKind::Imap
+        }
+        fn probe(&self) -> BoxFuture<'_, Result<(), ProviderError>> {
+            Box::pin(async { Ok(()) })
+        }
+        fn fetch_snapshot(&self, _account: &Account) -> BoxFuture<'_, Result<MailboxSnapshot, ProviderError>> {
+            let snap = self.snapshot.lock().unwrap().clone();
+            Box::pin(async move { Ok(snap) })
+        }
+        fn fetch_changes(&self, _account: &Account, checkpoint: &str) -> BoxFuture<'_, Result<RemoteChanges, ProviderError>> {
+            let changes = self.changes.lock().unwrap().take().unwrap_or_else(|| RemoteChanges { checkpoint: Some(checkpoint.to_owned()), ..Default::default() });
+            Box::pin(async move { Ok(changes) })
+        }
+        fn fetch_messages(&self, _account: &Account, ids: &[ProviderId], _labels: &[Label]) -> BoxFuture<'_, Result<Vec<Message>, ProviderError>> {
+            let bodies = self.bodies.lock().unwrap();
+            self.fetched.lock().unwrap().extend(ids.iter().map(|p| p.0.clone()));
+            let found: Vec<Message> = ids.iter().filter_map(|p| bodies.get(&p.0).cloned()).collect();
+            Box::pin(async move { Ok(found) })
+        }
+        fn apply(&self, _account: &Account, _op: &PendingOperation, _messages: &[Message], _labels: &[Label]) -> BoxFuture<'_, Result<AppliedChanges, ProviderError>> {
+            let applied = std::mem::take(&mut *self.applied.lock().unwrap());
+            Box::pin(async move { Ok(applied) })
+        }
+        fn send(&self, _account: &Account, _draft: &Draft, _context: SendContext) -> BoxFuture<'_, Result<SentReceipt, ProviderError>> {
+            Box::pin(async { Err(ProviderError::Rejected("not in this test".into())) })
+        }
+        fn reconcile_send(&self, _account: &Account, _draft: &Draft) -> BoxFuture<'_, Result<SendOutcome, ProviderError>> {
+            Box::pin(async { Ok(SendOutcome::NotDelivered) })
+        }
+    }
+
+    fn imap_account() -> Account {
+        Account { id: AccountId::from("imap:j"), provider: ProviderKind::Imap, display_name: "Jason".into(), email: "jason@example.com".into(), created_at: 0 }
+    }
+
+    fn folder(kind: LabelKind, path: &str) -> Label {
+        Label { id: LabelId(format!("imap:j:{path}")), account_id: AccountId::from("imap:j"), kind, name: path.into(), provider_id: Some(ProviderId(path.into())), color: None, sort_order: 0 }
+    }
+
+    fn raw_message(uid: &str, folder: &str, rfc: &str, in_reply_to: Option<&str>, references: &[&str], date: i64, cached: bool) -> Message {
+        Message {
+            id: MessageId(format!("imap:j:{}", MessageId::generate())),
+            account_id: AccountId::from("imap:j"),
+            conversation_id: ConversationId(String::new()),
+            provider_id: Some(ProviderId(format!("{folder}\u{1f}1\u{1f}{uid}"))),
+            from: Address::named("Maya Chen", "maya@northstar.example"),
+            to: vec![Address::named("Jason", "jason@example.com")],
+            cc: vec![],
+            bcc: vec![],
+            reply_to: None,
+            subject: format!("Message {uid}"),
+            snippet: String::new(),
+            body: if cached { Body { text: Some(format!("body {uid}")), html: None } } else { Body::default() },
+            date,
+            is_read: false,
+            is_starred: false,
+            is_outgoing: false,
+            label_ids: [LabelId(format!("imap:j:{folder}"))].into_iter().collect(),
+            attachments: vec![],
+            rfc_message_id: Some(rfc.into()),
+            in_reply_to: in_reply_to.map(str::to_owned),
+            references: references.iter().map(|r| r.to_string()).collect(),
+            category: None,
+            is_important: false,
+            focus_override: None,
+            invitation: None,
+        }
+    }
+
+    fn imap_seeded() -> (Arc<Store>, Account, Arc<Scripted>) {
+        let store = Arc::new(Store::open_in_memory().unwrap());
+        let account = imap_account();
+        store.upsert_account(&account).unwrap();
+        let provider = Arc::new(Scripted::default());
+        *provider.snapshot.lock().unwrap() = MailboxSnapshot {
+            labels: vec![folder(LabelKind::Inbox, "INBOX"), folder(LabelKind::Archive, "Archive")],
+            messages: vec![
+                raw_message("1", "INBOX", "<a@x>", None, &[], 1_000, true),
+                raw_message("2", "INBOX", "<b@x>", Some("<a@x>"), &["<a@x>"], 2_000, true),
+                raw_message("3", "INBOX", "<z@x>", None, &["<p@x>"], 3_000, true),
+            ],
+            message_ids: vec![],
+            checkpoint: Some("cursor-1".into()),
+        };
+        (store, account, provider)
+    }
+
+    fn by_rfc(store: &Store, rfc: &str) -> Message {
+        store.message_by_rfc_id(&AccountId::from("imap:j"), rfc).unwrap().unwrap_or_else(|| panic!("no message {rfc}"))
+    }
+
+    #[test]
+    fn threads_messages_for_providers_without_thread_ids() {
+        let (store, account, provider) = imap_seeded();
+        let outcome = block_on(run_sync(store.clone(), provider.clone(), None, account.clone()));
+        assert_eq!(outcome.state, Some(SyncState::UpToDate));
+        let (a, b, z) = (by_rfc(&store, "<a@x>"), by_rfc(&store, "<b@x>"), by_rfc(&store, "<z@x>"));
+        assert_eq!(a.conversation_id.as_str(), "imap:j:<a@x>");
+        assert_eq!(b.conversation_id, a.conversation_id, "the reply joined its parent");
+        assert_ne!(z.conversation_id, a.conversation_id);
+        assert!(store.messages_for_account(&account.id).unwrap().iter().all(|m| !m.conversation_id.0.is_empty()));
+
+        // Next cycle: a reply to b arrives, and the parent z referenced shows up late.
+        *provider.changes.lock().unwrap() = Some(RemoteChanges {
+            upserts: vec![raw_message("4", "INBOX", "<c@x>", Some("<b@x>"), &["<a@x>", "<b@x>"], 4_000, true), raw_message("5", "INBOX", "<p@x>", None, &[], 500, true)],
+            checkpoint: Some("cursor-2".into()),
+            ..Default::default()
+        });
+        block_on(run_sync(store.clone(), provider.clone(), None, account.clone()));
+        assert_eq!(by_rfc(&store, "<c@x>").conversation_id, a.conversation_id);
+        assert_eq!(by_rfc(&store, "<p@x>").conversation_id, z.conversation_id, "a parent downloaded after its reply joins the reply's conversation");
+        assert_eq!(store.messages_in_conversation(&account.id, &a.conversation_id).unwrap().len(), 3);
+    }
+
+    #[test]
+    fn move_seen_elsewhere_keeps_the_local_message() {
+        let (store, account, provider) = imap_seeded();
+        block_on(run_sync(store.clone(), provider.clone(), None, account.clone()));
+        let before = by_rfc(&store, "<b@x>");
+        assert!(!before.is_starred);
+
+        // Another client starred and archived it: the UID vanished from INBOX and a new one
+        // appeared in Archive. (With a local operation still pending on the message, the
+        // store would keep the local flags and labels until it replays; that rule is tested
+        // in the store crate and is unchanged here.)
+        let mut reappeared = raw_message("9", "Archive", "<b@x>", Some("<a@x>"), &["<a@x>"], 2_000, false);
+        reappeared.is_starred = true;
+        *provider.changes.lock().unwrap() = Some(RemoteChanges { upserts: vec![reappeared], deleted: vec![before.id.clone()], checkpoint: Some("cursor-2".into()), ..Default::default() });
+        block_on(run_sync(store.clone(), provider.clone(), None, account.clone()));
+
+        let all = store.messages_by_rfc_id(&account.id, "<b@x>").unwrap();
+        assert_eq!(all.len(), 1, "no duplicate after the move");
+        let after = &all[0];
+        assert_eq!(after.id, before.id, "the local id survives the move");
+        assert_eq!(after.provider_id.as_ref().unwrap().as_str(), "Archive\u{1f}1\u{1f}9");
+        assert_eq!(after.label_ids.iter().map(|l| l.as_str()).collect::<Vec<_>>(), vec!["imap:j:Archive"]);
+        assert_eq!(after.conversation_id, before.conversation_id);
+        assert!(after.is_starred, "flags come from the server copy");
+        assert_eq!(after.body.text.as_deref(), Some("body 2"), "a header-only reappearance keeps the cached body");
+        assert_eq!(store.message_count(&account.id).unwrap(), 3);
+    }
+
+    #[test]
+    fn header_only_changes_queue_bodies_that_complete_the_same_row() {
+        let (store, account, provider) = imap_seeded();
+        block_on(run_sync(store.clone(), provider.clone(), None, account.clone()));
+        let header = raw_message("7", "INBOX", "<h@x>", None, &[], 7_000, false);
+        let mut full = raw_message("7", "INBOX", "<h@x>", None, &[], 7_000, true);
+        full.id = MessageId::from("imap:j:some-other-uuid");
+        provider.bodies.lock().unwrap().insert("INBOX\u{1f}1\u{1f}7".into(), full);
+        *provider.changes.lock().unwrap() = Some(RemoteChanges { upserts: vec![header.clone()], message_ids: vec![ProviderId("INBOX\u{1f}1\u{1f}7".into())], checkpoint: Some("cursor-2".into()), ..Default::default() });
+        let outcome = block_on(run_sync(store.clone(), provider.clone(), None, account.clone()));
+        assert_eq!(outcome.state, Some(SyncState::UpToDate));
+        assert_eq!(provider.fetched.lock().unwrap().as_slice(), ["INBOX\u{1f}1\u{1f}7"]);
+        let rows = store.messages_by_rfc_id(&account.id, "<h@x>").unwrap();
+        assert_eq!(rows.len(), 1, "the body download updated the header row instead of adding one");
+        assert_eq!(rows[0].id, header.id);
+        assert_eq!(rows[0].body.text.as_deref(), Some("body 7"));
+        assert!(!rows[0].conversation_id.0.is_empty());
+        assert!(backlog(&store, &account.id).is_empty());
+    }
+
+    #[test]
+    fn applied_changes_rewrite_provider_ids() {
+        let (store, account, provider) = imap_seeded();
+        block_on(run_sync(store.clone(), provider.clone(), None, account.clone()));
+        let m = by_rfc(&store, "<z@x>");
+        store.apply_change(&account.id, overlook_store::LocalChange::Archive { message_ids: vec![m.id.clone()] }).unwrap();
+        *provider.applied.lock().unwrap() = AppliedChanges { provider_ids: vec![(m.id.clone(), ProviderId("Archive\u{1f}1\u{1f}3".into()), LabelId::from("imap:j:Archive"))] };
+        let outcome = block_on(run_sync(store.clone(), provider.clone(), None, account.clone()));
+        assert_eq!(outcome.applied, 1);
+        let moved = store.message(&m.id).unwrap().unwrap();
+        assert_eq!(moved.provider_id.as_ref().unwrap().as_str(), "Archive\u{1f}1\u{1f}3");
+        assert_eq!(moved.label_ids.iter().map(|l| l.as_str()).collect::<BTreeSet<_>>(), ["imap:j:Archive"].into_iter().collect());
+        assert_eq!(store.pending_count(&account.id).unwrap(), 0);
     }
 }

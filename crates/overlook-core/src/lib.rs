@@ -4,7 +4,7 @@
 //! the vocabulary the rest of Overlook shares: accounts, labels, folders, messages,
 //! conversations, drafts, pending operations, synchronization status, and appearance
 //! preferences. It also contains pure logic that must behave identically everywhere:
-//! conversation grouping, truthful status wording, HTML sanitization, and theme resolution.
+//! conversation grouping (threading by References for IMAP and POP3), truthful status wording, HTML sanitization, and theme resolution.
 
 pub mod appearance;
 pub mod browser;
@@ -19,7 +19,9 @@ pub mod ops;
 pub mod prefs;
 pub mod prepass;
 pub mod sanitize;
+pub mod servers;
 pub mod status;
+pub mod threading;
 pub mod time;
 pub mod tz;
 
@@ -31,4 +33,5 @@ pub use ids::*;
 pub use model::*;
 pub use ops::*;
 pub use prefs::*;
+pub use servers::*;
 pub use status::*;

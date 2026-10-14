@@ -1,4 +1,5 @@
-//! Builds the RFC 822 message for `users.messages.send`.
+//! Builds RFC 822 messages for sending: the Gmail API's `users.messages.send` takes the same
+//! bytes SMTP does, so every provider shares this builder.
 
 use lettre::message::header::ContentType;
 use lettre::message::{Attachment as MimeAttachment, Mailbox, MultiPart};
@@ -53,6 +54,35 @@ pub fn build_raw(account: &Account, draft: &Draft, in_reply_to: Option<&Message>
     }
     .map_err(|e| e.to_string())?;
     Ok(message.formatted())
+}
+
+/// Rebuilds an RFC 822 message from what is stored locally. Used when the provider cannot
+/// hand back the original bytes.
+pub fn message_to_raw(message: &Message) -> Vec<u8> {
+    let mailbox = |a: &Address| -> Option<Mailbox> { a.email.parse().ok().map(|e| Mailbox::new(a.name.clone(), e)) };
+    let mut builder = MimeMessage::builder().subject(message.subject.clone()).date(std::time::UNIX_EPOCH + std::time::Duration::from_millis(message.date.max(0) as u64));
+    if let Some(from) = mailbox(&message.from) {
+        builder = builder.from(from);
+    }
+    for a in &message.to {
+        if let Some(m) = mailbox(a) {
+            builder = builder.to(m);
+        }
+    }
+    for a in &message.cc {
+        if let Some(m) = mailbox(a) {
+            builder = builder.cc(m);
+        }
+    }
+    if let Some(id) = &message.rfc_message_id {
+        builder = builder.message_id(Some(id.clone()));
+    }
+    let text = message.body.text.clone().unwrap_or_else(|| message.snippet.clone());
+    let built = match &message.body.html {
+        Some(html) => builder.multipart(MultiPart::alternative_plain_html(text, html.clone())),
+        None => builder.header(ContentType::TEXT_PLAIN).body(text),
+    };
+    built.map(|m| m.formatted()).unwrap_or_else(|_| format!("Subject: {}\n\n{}", message.subject, message.body.text.clone().unwrap_or_default()).into_bytes())
 }
 
 #[cfg(test)]
@@ -116,6 +146,7 @@ mod tests {
             attachments: vec![],
             rfc_message_id: Some("<abc@northstar.example>".into()),
             in_reply_to: None,
+            references: Vec::new(),
             category: None,
             is_important: false,
             focus_override: None,

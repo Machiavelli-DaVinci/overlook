@@ -662,9 +662,10 @@ impl MailWindow {
             self.close_composer(window, cx);
         }
         let Some(account) = self.accounts.iter().find(|a| a.id == id).cloned() else { return };
-        if account.provider == ProviderKind::Gmail {
-            if let Err(e) = credentials::delete_tokens(&id) {
-                tracing::warn!("could not remove stored tokens: {e}");
+        if account.provider != ProviderKind::Sample {
+            // Tokens or passwords, whichever kinds this account stored.
+            if let Err(e) = credentials::delete_all_secrets(&id) {
+                tracing::warn!("could not remove stored credentials: {e}");
             }
         }
         if let Err(e) = self.store.delete_account(&id) {

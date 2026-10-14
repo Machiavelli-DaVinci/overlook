@@ -84,6 +84,7 @@ mod tests {
             attachments: vec![],
             rfc_message_id: None,
             in_reply_to: None,
+            references: Vec::new(),
             category: None,
             is_important: false,
             focus_override: None,

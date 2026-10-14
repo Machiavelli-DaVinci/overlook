@@ -3,6 +3,7 @@
 //! Local ids are deterministic (`<account>:<gmail id>`) so repeated downloads update the
 //! same rows and conversations map one to one onto Gmail threads.
 
+use crate::mime::decode_rfc2047;
 use base64::Engine;
 use overlook_core::sanitize::html_to_text;
 use overlook_core::*;
@@ -156,6 +157,7 @@ pub fn message_from_json(account: &Account, v: &Value, labels: &HashMap<String, 
         attachments,
         rfc_message_id: header("Message-ID").or_else(|| header("Message-Id")),
         in_reply_to: header("In-Reply-To"),
+        references: header("References").map(|r| r.split_whitespace().map(str::to_owned).collect()).unwrap_or_default(),
         category: label_ids_raw.iter().find_map(|l| l.strip_prefix("CATEGORY_").map(|c| c.to_ascii_lowercase())),
         is_important: has("IMPORTANT"),
         focus_override: None,
@@ -230,71 +232,6 @@ pub fn base64url_encode(data: &[u8]) -> String {
     base64::engine::general_purpose::URL_SAFE_NO_PAD.encode(data)
 }
 
-/// Decodes RFC 2047 encoded words (`=?UTF-8?B?...?=` / `=?UTF-8?Q?...?=`) in a header.
-pub fn decode_rfc2047(input: &str) -> String {
-    let mut out = String::with_capacity(input.len());
-    let mut rest = input;
-    let mut last_was_word = false;
-    while let Some(start) = rest.find("=?") {
-        let before = &rest[..start];
-        if !(last_was_word && before.trim().is_empty()) {
-            out.push_str(before);
-        }
-        let Some(end_rel) = rest[start + 2..].find("?=") else {
-            out.push_str(&rest[start..]);
-            return out;
-        };
-        let word = &rest[start + 2..start + 2 + end_rel];
-        let mut pieces = word.splitn(3, '?');
-        let (charset, encoding, payload) = (pieces.next().unwrap_or(""), pieces.next().unwrap_or(""), pieces.next().unwrap_or(""));
-        let bytes = match encoding.to_ascii_uppercase().as_str() {
-            "B" => base64::engine::general_purpose::STANDARD.decode(payload).unwrap_or_default(),
-            "Q" => decode_q(payload),
-            _ => payload.as_bytes().to_vec(),
-        };
-        let decoded = if charset.to_ascii_lowercase().starts_with("iso-8859-1") || charset.to_ascii_lowercase() == "latin1" {
-            bytes.iter().map(|&b| b as char).collect()
-        } else {
-            String::from_utf8_lossy(&bytes).into_owned()
-        };
-        out.push_str(&decoded);
-        rest = &rest[start + 2 + end_rel + 2..];
-        last_was_word = true;
-    }
-    out.push_str(rest);
-    out
-}
-
-fn decode_q(payload: &str) -> Vec<u8> {
-    let bytes = payload.as_bytes();
-    let mut out = Vec::with_capacity(bytes.len());
-    let mut i = 0;
-    while i < bytes.len() {
-        match bytes[i] {
-            b'_' => {
-                out.push(b' ');
-                i += 1;
-            }
-            b'=' if i + 2 < bytes.len() + 1 && i + 2 <= bytes.len() - 1 + 1 && i + 2 < bytes.len() + 1 => {
-                if i + 2 < bytes.len() + 1 && i + 3 <= bytes.len() {
-                    if let Ok(v) = u8::from_str_radix(&payload[i + 1..i + 3], 16) {
-                        out.push(v);
-                        i += 3;
-                        continue;
-                    }
-                }
-                out.push(b'=');
-                i += 1;
-            }
-            b => {
-                out.push(b);
-                i += 1;
-            }
-        }
-    }
-    out
-}
-
 #[cfg(test)]
 mod tests {
     use super::*;
@@ -307,14 +244,6 @@ mod tests {
             email: "jason@example.com".into(),
             created_at: 0,
         }
-    }
-
-    #[test]
-    fn decodes_encoded_words() {
-        assert_eq!(decode_rfc2047("=?UTF-8?B?SMOpbGxv?= world"), "Héllo world");
-        assert_eq!(decode_rfc2047("=?utf-8?Q?Caf=C3=A9_time?="), "Café time");
-        assert_eq!(decode_rfc2047("plain"), "plain");
-        assert_eq!(decode_rfc2047("=?UTF-8?B?YQ==?= =?UTF-8?B?Yg==?="), "ab");
     }
 
     #[test]
@@ -342,7 +271,8 @@ mod tests {
                     {"name": "From", "value": "=?UTF-8?B?TWF5YSBDaGVu?= <maya@northstar.example>"},
                     {"name": "To", "value": "Jason <jason@example.com>, alex@studio.example"},
                     {"name": "Subject", "value": "Launch creative"},
-                    {"name": "Message-ID", "value": "<abc@northstar.example>"}
+                    {"name": "Message-ID", "value": "<abc@northstar.example>"},
+                    {"name": "References", "value": "<root@northstar.example>\r\n <mid@northstar.example>"}
                 ],
                 "parts": [
                     {"mimeType": "multipart/alternative", "parts": [
@@ -379,6 +309,7 @@ mod tests {
         assert_eq!(inv.uid, "ev1@google.com");
         assert_eq!(inv.method, "REQUEST");
         assert_eq!(m.rfc_message_id.as_deref(), Some("<abc@northstar.example>"));
+        assert_eq!(m.references, vec!["<root@northstar.example>".to_owned(), "<mid@northstar.example>".to_owned()]);
         assert!(m.is_important);
         assert_eq!(gmail_id(&account().id, m.id.as_str()).as_deref(), Some("18f1"));
         let promo = serde_json::json!({"id": "p1", "threadId": "p1", "labelIds": ["INBOX", "CATEGORY_PROMOTIONS"]});

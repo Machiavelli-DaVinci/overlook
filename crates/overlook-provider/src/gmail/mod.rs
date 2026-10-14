@@ -2,14 +2,13 @@
 //!
 //! - `oauth`: installed-app OAuth 2.0 (PKCE, loopback redirect, token exchange/refresh).
 //! - `api`: a small authenticated REST client with transparent token refresh.
-//! - `mapping`: Gmail JSON to Overlook's domain types.
-//! - `mime`: building RFC 822 messages for `messages.send`.
+//! - `mapping`: Gmail JSON to Overlook's domain types. Outgoing RFC 822 bytes for
+//!   `messages.send` come from the shared `crate::outgoing` builder.
 //! - `provider`: the `MailProvider` implementation.
 
 pub mod api;
 pub mod calendar;
 pub mod mapping;
-pub mod mime;
 pub mod oauth;
 pub mod provider;
 

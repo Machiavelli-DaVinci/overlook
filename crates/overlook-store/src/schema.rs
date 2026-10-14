@@ -2,7 +2,7 @@
 
 use rusqlite::Connection;
 
-const MIGRATIONS: &[&str] = &[V1, V2, V3, V4, V5, V6, V7, V8, V9, V10];
+const MIGRATIONS: &[&str] = &[V1, V2, V3, V4, V5, V6, V7, V8, V9, V10, V11];
 
 pub fn migrate(conn: &Connection) -> rusqlite::Result<()> {
     let current: i64 = conn.query_row("PRAGMA user_version", [], |r| r.get(0))?;
@@ -282,5 +282,37 @@ INSERT INTO people(id, account_id, email, emails_json, name, photo_url, in_addre
     SELECT 'legacy:' || email, account_id, email, '["' || email || '"]', name, photo_url, in_address_book, updated FROM contacts;
 DROP TABLE contacts;
 CREATE INDEX people_email ON people(account_id, email);
+COMMIT;
+"#;
+
+// IMAP/POP3 plumbing: server settings, folder sync cursors, the POP3 download ledger,
+// the References header for threading, and a fast lookup by Message-ID for move
+// reconciliation.
+const V11: &str = r#"
+BEGIN;
+CREATE TABLE account_servers (
+    account_id TEXT PRIMARY KEY REFERENCES accounts(id) ON DELETE CASCADE,
+    servers_json TEXT NOT NULL
+);
+CREATE TABLE imap_folders (
+    account_id TEXT NOT NULL REFERENCES accounts(id) ON DELETE CASCADE,
+    path TEXT NOT NULL,
+    uidvalidity INTEGER,
+    highest_uid INTEGER NOT NULL DEFAULT 0,
+    highest_modseq INTEGER,
+    delimiter TEXT,
+    special_use TEXT,
+    subscribed INTEGER NOT NULL DEFAULT 1,
+    PRIMARY KEY (account_id, path)
+);
+CREATE TABLE pop3_seen (
+    account_id TEXT NOT NULL REFERENCES accounts(id) ON DELETE CASCADE,
+    uidl TEXT NOT NULL,
+    seen_at INTEGER NOT NULL,
+    deleted_on_server INTEGER NOT NULL DEFAULT 0,
+    PRIMARY KEY (account_id, uidl)
+);
+ALTER TABLE messages ADD COLUMN references_json TEXT;
+CREATE INDEX messages_rfc_id ON messages(account_id, rfc_message_id);
 COMMIT;
 "#;

@@ -326,6 +326,10 @@ pub struct Message {
     /// RFC 5322 Message-ID header, when known.
     pub rfc_message_id: Option<String>,
     pub in_reply_to: Option<String>,
+    /// The `References` header as a list of Message-IDs, oldest first. Used to rebuild
+    /// conversations for providers without thread ids (see `threading`).
+    #[serde(default)]
+    pub references: Vec<String>,
     /// Provider category hint (Gmail: personal, social, promotions, updates, forums).
     pub category: Option<String>,
     /// Provider importance hint (Gmail IMPORTANT).
@@ -753,6 +757,7 @@ mod tests {
             attachments: vec![],
             rfc_message_id: None,
             in_reply_to: None,
+            references: Vec::new(),
             category: None,
             is_important: false,
             focus_override: None,

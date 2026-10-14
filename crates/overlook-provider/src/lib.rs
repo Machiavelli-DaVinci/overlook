@@ -7,9 +7,13 @@
 
 pub mod calendar;
 pub mod gmail;
+pub mod mime;
+pub mod outgoing;
 pub mod sample;
+pub mod smtp;
 
 pub use calendar::{CalendarProvider, EventChanges};
+pub use outgoing::{build_raw, message_to_raw};
 
 use overlook_core::*;
 use std::future::Future;
@@ -67,7 +71,20 @@ pub struct RemoteChanges {
     pub upserts: Vec<Message>,
     /// Messages removed at the provider (local ids).
     pub deleted: Vec<MessageId>,
+    /// Provider ids whose bodies still need downloading (new mail reported header-only).
+    /// The sync engine adds them to the persisted backlog.
+    pub message_ids: Vec<ProviderId>,
     pub checkpoint: Option<String>,
+}
+
+/// What changed at the provider as a side effect of applying an operation. `Default` means
+/// "nothing beyond the operation itself", which is what Gmail and Sample report.
+#[derive(Debug, Clone, Default, PartialEq, Eq)]
+pub struct AppliedChanges {
+    /// Messages whose provider id changed, with the folder label they now live in. An IMAP
+    /// move gives a message a new UID in another folder; the store rewrites its identity so
+    /// the next sync recognises it.
+    pub provider_ids: Vec<(MessageId, ProviderId, LabelId)>,
 }
 
 /// Everything a provider needs to submit a draft besides the draft itself.
@@ -116,10 +133,10 @@ pub trait MailProvider: Send + Sync {
         Box::pin(async { Ok(Vec::new()) })
     }
 
-    /// Applies an idempotent mailbox operation.
-    fn apply(&self, account: &Account, op: &PendingOperation, messages: &[Message], labels: &[Label]) -> BoxFuture<'_, Result<(), ProviderError>>;
+    /// Applies an idempotent mailbox operation. The result reports identity changes the
+    /// store must record; most providers return [`AppliedChanges::default`].
+    fn apply(&self, account: &Account, op: &PendingOperation, messages: &[Message], labels: &[Label]) -> BoxFuture<'_, Result<AppliedChanges, ProviderError>>;
 
-    /// Downloads one attachment's bytes.
     /// Whether automatic replies can be read and changed at the provider.
     fn has_settings_access(&self) -> bool {
         false
@@ -200,35 +217,4 @@ pub fn backoff_seconds(attempt: u32) -> u64 {
         4 => 60,
         _ => 300,
     }
-}
-
-/// Rebuilds an RFC 822 message from what is stored locally. Used when the provider cannot
-/// hand back the original bytes.
-pub fn message_to_raw(message: &Message) -> Vec<u8> {
-    use lettre::message::header::ContentType;
-    use lettre::message::{Mailbox, MultiPart};
-    let mailbox = |a: &Address| -> Option<Mailbox> { a.email.parse().ok().map(|e| Mailbox::new(a.name.clone(), e)) };
-    let mut builder = lettre::Message::builder().subject(message.subject.clone()).date(std::time::UNIX_EPOCH + std::time::Duration::from_millis(message.date.max(0) as u64));
-    if let Some(from) = mailbox(&message.from) {
-        builder = builder.from(from);
-    }
-    for a in &message.to {
-        if let Some(m) = mailbox(a) {
-            builder = builder.to(m);
-        }
-    }
-    for a in &message.cc {
-        if let Some(m) = mailbox(a) {
-            builder = builder.cc(m);
-        }
-    }
-    if let Some(id) = &message.rfc_message_id {
-        builder = builder.message_id(Some(id.clone()));
-    }
-    let text = message.body.text.clone().unwrap_or_else(|| message.snippet.clone());
-    let built = match &message.body.html {
-        Some(html) => builder.multipart(MultiPart::alternative_plain_html(text, html.clone())),
-        None => builder.header(ContentType::TEXT_PLAIN).body(text),
-    };
-    built.map(|m| m.formatted()).unwrap_or_else(|_| format!("Subject: {}\n\n{}", message.subject, message.body.text.clone().unwrap_or_default()).into_bytes())
 }

@@ -6,7 +6,7 @@
 //! delivery. Its connection state is controlled by the app (a visible switch) and never
 //! pretends to be a real account: the account is labelled "Sample account".
 
-use crate::{BoxFuture, CalendarProvider, EventChanges, MailProvider, MailboxSnapshot, ProviderError, RemoteChanges, SendContext, SendOutcome, SentReceipt};
+use crate::{AppliedChanges, BoxFuture, CalendarProvider, EventChanges, MailProvider, MailboxSnapshot, ProviderError, RemoteChanges, SendContext, SendOutcome, SentReceipt};
 use overlook_core::time::{days_from_civil, Timestamp};
 use overlook_core::*;
 use std::collections::{BTreeSet, HashSet};
@@ -241,13 +241,13 @@ impl MailProvider for SampleProvider {
         })
     }
 
-    fn apply(&self, _account: &Account, op: &PendingOperation, _messages: &[Message], _labels: &[Label]) -> BoxFuture<'_, Result<(), ProviderError>> {
+    fn apply(&self, _account: &Account, op: &PendingOperation, _messages: &[Message], _labels: &[Label]) -> BoxFuture<'_, Result<AppliedChanges, ProviderError>> {
         let op = op.clone();
         Box::pin(async move {
             self.require_online()?;
             self.sleep().await;
             self.inner.applied_ops.lock().unwrap().push(op.id.clone());
-            Ok(())
+            Ok(AppliedChanges::default())
         })
     }
 
@@ -484,6 +484,7 @@ pub fn sent_message(
         attachments: Vec::new(),
         rfc_message_id: Some(rfc_id.to_owned()),
         in_reply_to: None,
+        references: Vec::new(),
         category: None,
         is_important: false,
         focus_override: None,
@@ -566,6 +567,7 @@ pub fn sample_mailbox(account: &Account, now: Timestamp) -> MailboxSnapshot {
                 .collect(),
             rfc_message_id: None,
             in_reply_to: None,
+            references: Vec::new(),
             category: None,
             is_important: false,
             focus_override: None,
