@@ -503,7 +503,9 @@ impl BrowserBody {
                     }
                 }
                 BrowserEvent::Selection(text) => {
-                    cx.write_to_clipboard(ClipboardItem::new_string(text))
+                    if !text.is_empty() {
+                        cx.write_to_clipboard(ClipboardItem::new_string(text));
+                    }
                 }
                 BrowserEvent::Link(url) => {
                     if allowed_url(&url) {

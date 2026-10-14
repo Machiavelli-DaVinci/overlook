@@ -408,6 +408,20 @@ impl MailWindow {
                                 .child(header).child(messages).child(reply_area))
                     )
                     .vertical_scrollbar(&self.reader_scroll)
+                    // Capture before the inner scroller/editor consumes input.
+                    .child(canvas(|_, _, _| {}, {
+                        let view = cx.entity().downgrade();
+                        move |bounds, _, window, _| {
+                            let view = view.clone();
+                            window.on_mouse_event(move |event: &ScrollWheelEvent, phase, _, cx| {
+                                if phase == DispatchPhase::Capture && bounds.contains(&event.position) {
+                                    let _ = view.update(cx, |this, _| this.cancel_composer_reveal());
+                                }
+                            });
+                        }
+                    }).absolute().inset_0())
+                    .capture_any_mouse_down(cx.listener(|this, _, _, _| this.cancel_composer_reveal()))
+                    .capture_key_down(cx.listener(|this, _, _, _| this.cancel_composer_reveal()))
                     .on_key_down(cx.listener(|this, event: &KeyDownEvent, window, cx| {
                         let stroke = &event.keystroke;
                         if stroke.modifiers.control || stroke.modifiers.platform || stroke.modifiers.alt || stroke.modifiers.shift { return; }
@@ -422,6 +436,7 @@ impl MailWindow {
                             "down" => old.y - px(40.),
                             _ => return,
                         };
+                        this.cancel_composer_reveal();
                         this.reader_scroll.set_offset(point(old.x, next.min(px(0.)).max(-this.reader_scroll.max_offset().y)));
                         window.prevent_default();
                         cx.stop_propagation();

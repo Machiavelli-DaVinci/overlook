@@ -1031,6 +1031,19 @@ impl Actor {
                 {
                     return Ok(());
                 }
+                // Blink needs the held button as well as its buttons mask for
+                // drag selection. A hover-style `button:none` with buttons:1
+                // silently produces no selection, even though presses work.
+                let button = if kind == "mouseMoved" && button == "none" {
+                    match buttons & 31 {
+                        b if b & 1 != 0 => "left",
+                        b if b & 2 != 0 => "right",
+                        b if b & 4 != 0 => "middle",
+                        b if b & 8 != 0 => "back",
+                        b if b & 16 != 0 => "forward",
+                        _ => "none",
+                    }
+                } else { button.as_str() };
                 let viewport_y = self.interaction_y(y)?;
                 self.pointer = (x, viewport_y);
                 if kind == "mousePressed" && button == "left" {
@@ -1682,6 +1695,27 @@ mod tests {
             if text.contains("FATAL") || text.contains("Check failed") { failures.push(format!("fatal/check in {}", entry.path().display())); }
         }
         assert!(failures.is_empty(), "synthetic failures:\n{}", failures.join("\n"));
+    }
+
+    #[test]
+    #[ignore = "runs real sandboxed Chromium with fictional text only"]
+    fn browser_drag_selection_survives_tile_capture() {
+        for (button, top) in [("none", 0), ("left", 0), ("none", 1100), ("left", 1100)] {
+            let mut actor = Actor::start(Arc::new(AtomicBool::new(false)), false).unwrap();
+            actor.load(&format!("<style>body{{margin:0;font:20px monospace}}p{{margin:0}}</style><div style='height:{top}px'></div><p>Synthetic selectable text for copying café 日本語</p>"), false).unwrap();
+            actor.input(Input::Resize(800, 900, 1.), &|_| {}).unwrap();
+            actor.input(Input::VisibleRange(top, top + 512), &|_| {}).unwrap();
+            let y = f64::from(top) + 12.;
+            actor.input(Input::Mouse("mousePressed".into(), 2., y, "left".into(), 1, 1), &|_| {}).unwrap();
+            for x in [40., 80., 120., 160., 200.] {
+                actor.input(Input::Mouse("mouseMoved".into(), x, y, button.into(), 1, 0), &|_| {}).unwrap();
+                actor.refresh_layout(&|_| {}).unwrap();
+                actor.capture_next_tile(&|_| {}).unwrap();
+            }
+            actor.input(Input::Mouse("mouseReleased".into(), 200., y, "left".into(), 0, 1), &|_| {}).unwrap();
+            let selected = actor.cdp.eval("String(getSelection())".into()).unwrap();
+            assert!(selected.as_str().unwrap().contains("Synthetic"), "button={button}: {selected}");
+        }
     }
 
     #[test]

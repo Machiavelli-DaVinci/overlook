@@ -18,7 +18,20 @@ use gpui_kit::base::{h_flex, v_flex};
 use overlook_core::status::draft_state_label;
 use overlook_core::time::{format_clock, now};
 use overlook_core::*;
-use std::time::Duration;
+use std::time::{Duration, Instant};
+
+/// A bounded opening reveal, not a sticky scroll-to-composer mode.
+struct ComposerReveal {
+    until: Instant,
+    focus_to: bool,
+}
+
+/// Reveal the beginning of a field, even when the editor is taller than the pane.
+fn reveal_offset(offset: Pixels, top: Pixels, height: Pixels, viewport: Pixels, max: Pixels) -> Pixels {
+    let bottom = top + height.min(viewport);
+    let delta = if top < px(0.) { -top } else if bottom > viewport { viewport - bottom } else { px(0.) };
+    (offset + delta).min(px(0.)).max(-max)
+}
 
 pub struct Composer {
     pub draft: Draft,
@@ -41,6 +54,7 @@ pub struct Composer {
     pub suggestions: Vec<Address>,
     pub error: Option<String>,
     pub _subscriptions: Vec<Subscription>,
+    reveal: Option<ComposerReveal>,
 }
 
 impl MailWindow {
@@ -92,6 +106,10 @@ impl MailWindow {
         }));
 
         let focus_to = draft.to.is_empty();
+        let reveal = (draft.kind != DraftKind::New && self.selected.is_some()).then(|| ComposerReveal {
+            until: Instant::now() + Duration::from_secs(2),
+            focus_to,
+        });
         let show_cc = !draft.cc.is_empty();
         let show_bcc = !draft.bcc.is_empty();
         self.composer = Some(Composer {
@@ -113,6 +131,7 @@ impl MailWindow {
             suggestions: Vec::new(),
             error: None,
             _subscriptions: subs,
+            reveal,
         });
         if focus_to {
             to.update(cx, |s, cx| s.focus(window, cx));
@@ -120,6 +139,51 @@ impl MailWindow {
             body.update(cx, |s, cx| s.focus(window, cx));
         }
         cx.notify();
+    }
+
+    pub(super) fn cancel_composer_reveal(&mut self) {
+        if let Some(c) = self.composer.as_mut() { c.reveal = None; }
+    }
+
+    /// Measure the actual field in prepaint, then scroll only after the scroll
+    /// handle has its final layout bounds. Re-measure briefly as browser height
+    /// settles. Closing/replacing the draft or user scrolling cancels callbacks.
+    fn composer_reveal_anchor(&self, focus_to: bool, cx: &Context<Self>) -> AnyElement {
+        let Some(c) = self.composer.as_ref() else { return div().into_any_element() };
+        if !c.reveal.as_ref().is_some_and(|r| r.focus_to == focus_to) {
+            return div().into_any_element();
+        }
+        let body = c.body.entity_id();
+        let view = cx.entity().downgrade();
+        let scroll = self.reader_scroll.clone();
+        canvas(move |bounds, window, _| {
+            let measured_offset = scroll.offset().y;
+            let view = view.clone();
+            window.on_next_frame(move |_, cx| {
+                let _ = view.update(cx, |this, cx| {
+                    let Some(c) = this.composer.as_mut().filter(|c| c.body.entity_id() == body) else { return };
+                    let Some(reveal) = c.reveal.as_ref() else { return };
+                    if Instant::now() >= reveal.until {
+                        c.reveal = None;
+                        return;
+                    }
+                    let viewport = this.reader_scroll.bounds();
+                    let offset = this.reader_scroll.offset();
+                    if viewport.size.height > px(0.) {
+                        let top = bounds.top() - viewport.top() + offset.y - measured_offset;
+                        let next = reveal_offset(offset.y, top, bounds.size.height, viewport.size.height, this.reader_scroll.max_offset().y);
+                        if next != offset.y {
+                            this.reader_scroll.set_offset(point(offset.x, next));
+                        }
+                    }
+                    // Drives only the bounded opening interval; never re-focuses
+                    // after the user has chosen another field or control.
+                    // notify schedules the next render. request_animation_frame
+                    // is render-phase-only and would panic in this callback.
+                    cx.notify();
+                });
+            });
+        }, |_, _, _, _| {}).absolute().inset_0().into_any_element()
     }
 
     /// Enter in To/Cc/Bcc/Subject moves focus to the next field, ending in the body.
@@ -469,7 +533,8 @@ impl MailWindow {
                     .border_b_1()
                     .border_color(p.divider)
                     .child(field_label("To"))
-                    .child(div().flex_1().min_w_0().child(Input::new(&c.to).appearance(false)))
+                    .child(div().relative().flex_1().min_w_0().child(Input::new(&c.to).appearance(false))
+                        .child(self.composer_reveal_anchor(true, cx)))
                     .when(!c.show_cc, |d| {
                         d.child(Button::new("show-cc").ghost().xsmall().label("Cc").on_click(cx.listener(|this, _, _w, cx| {
                             if let Some(c) = this.composer.as_mut() { c.show_cc = true; }
@@ -508,11 +573,13 @@ impl MailWindow {
                     .into_any_element()
             } else {
                 div()
+                    .relative()
                     .flex_1()
                     .min_h(px(if inline { 180. } else { 240. }))
                     .px(px(10.))
                     .py(px(6.))
                     .child(Editor::new(&c.body).appearance(false).bordered(false).h_full().font_family("Inter").text_size(px(14.)).line_height(px(22.)))
+                    .child(self.composer_reveal_anchor(false, cx))
                     .into_any_element()
             })
             .children(self.render_quote_block(c, &p, cx))
@@ -892,6 +959,37 @@ impl MailWindow {
             }
         }
         self.save_composer(window, cx);
+    }
+}
+
+#[cfg(test)]
+mod tests {
+    use super::reveal_offset;
+    use gpui_kit::px;
+    // The parent's GPUI glob also exports a `test` proc macro.
+    use std::prelude::v1::test;
+
+    #[test]
+    fn reveal_long_message_editor_precisely() {
+        assert_eq!(reveal_offset(px(0.), px(100_000.), px(180.), px(600.), px(100_500.)), px(-99_580.));
+    }
+
+    #[test]
+    fn reveal_is_minimal_and_clamped() {
+        // Already visible: no scroll. Above: align the field's beginning.
+        assert_eq!(reveal_offset(px(-500.), px(100.), px(180.), px(600.), px(1000.)), px(-500.));
+        assert_eq!(reveal_offset(px(-500.), px(-40.), px(180.), px(600.), px(1000.)), px(-460.));
+        // Tall editors reveal their beginning rather than their footer/quote.
+        assert_eq!(reveal_offset(px(0.), px(800.), px(2000.), px(600.), px(3000.)), px(-800.));
+        assert_eq!(reveal_offset(px(0.), px(800.), px(180.), px(600.), px(300.)), px(-300.));
+    }
+
+    #[test]
+    fn reveal_tracks_height_settling_without_a_fixed_scroll_distance() {
+        let first = reveal_offset(px(0.), px(10_000.), px(180.), px(600.), px(20_000.));
+        // The browser body grows 4,000px after the initial reveal.
+        let settled = reveal_offset(first, px(14_000.) + first, px(180.), px(600.), px(20_000.));
+        assert_eq!(settled, px(-13_580.));
     }
 }
 
