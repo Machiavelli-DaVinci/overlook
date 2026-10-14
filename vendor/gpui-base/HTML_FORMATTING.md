@@ -18,7 +18,9 @@ Supported presentation:
   inline-code chip padding. Left/right/center alignment is supported; justification
   falls back to left alignment.
 - Hard breaks, preserved whitespace, block/list boundaries, explicit `th` header
-  rows, and table footers.
+  rows, and table footers. In normal HTML flow a terminal `br` closes its line:
+  `<div><br></div>` is one blank line, not two. Markdown inline HTML fragments
+  keep their hard breaks; preserved literal whitespace is unchanged.
 
 Deliberate limits (not a browser CSS implementation):
 - Vertical spacing uses native additive padding, not CSS margin collapse. Margins
@@ -33,10 +35,21 @@ Deliberate limits (not a browser CSS implementation):
   absolute 1–7 and relative +/− sizes against the HTML base size.
 - Decoration addition is supported; explicit removal of an ancestor decoration
   is not. No arbitrary selectors, layout CSS, or external stylesheets are evaluated.
+- Images encountered directly between block children use separate native blocks;
+  images inside inline wrappers can participate in text flow.
 - Table header appearance is row-level: a row containing `th` is treated as a
   header row even when mixed with `td`. Rowspan and true spanning layout remain
   unsupported. GFM export still needs its first-row delimiter; HTML rendering and
   table data use the explicit authored header metadata.
+
+HTML paragraphs without source spans use their stable paragraph-state identity
+for retained element state. A shared fallback ID must not be used: it aliases
+mixed-size flow layouts and can replace a short signature line with a later
+multiline paragraph's fragments and height.
+
+Regression tests cover complete request-layout/prepaint/paint frames, multiple
+HTML flows, repeated frames and width changes. On Linux, the signature tests use
+the real platform font system rather than synthetic font metrics.
 
 Test independently with:
 

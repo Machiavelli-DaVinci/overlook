@@ -284,8 +284,6 @@ pub struct MailWindow {
     thread: Vec<Message>,
     expanded: BTreeSet<MessageId>,
     remote_allowed: BTreeSet<MessageId>,
-    /// Messages whose quoted history is expanded.
-    pub(crate) quotes_shown: BTreeSet<MessageId>,
     /// The message whose sender's contact card is open.
     pub(crate) contact_card: Option<MessageId>,
     // Contacts module state.
@@ -302,6 +300,8 @@ pub struct MailWindow {
     pub(crate) pdf_thumbs_pending: HashSet<AttachmentId>,
     /// Inline images already encoded as `data:` URLs, by attachment.
     pub(crate) inline_images: std::cell::RefCell<HashMap<AttachmentId, Option<String>>>,
+    /// Live isolated message documents; released when their reader surface closes.
+    pub(crate) browser_bodies: std::cell::RefCell<HashMap<String, (u64, usize, Entity<crate::browser_body::BrowserBody>)>>,
 
     composer: Option<Composer>,
     appearance: AppearancePreference,
@@ -324,6 +324,7 @@ pub struct MailWindow {
     pub(crate) calendars: Vec<Calendar>,
     pub(crate) cal_selected: Option<EventId>,
     pub(crate) cal_status: SyncState,
+    pub(crate) reader_scroll: ScrollHandle,
     pub(crate) cal_scroll: ScrollHandle,
     pub(crate) cal_scrolled_for: std::cell::Cell<Option<(CalView, i64)>>,
     pub(crate) cal_focus: FocusHandle,
@@ -464,7 +465,6 @@ impl MailWindow {
             thread: Vec::new(),
             expanded: BTreeSet::new(),
             remote_allowed: BTreeSet::new(),
-            quotes_shown: BTreeSet::new(),
             quick_look: None,
             contact_card: None,
             contacts: Vec::new(),
@@ -476,6 +476,7 @@ impl MailWindow {
             pdf_thumbs: HashMap::new(),
             pdf_thumbs_pending: HashSet::new(),
             inline_images: std::cell::RefCell::new(HashMap::new()),
+            browser_bodies: std::cell::RefCell::new(HashMap::new()),
             composer: None,
             appearance,
             density,
@@ -492,6 +493,7 @@ impl MailWindow {
             calendars: Vec::new(),
             cal_selected: None,
             cal_status: SyncState::Offline,
+            reader_scroll: ScrollHandle::new(),
             cal_scroll: ScrollHandle::new(),
             cal_scrolled_for: std::cell::Cell::new(None),
             cal_focus: cx.focus_handle(),
@@ -1454,6 +1456,7 @@ impl MailWindow {
         }
         self.outbox_selected = None;
         self.expanded.clear();
+        self.reader_scroll.set_offset(point(px(0.), px(0.)));
         self.selected = id;
         self.load_thread();
         self.fetch_inline_images(window, cx);
@@ -2449,6 +2452,9 @@ impl MailWindow {
     // ------------------------------------------------------------------ body
 
     fn render_body(&self, cx: &mut Context<Self>) -> AnyElement {
+        if matches!(self.module, Module::Contacts | Module::Calendar) {
+            self.browser_bodies.borrow_mut().clear();
+        }
         if self.module == Module::Contacts {
             return h_resizable("main-contacts")
                 .with_state(&self.panes)

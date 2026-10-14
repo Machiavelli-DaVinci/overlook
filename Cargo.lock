@@ -4753,8 +4753,11 @@ name = "overlook"
 version = "0.4.2"
 dependencies = [
  "anyhow",
+ "base64 0.22.1",
  "directories",
  "gpui-kit",
+ "image",
+ "libc",
  "notify-rust",
  "oo7 0.4.3",
  "overlook-core",
@@ -4768,6 +4771,7 @@ dependencies = [
  "tracing",
  "tracing-subscriber",
  "ureq",
+ "url",
 ]
 
 [[package]]

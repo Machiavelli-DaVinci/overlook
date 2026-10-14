@@ -2425,6 +2425,66 @@ mod tests {
     }
 
     #[test]
+    #[cfg(target_os = "linux")]
+    fn native_html_signature_paints_mixed_space_between_adjacent_lines() {
+        use gpui::TestApp;
+        struct SignatureRoot {
+            text_view: Entity<TextViewState>,
+            width: f32,
+        }
+        impl Render for SignatureRoot {
+            fn render(&mut self, _: &mut Window, _: &mut Context<Self>) -> impl IntoElement {
+                div()
+                    .w(px(self.width))
+                    .text_size(px(15.))
+                    .line_height(px(24.))
+                    .child(TextView::new(&self.text_view))
+            }
+        }
+        let source = "<div style='font-family:Calibri;font-size:10pt'><p style='margin:0;line-height:1.5'><b style='color:rgb(0,82,155)'>Sample Person</b></p><p style='margin:0'><span style='color:rgb(0,82,155)'>ABC</span><span style='font-size:11pt'>&nbsp;</span><span style='color:rgb(0,82,155)'>DEF</span></p><p style='margin:0;color:rgb(0,82,155)'>Sample Company</p><p style='margin:0'><span style='font-size:11pt'>footer<br>one<br>two<br>three<br>four<br>five<br>six<br>seven<br>eight<br>nine</span></p></div>";
+        let platform = gpui_platform::current_platform(true);
+        let mut app = TestApp::with_text_system(platform.text_system());
+        app.update(crate::init);
+        let mut window = app.open_window(|_, cx| SignatureRoot {
+            text_view: cx.new(|cx| TextViewState::html(source, cx)),
+            width: 760.,
+        });
+        window.draw();
+        app.run_until_parked();
+        window.draw();
+        window.update(|root, _, cx| root.text_view.update(cx, |state, cx| state.select_all(cx)));
+        window.draw();
+        for width in [760., 240., 760.] {
+            window.update(|root, _, cx| {
+                root.width = width;
+                cx.notify();
+            });
+            window.draw();
+            app.run_until_parked();
+            window.draw();
+            window.read(|root, cx| {
+                let state = root.text_view.read(cx);
+                let bounds = state.selection_adapter.text_bounds();
+                assert!(state.selected_text().contains("ABC"));
+                assert!(state.selected_text().contains("DEF"));
+                assert_eq!(
+                    bounds.len(),
+                    15,
+                    "each signature/footnote fragment must paint exactly once: {bounds:?}"
+                );
+                assert!(
+                    bounds[1].top() < px(30.) && bounds[4].top() < px(65.),
+                    "the later multiline flow must not inflate the signature: {bounds:?}"
+                );
+                assert!(
+                    bounds.iter().all(|b| b.size.height < px(30.)),
+                    "mixed font fragments must fit their line: {bounds:?}"
+                );
+            });
+        }
+    }
+
+    #[test]
     fn ordered_markdown_list_start_reaches_layout_marker() {
         use crate::text::inline::test_fonts::{WideMonoTextSystem, record_shaped_lines};
         use gpui::TestApp;

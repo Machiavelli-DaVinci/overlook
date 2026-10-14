@@ -2537,7 +2537,7 @@ impl Paragraph {
 
         if self.should_render_inline_flow() {
             return InlineFlow::new(
-                leaf_element_id(fade_key),
+                leaf_element_id(fade_key, &self.state),
                 self.inline_flow_items(fade_key, fades, backgrounds, node_cx, cx),
                 node_cx.link_click_handler.clone(),
             )
@@ -2715,7 +2715,7 @@ impl Paragraph {
         }
 
         div()
-            .id(leaf_element_id(fade_key))
+            .id(leaf_element_id(fade_key, &self.state))
             .children(child_nodes)
             .into_any_element()
     }
@@ -2903,9 +2903,14 @@ fn block_element_id(kind: &'static str, span: Option<Span>, ix: usize) -> Elemen
 /// The element id of a paragraph that needs one: an inline flow, whose
 /// objects are accessibility nodes, or an image, whose element state is its
 /// animation. The leaf key is unique per paragraph in a parsed Markdown
-/// document; the HTML parser records no spans, so its paragraphs share one.
-fn leaf_element_id(fade_key: Option<TextLeafKey>) -> ElementId {
-    fade_key.map_or_else(|| ElementId::from("p"), ElementId::from)
+/// document. HTML has no source spans: use the paragraph's stable state
+/// allocation instead. A shared fallback id aliases retained flow layouts and
+/// image state across unrelated paragraphs, including across nested containers.
+fn leaf_element_id(fade_key: Option<TextLeafKey>, state: &Arc<Mutex<InlineState>>) -> ElementId {
+    fade_key.map_or_else(
+        || ElementId::from(("html-p", Arc::as_ptr(state) as usize)),
+        ElementId::from,
+    )
 }
 
 /// A link's underline: a hairline in a translucent link color, so a run of
@@ -4351,6 +4356,76 @@ mod tests {
             assert!((f32::from(spaced - normal) - 50.).abs() < 1.);
             let tall = height("<div style='font-size:20px;line-height:2'>x<br>x</div>");
             assert!((f32::from(tall) - 80.).abs() < 1.);
+        });
+    }
+
+    #[test]
+    #[cfg(target_os = "linux")]
+    fn html_signature_mixed_size_space_keeps_a_single_line_with_native_fonts() {
+        use crate::text::inline::test_draw::in_prepaint;
+        use gpui::{AvailableSpace, TestApp};
+        let platform = gpui_platform::current_platform(true);
+        let mut app = TestApp::with_text_system(platform.text_system());
+        in_prepaint(&mut app, |window, cx| {
+            let mut height = |html: &str| {
+                let mut node_cx = NodeContext::default();
+                let doc = crate::text::format::html::parse(html, &mut node_cx).unwrap();
+                let mut element =
+                    doc.blocks[0].render_block(NodeRenderOptions::default(), &node_cx, window, cx);
+                element
+                    .layout_as_root(
+                        gpui::size(
+                            AvailableSpace::Definite(px(760.)),
+                            AvailableSpace::MinContent,
+                        ),
+                        window,
+                        cx,
+                    )
+                    .height
+            };
+            let plain =
+                height("<p style='margin:0;font-size:10pt;font-family:Calibri'>ABC DEF</p>");
+            let mixed = height(
+                "<p style='margin:0;font-size:10pt;font-family:Calibri'><span style='font-family:Calibri;color:rgb(0,82,155)'>ABC</span><span style='font-family:Calibri;font-size:11pt'>&nbsp;</span><span style='font-family:Calibri;color:rgb(0,82,155)'>DEF</span></p>",
+            );
+            assert!(
+                (f32::from(mixed - plain)).abs() < 4.,
+                "mixed-size space should not inflate signature line: plain={plain:?}, mixed={mixed:?}"
+            );
+        });
+    }
+
+    #[test]
+    fn html_break_only_block_is_one_blank_line_not_two() {
+        use crate::text::inline::test_draw::in_prepaint;
+        use crate::text::inline::test_fonts::WideMonoTextSystem;
+        use gpui::{AvailableSpace, TestApp};
+        let mut app = TestApp::with_text_system(Arc::new(WideMonoTextSystem));
+        in_prepaint(&mut app, |window, cx| {
+            let mut height = |html: &str| {
+                let mut node_cx = NodeContext::default();
+                let doc = crate::text::format::html::parse(html, &mut node_cx).unwrap();
+                let mut element =
+                    doc.blocks[0].render_block(NodeRenderOptions::default(), &node_cx, window, cx);
+                element
+                    .layout_as_root(AvailableSpace::min_size(), window, cx)
+                    .height
+            };
+            let line = height("<div>x</div>");
+            for (html, lines) in [
+                ("<div><br></div>", 1.),
+                ("<div><br><br></div>", 2.),
+                ("<div>x<br></div>", 1.),
+                ("<div>x<br>x</div>", 2.),
+                ("<div>x</div><div><br></div><div>x</div>", 3.),
+            ] {
+                let actual = height(html);
+                assert!(
+                    (f32::from(actual - line * lines)).abs() < 1.,
+                    "{html}: height={actual:?}, expected {} lines of {line:?}",
+                    lines
+                );
+            }
         });
     }
 

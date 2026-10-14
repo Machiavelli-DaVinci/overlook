@@ -12,7 +12,7 @@ jobs:
     steps:
       - name: Install toolchain and libraries
         run: |
-          pacman -Syu --noconfirm git rustup vulkan-icd-loader libxkbcommon libxkbcommon-x11 libxcb wayland fontconfig freetype2 openssl pkgconf xdg-desktop-portal sudo
+          pacman -Syu --noconfirm git rustup vulkan-icd-loader libxkbcommon libxkbcommon-x11 libxcb wayland fontconfig freetype2 openssl pkgconf xdg-desktop-portal chromium sudo
           rustup default stable
       - uses: actions/checkout@v4
         with:

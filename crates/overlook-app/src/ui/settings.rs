@@ -691,8 +691,8 @@ impl MailWindow {
                 }),
             ))
             .child(setting_row(
-                "Remote images",
-                "Images hosted on the sender’s servers can reveal when you open a message.",
+                "Remote content",
+                "Remote images and fonts can reveal when you open a message. Browser resources use the same consent decision.",
                 choice(&[("Block until I choose", RemoteImages::Block), ("Always show", RemoteImages::Allow)], prefs.remote_images, cx, |this, v, _w, cx| {
                     this.prefs.remote_images = v;
                     this.save_prefs(cx);

@@ -7,18 +7,85 @@ use crate::theme::ActivePalette;
 use gpui_kit::component::button::{Button, ButtonVariants};
 use gpui_kit::component::menu::{DropdownMenu, PopupMenuItem};
 use gpui_kit::component::scroll::ScrollableElement;
-use gpui_kit::component::text::TextView;
+use gpui_kit::base::InteractiveElementExt as _;
 use gpui_kit::component::{Sizable, StyledExt};
 use gpui_kit::prelude::*;
 use gpui_kit::*;
 use gpui_kit::base::{h_flex, v_flex};
-use overlook_core::sanitize::{sanitize_html, text_to_html, RemoteContent};
+use overlook_core::sanitize::text_to_html;
 use overlook_core::time::{format_full, relative_label};
 use overlook_core::*;
 use overlook_store::MailboxView;
 
 impl MailWindow {
+    fn prune_browser_bodies(&self) {
+        let mut active = std::collections::HashSet::new();
+        if let Some(summary) = self.selected_summary() {
+            for m in &self.thread {
+                if m.id == summary.latest_message_id || self.expanded.contains(&m.id) {
+                    active.insert(format!("message-{}", m.id));
+                }
+            }
+        }
+        if let Some(c) = &self.composer {
+            if c.preview { active.insert(format!("preview-{}", c.draft.id)); }
+            if c.quote_shown && c.draft.include_quote { active.insert(format!("quote-{}", c.draft.id)); }
+        }
+        if let Some(id) = &self.outbox_selected { active.insert(format!("outbox-{id}")); }
+        self.browser_bodies.borrow_mut().retain(|key, _| active.contains(key));
+    }
+
+    /// Browser layout starts from stored original HTML, not the lossy native
+    /// presentation projection. Sanitized documents are cached only in memory.
+    pub(super) fn browser_message_body(
+        &self, key: String, source: &str, original: Option<&Message>,
+        allow_remote: bool, dark: bool, cx: &mut Context<Self>,
+    ) -> (AnyElement, usize) {
+        use std::hash::{Hash, Hasher};
+        let mut hash = std::collections::hash_map::DefaultHasher::new();
+        source.hash(&mut hash);
+        allow_remote.hash(&mut hash);
+        dark.hash(&mut hash);
+        if source.as_bytes().windows(4).any(|chunk| chunk.eq_ignore_ascii_case(b"cid:")) {
+            if let Some(m) = original {
+                // Downloading a PDF or other non-inline attachment does not
+                // change browser content and must not reload the message.
+                for part in m.attachments.iter().filter(|part| part.is_inline_image()) {
+                    part.id.hash(&mut hash);
+                    part.local_path.hash(&mut hash);
+                }
+            }
+        }
+        let fingerprint = hash.finish();
+        let mut cache = self.browser_bodies.borrow_mut();
+        if let Some((old, count, view)) = cache.get_mut(&key) {
+            if *old != fingerprint {
+                let mut doc = overlook_core::browser::prepare_document(source);
+                if let Some(m) = original { doc.html = self.resolve_inline_images(m, doc.html); }
+                *count = doc.remote_resources;
+                *old = fingerprint;
+                view.update(cx, |body, cx| body.set_document(doc.html, allow_remote, dark, cx));
+            }
+            return (view.clone().into_any_element(), *count);
+        }
+        if cache.len() >= 4 {
+            return (div().p_3().child("Collapse another message to load this browser-rendered body (four live documents maximum).").into_any_element(), 0);
+        }
+        let mut doc = overlook_core::browser::prepare_document(source);
+        if let Some(m) = original { doc.html = self.resolve_inline_images(m, doc.html); }
+        let count = doc.remote_resources;
+        let native_scroll = (key.starts_with("message-") || key.starts_with("outbox-")).then(|| self.reader_scroll.clone());
+        let view = cx.new(|cx| {
+            let mut body = crate::browser_body::BrowserBody::new(doc.html, allow_remote, dark, cx);
+            if let Some(scroll) = native_scroll { body.attach_native_scroll(scroll); }
+            body
+        });
+        cache.insert(key, (fingerprint, count, view.clone()));
+        (view.into_any_element(), count)
+    }
+
     pub(super) fn render_reader(&self, cx: &mut Context<Self>) -> impl IntoElement {
+        self.prune_browser_bodies();
         let p = *cx.palette();
         let container = v_flex().size_full().bg(p.message_surface()).min_w_0();
 
@@ -29,7 +96,13 @@ impl MailWindow {
         }
 
         if let Some(item) = self.outbox_selected.as_ref().and_then(|id| self.outbox.iter().find(|d| &d.id == id)) {
-            return container.child(self.render_outbox_item(item, cx)).into_any_element();
+            return container.child(
+                v_flex().id("outbox-reader-scroll").relative().flex_1().min_h_0().overflow_hidden()
+                    .child(v_flex().id("outbox-scroll-area").size_full().overflow_y_scroll()
+                        .lock_scroll_axis().track_scroll(&self.reader_scroll)
+                        .child(v_flex().w_full().flex_none().h_auto().min_h_full().child(self.render_outbox_item(item, cx))))
+                    .vertical_scrollbar(&self.reader_scroll)
+            ).into_any_element();
         }
 
         let Some(summary) = self.selected_summary() else {
@@ -324,12 +397,36 @@ impl MailWindow {
             .child(
                 v_flex()
                     .id("reader-scroll")
+                    .relative()
                     .flex_1()
                     .min_h_0()
-                    .child(header)
-                    .child(messages)
-                    .child(reply_area)
-                    .overflow_y_scrollbar(),
+                    .overflow_hidden()
+                    .child(
+                        v_flex().id("reader-scroll-area").size_full()
+                            .overflow_y_scroll().lock_scroll_axis().track_scroll(&self.reader_scroll)
+                            .child(v_flex().w_full().flex_none().h_auto().min_h_full()
+                                .child(header).child(messages).child(reply_area))
+                    )
+                    .vertical_scrollbar(&self.reader_scroll)
+                    .on_key_down(cx.listener(|this, event: &KeyDownEvent, window, cx| {
+                        let stroke = &event.keystroke;
+                        if stroke.modifiers.control || stroke.modifiers.platform || stroke.modifiers.alt || stroke.modifiers.shift { return; }
+                        let old = this.reader_scroll.offset();
+                        let page = this.reader_scroll.bounds().size.height * 0.9;
+                        let next = match stroke.key.as_str() {
+                            "pageup" => old.y + page,
+                            "pagedown" => old.y - page,
+                            "home" => px(0.),
+                            "end" => -this.reader_scroll.max_offset().y,
+                            "up" => old.y + px(40.),
+                            "down" => old.y - px(40.),
+                            _ => return,
+                        };
+                        this.reader_scroll.set_offset(point(old.x, next.min(px(0.)).max(-this.reader_scroll.max_offset().y)));
+                        window.prevent_default();
+                        cx.stop_propagation();
+                        cx.notify();
+                    })),
             )
             .into_any_element()
     }
@@ -374,25 +471,14 @@ impl MailWindow {
         let who = if m.is_outgoing { Address::named("You", &self.account.email) } else { m.from.clone() };
         let owner = self.owner();
         let allow_remote = self.remote_allowed.contains(&m.id) || self.prefs.remote_images == RemoteImages::Allow;
-        let policy = if allow_remote { RemoteContent::Allowed } else { RemoteContent::Blocked };
         let html = match (&m.body.html, &m.body.text) {
             (Some(h), _) => h.clone(),
             (None, Some(t)) => text_to_html(t),
             (None, None) => String::new(),
         };
-        let sanitized = sanitize_html(&html, policy);
-        let dark = p.is_dark();
-        // Quoted history is folded away only when it repeats a message already in this
-        // conversation; otherwise it is part of what the sender wants read.
-        let (body, quoted) = match sanitized.quoted.map(|q| q.trim_start_matches("<hr>").to_owned()) {
-            Some(q) if self.quote_repeats_thread(&q, m) => (sanitized.html, Some(q)),
-            Some(q) => (format!("{}<hr>{}", sanitized.html, q), None),
-            None => (sanitized.html, None),
-        };
-        let body_html = self.resolve_inline_images(m, overlook_core::sanitize::adapt_colors(&body, dark));
-        let quoted_html = quoted.map(|q| self.resolve_inline_images(m, overlook_core::sanitize::adapt_colors(&q, dark)));
-        let quote_shown = self.quotes_shown.contains(&m.id);
-        let quote_id = m.id.clone();
+        let (body_view, remote_resources) = self.browser_message_body(
+            format!("message-{}", m.id), &html, Some(m), allow_remote, p.is_dark(), cx,
+        );
         let to_line = {
             let names = |list: &[Address]| -> Vec<String> {
                 list.iter().map(|a| if a.email.eq_ignore_ascii_case(&self.account.email) { "me".to_owned() } else { a.display_name() }).collect()
@@ -505,7 +591,7 @@ impl MailWindow {
                 )
             })
             .children(m.invitation.as_ref().map(|inv| self.render_invitation_card(inv, cx)))
-            .when(sanitized.blocked_remote > 0, |d| {
+            .when(!allow_remote && remote_resources > 0, |d| {
                 d.child(
                     h_flex()
                         .items_center()
@@ -518,16 +604,16 @@ impl MailWindow {
                         .text_color(p.muted)
                         .child(icon("image-off").size(px(14.)).text_color(p.muted))
                         .child(format!(
-                            "{} remote image{} blocked to protect your privacy.",
-                            sanitized.blocked_remote,
-                            if sanitized.blocked_remote == 1 { "" } else { "s" }
+                            "{} remote resource{} blocked to protect your privacy.",
+                            remote_resources,
+                            if remote_resources == 1 { "" } else { "s" }
                         ))
                         .child(div().flex_1())
                         .child(
                             Button::new(SharedString::from(format!("allow-remote-{}", m.id)))
                                 .ghost()
                                 .xsmall()
-                                .label("Show images")
+                                .label("Load remote content")
                                 .on_click(cx.listener(move |this, _, _window, cx| {
                                     this.remote_allowed.insert(mid.clone());
                                     cx.notify();
@@ -535,51 +621,7 @@ impl MailWindow {
                         ),
                 )
             })
-            .child(
-                div()
-                    .text_size(px(15.))
-                    .line_height(px(24.))
-                    .max_w(px(760.))
-                    .child(
-                        TextView::html(SharedString::from(format!("body-{}-{}", m.id, allow_remote)), body_html)
-                            .selectable(true),
-                    ),
-            )
-            .when_some(quoted_html, |d, quoted| {
-                d.child(
-                    v_flex()
-                        .gap(px(8.))
-                        .child(
-                            div().child(
-                                Button::new(SharedString::from(format!("quote-{}", m.id)))
-                                    .ghost()
-                                    .xsmall()
-                                    .icon(icon("ellipsis").size(px(14.)))
-                                    .label(if quote_shown { "Hide quoted text" } else { "Show quoted text" })
-                                    .tooltip("The earlier messages this one replies to")
-                                    .on_click(cx.listener(move |this, _, _w, cx| {
-                                        if !this.quotes_shown.remove(&quote_id) {
-                                            this.quotes_shown.insert(quote_id.clone());
-                                        }
-                                        cx.notify();
-                                    })),
-                            ),
-                        )
-                        .when(quote_shown, |d| {
-                            d.child(
-                                div()
-                                    .pl(px(14.))
-                                    .border_l_2()
-                                    .border_color(p.divider)
-                                    .text_size(px(15.))
-                                    .line_height(px(24.))
-                                    .max_w(px(760.))
-                                    .text_color(p.muted)
-                                    .child(TextView::html(SharedString::from(format!("quoted-{}-{}", m.id, allow_remote)), quoted).selectable(true)),
-                            )
-                        }),
-                )
-            })
+            .child(div().w_full().min_w_0().child(body_view))
             .when(!m.attachments.is_empty(), |d| {
                 d.child(
                     v_flex()
@@ -615,7 +657,12 @@ impl MailWindow {
                 continue;
             }
             if let Some(url) = self.inline_image_data_url(a) {
-                out = out.replace(&needle, &format!("src=\"{url}\""));
+                let replacement = format!("src=\"{url}\"");
+                let count = out.matches(&needle).count();
+                let growth = replacement.len().saturating_sub(needle.len()).checked_mul(count);
+                if growth.and_then(|n| out.len().checked_add(n)).is_some_and(|n| n <= 8 * 1024 * 1024) {
+                    out = out.replace(&needle, &replacement);
+                }
             }
         }
         out
@@ -626,32 +673,21 @@ impl MailWindow {
             return cached.clone();
         }
         let path = a.local_path.as_deref().map(std::path::PathBuf::from).filter(|p| p.exists())?;
-        let bytes = std::fs::read(&path).ok()?;
+        use std::io::Read;
+        const MAX_INLINE_BYTES: usize = 3 * 1024 * 1024;
+        let file = std::fs::File::open(&path).ok()?;
+        if file.metadata().ok()?.len() > MAX_INLINE_BYTES as u64 { return None; }
+        let mut bytes = Vec::new();
+        file.take((MAX_INLINE_BYTES + 1) as u64).read_to_end(&mut bytes).ok()?;
+        if bytes.len() > MAX_INLINE_BYTES { return None; }
         let mime = a.mime_type.split(';').next().unwrap_or("image/png").trim();
         let url = format!("data:{mime};base64,{}", base64_encode(&bytes));
-        self.inline_images.borrow_mut().insert(a.id.clone(), Some(url.clone()));
+        let mut cache = self.inline_images.borrow_mut();
+        if cache.values().filter_map(|s| s.as_ref()).map(String::len).sum::<usize>() + url.len() > 16 * 1024 * 1024 {
+            cache.clear();
+        }
+        cache.insert(a.id.clone(), Some(url.clone()));
         Some(url)
-    }
-
-    /// Whether quoted HTML repeats the text of an earlier message in the open conversation.
-    fn quote_repeats_thread(&self, quoted_html: &str, m: &Message) -> bool {
-        fn normalized(text: &str) -> String {
-            text.split_whitespace().collect::<Vec<_>>().join(" ").to_lowercase()
-        }
-        let quoted = normalized(&overlook_core::sanitize::html_to_text(quoted_html));
-        if quoted.len() < 40 {
-            return false;
-        }
-        self.thread.iter().filter(|other| other.id != m.id && other.date <= m.date).any(|other| {
-            let text = other.body.text.clone().or_else(|| other.body.html.as_deref().map(overlook_core::sanitize::html_to_text)).unwrap_or_default();
-            let text = normalized(&text);
-            if text.len() < 40 {
-                return false;
-            }
-            // Only fold an exact redundant body. A matching prefix is insufficient:
-            // inline answers, annotations, and signatures must not disappear with history.
-            quoted == text
-        })
     }
 
     /// Who a sender is: address book entry or correspondent, with the two things one does
@@ -957,11 +993,8 @@ impl MailWindow {
                     .child({
                         let source = d.in_reply_to.as_ref().and_then(|id| self.store.message(id).ok().flatten());
                         let allow_remote = self.prefs.remote_images == RemoteImages::Allow || source.as_ref().is_some_and(|m| self.remote_allowed.contains(&m.id));
-                        let policy = if allow_remote { RemoteContent::Allowed } else { RemoteContent::Blocked };
-                        let html = overlook_core::compose::outgoing_preview(d, source.as_ref(), policy);
-                        let html = overlook_core::sanitize::adapt_colors(&html, p.is_dark());
-                        let html = match source.as_ref() { Some(m) => self.resolve_inline_images(m, html), None => html };
-                        TextView::html(SharedString::from(format!("outbox-{}", d.id)), html).selectable(true)
+                        let html = overlook_core::compose::outgoing_bodies(d, source.as_ref()).html;
+                        self.browser_message_body(format!("outbox-{}", d.id), &html, source.as_ref(), allow_remote, p.is_dark(), cx).0
                     }),
             )
     }

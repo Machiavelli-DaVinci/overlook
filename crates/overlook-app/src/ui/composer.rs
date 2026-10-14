@@ -8,7 +8,6 @@ use gpui_kit::component::button::{Button, ButtonVariants};
 use super::mail_highlight::{list_marker_len, MailHighlighter, LANGUAGE};
 use gpui_kit::component::input::{Editor, EditorState, Input, InputEvent, InputHighlighter, InputState};
 use gpui_kit::component::menu::{DropdownMenu, PopupMenuItem};
-use gpui_kit::component::text::TextView;
 use gpui_kit::component::{Disableable, Sizable, WindowExt};
 use overlook_core::compose::render_markdown;
 use std::rc::Rc;
@@ -500,10 +499,11 @@ impl MailWindow {
                     .text_size(px(15.))
                     .line_height(px(24.))
                     .child({
-                        let policy = if self.prefs.remote_images == RemoteImages::Allow { overlook_core::sanitize::RemoteContent::Allowed } else { overlook_core::sanitize::RemoteContent::Blocked };
-                        let html = overlook_core::compose::outgoing_preview(&c.draft, None, policy);
-                        let html = overlook_core::sanitize::adapt_colors(&html, p.is_dark());
-                        TextView::html(SharedString::from(format!("preview-{}", c.draft.id)), html).selectable(true)
+                        let html = overlook_core::compose::outgoing_bodies(&c.draft, None).html;
+                        self.browser_message_body(
+                            format!("preview-{}", c.draft.id), &html, None,
+                            self.prefs.remote_images == RemoteImages::Allow, p.is_dark(), cx,
+                        ).0
                     })
                     .into_any_element()
             } else {
@@ -634,9 +634,8 @@ impl MailWindow {
         let shown = c.quote_shown;
         let html = shown.then(|| {
             let allow_remote = self.remote_allowed.contains(&source.id) || self.prefs.remote_images == RemoteImages::Allow;
-            let policy = if allow_remote { overlook_core::sanitize::RemoteContent::Allowed } else { overlook_core::sanitize::RemoteContent::Blocked };
-            let safe = overlook_core::compose::quote_preview(&c.draft, source, policy);
-            self.resolve_inline_images(source, overlook_core::sanitize::adapt_colors(&safe, p.is_dark()))
+            let safe = overlook_core::compose::quote_preview(&c.draft, source, overlook_core::sanitize::RemoteContent::Allowed);
+            self.browser_message_body(format!("quote-{}", c.draft.id), &safe, Some(source), allow_remote, p.is_dark(), cx).0
         });
         Some(
             v_flex()
@@ -676,9 +675,7 @@ impl MailWindow {
                             .text_size(px(14.))
                             .line_height(px(22.))
                             .text_color(p.muted)
-                            .max_h(px(360.))
-                            .overflow_hidden()
-                            .child(TextView::html(SharedString::from(format!("quote-{}", c.draft.id)), html).selectable(true)),
+                            .child(html),
                     )
                 }),
         )

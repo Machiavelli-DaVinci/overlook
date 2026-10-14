@@ -34,8 +34,10 @@ and you can read, search, write, and file mail with no connection at all.
   pane you can move below the list, comfortable and compact density, resizable panes that remember their size.
 - **Focused Inbox.** The Inbox splits into Focused and Other from Gmail's own hints, who you write to, and
   your choices: *Move to Other*, or *Always move messages from this sender*. Local, private, and reversible.
-- **Reading that respects you.** Received HTML is sanitized before it is rendered; scripts never run and remote
-  images are blocked until you ask. Data tables keep their columns. Image and PDF attachments show thumbnails
+- **Reading that respects you.** Received HTML uses isolated Chromium layout inside the native shell;
+  scripts never run and remote images/fonts are blocked until you ask. Authored cards, panels and tables
+  keep their browser layout, with smooth native scrolling and no blank flash during reflow.
+  If the renderer fails, available content stays visible with a Retry action. Image and PDF attachments show thumbnails
   and open in a quick look (PDFs through poppler's `pdftoppm`, which Omarchy ships); everything else opens with
   your system apps. Every message has Reply, Forward, Print, Save
   as .eml and View source, and long threads expand or collapse in one click.
@@ -60,7 +62,7 @@ and you can read, search, write, and file mail with no connection at all.
   to, searchable, with a detail card, add, edit and delete that sync back to Google, and one click to write to
   someone or find everything they sent. Changes made offline wait in the same queue as mail.
 - **Settings that do things.** Accounts and signatures, notifications, sync interval, mark-as-read timing,
-  remote images, download size, working hours, reminders, automatic replies (out of office), and more. Every
+  remote content, download size, working hours, reminders, automatic replies (out of office), and more. Every
   control takes effect immediately.
 
 <p align="center">
@@ -88,6 +90,10 @@ and you can read, search, write, and file mail with no connection at all.
 </table>
 
 ## Install
+
+Message bodies require sandboxed Chromium. The Arch package installs this dependency;
+other systems need a compatible Chromium on PATH (or `OVERLOOK_BROWSER_BIN` pointing
+to its executable). See [message rendering and isolation](docs/message-formatting.md).
 
 **Arch Linux and Omarchy.** One command:
 
@@ -174,7 +180,8 @@ has Undo.
 ## Built with
 
 Rust and [GPUI](https://gpui.rs), Zed's GPU-accelerated UI framework, through [GPUI Kit](https://gpui-kit.com).
-SQLite with FTS5 for local storage and search. No web view, no Electron.
+SQLite with FTS5 for local storage and search. A native shell, no Electron; sandboxed Chromium renders
+interactive message bodies through private pipes, without an exposed debugging port.
 See the [message formatting review](docs/message-formatting.md) for rendering policy, regression coverage,
 and native HTML layout limitations.
 
@@ -188,14 +195,15 @@ packaging/                 desktop entry, AppStream metadata, PKGBUILD, Flatpak 
 llm-docs/                  product plan, brand system, architecture and implementation notes
 ```
 
-Run the tests with `cargo test --workspace`. Received HTML is rendered natively after sanitization; complex
-newsletter layouts are flattened rather than reproduced pixel for pixel, a deliberate trade for having no
-browser engine in a mail client.
+Run the tests with `cargo test --workspace`. Received HTML is sanitized without flattening authored
+layouts, then rendered by isolated Chromium. Scripts are disabled and remote images, stylesheets and
+fonts are consent-gated. Originals remain unchanged. Printing and outgoing quotes still use the safe
+native subset; see [rendering policy and limits](docs/message-formatting.md).
 
 ## Status
 
 Early daily use by its author on Omarchy (Hyprland, Wayland). Gmail accounts work end to end; IMAP/SMTP and
-POP3 are planned next, as are attachment previews and a Flatpak build. GNOME, KDE,
+POP3 and a Flatpak build are planned next. GNOME, KDE,
 and screen-reader testing are still to be done. Open an issue with what you did, what you saw, and what you
 expected.
 

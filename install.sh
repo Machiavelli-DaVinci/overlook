@@ -185,6 +185,9 @@ else
     note "$DISTRO: building from source into $P (no administrator access needed)."
   fi
 fi
+if (( ! IS_ARCH )) && ! command -v chromium >/dev/null 2>&1 && ! command -v chromium-browser >/dev/null 2>&1 && ! command -v google-chrome >/dev/null 2>&1; then
+  note "Message bodies require Chromium (installed separately on non-Arch systems). Set OVERLOOK_BROWSER_BIN to a compatible executable if it is not on PATH."
+fi
 (( DRY )) && note "Dry run: nothing will be changed."
 confirm "Continue?" || { note "Nothing changed."; exit 0; }
 

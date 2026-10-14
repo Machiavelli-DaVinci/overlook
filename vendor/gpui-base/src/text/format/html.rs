@@ -58,6 +58,23 @@ const BLOCK_ELEMENTS: [&str; 35] = [
 
 /// Parse HTML into AST Node.
 pub(crate) fn parse(source: &str, cx: &mut NodeContext) -> Result<ParsedDocument, SharedString> {
+    parse_with_context(source, cx, false)
+}
+
+/// Markdown's inline HTML is not a complete line box: a br here must keep
+/// breaking the surrounding Markdown text, even at the end of this fragment.
+pub(crate) fn parse_inline(
+    source: &str,
+    cx: &mut NodeContext,
+) -> Result<ParsedDocument, SharedString> {
+    parse_with_context(source, cx, true)
+}
+
+fn parse_with_context(
+    source: &str,
+    cx: &mut NodeContext,
+    inline: bool,
+) -> Result<ParsedDocument, SharedString> {
     let opts = ParseOpts {
         ..Default::default()
     };
@@ -77,7 +94,10 @@ pub(crate) fn parse(source: &str, cx: &mut NodeContext) -> Result<ParsedDocument
     // NOTE: The outer paragraph is not used.
     let node: BlockNode =
         parse_node(&dom.document, &mut paragraph, cx).unwrap_or(BlockNode::Unknown);
-    let node = node.compact();
+    let mut node = node.compact();
+    if !inline {
+        close_html_line_boxes(&mut node);
+    }
 
     Ok(ParsedDocument {
         source: source.to_string().into(),
@@ -85,6 +105,82 @@ pub(crate) fn parse(source: &str, cx: &mut NodeContext) -> Result<ParsedDocument
     })
 }
 
+/// A terminal HTML br closes its current line, without creating another empty
+/// line box. A break-only block still has one line; two brs have two. Keep
+/// Markdown fragments and preserved literal whitespace out of this adjustment.
+fn close_html_line_boxes(block: &mut BlockNode) {
+    fn close(paragraph: &mut Paragraph) {
+        if paragraph.html_style.as_ref().is_some_and(|s| s.preserve) {
+            return;
+        }
+        let Some(ix) = paragraph
+            .children
+            .iter()
+            .rposition(|n| !n.text.is_empty() || n.image.is_some())
+        else {
+            return;
+        };
+        let node = &paragraph.children[ix];
+        if node.image.is_some() || !node.text.ends_with('\n') {
+            return;
+        }
+        let len = node.text.len() - 1;
+        // push_str gives br its own inline node. Only supply a blank-line
+        // strut when there is no preceding content on that line; otherwise
+        // x<br> would acquire a phantom space (and an image could wrap).
+        let mut line_has_content = false;
+        for previous in paragraph.children[..ix].iter().rev() {
+            if previous.image.is_some() {
+                line_has_content = true;
+                break;
+            }
+            let tail = previous.text.rsplit('\n').next().unwrap_or("");
+            if tail.chars().any(|ch| ch != ' ') {
+                line_has_content = true;
+                break;
+            }
+            if previous.text.contains('\n') {
+                break;
+            }
+        }
+        let blank_line = len == 0 && !line_has_content;
+        let node = &mut paragraph.children[ix];
+        node.text = if blank_line {
+            "\u{a0}".into()
+        } else {
+            node.text[..len].to_owned().into()
+        };
+        for (range, _) in &mut node.marks {
+            if blank_line && range.start < range.end {
+                *range = 0..node.text.len();
+            } else {
+                range.start = range.start.min(len);
+                range.end = range.end.min(len);
+            }
+        }
+    }
+    match block {
+        BlockNode::Paragraph(p) | BlockNode::Heading { children: p, .. } => close(p),
+        BlockNode::Root { children, .. }
+        | BlockNode::Blockquote { children, .. }
+        | BlockNode::List { children, .. }
+        | BlockNode::ListItem { children, .. } => {
+            for child in children {
+                close_html_line_boxes(child);
+            }
+        }
+        BlockNode::Table(table) => {
+            for row in &mut table.children {
+                for cell in &mut row.children {
+                    close(&mut cell.children);
+                }
+            }
+        }
+        _ => {}
+    }
+}
+
+#[cfg(test)]
 fn cleanup_html(source: &str) -> Vec<u8> {
     let mut w = std::io::Cursor::new(vec![]);
     let mut r = std::io::Cursor::new(source);
@@ -1029,6 +1125,36 @@ mod tests {
         assert_eq!(mark.font_weight, Some(gpui::FontWeight::NORMAL));
         assert_eq!(mark.font_style, Some(gpui::FontStyle::Italic));
         assert_eq!(mark.font_family.as_deref(), Some("Example"));
+    }
+
+    #[test]
+    fn terminal_break_closes_content_without_inserting_a_space() {
+        for source in ["<div>x<br></div>", "<div><span>é中</span><br></div>"] {
+            let doc = super::parse(source, &mut NodeContext::default()).unwrap();
+            let expected = if source.contains('é') {
+                "é中\n"
+            } else {
+                "x\n"
+            };
+            assert_eq!(doc.blocks[0].text(), expected);
+        }
+        let doc = super::parse(
+            "<div><span>x<img src='https://example.test/image.png'><br></span></div>",
+            &mut NodeContext::default(),
+        )
+        .unwrap();
+        let mut ps = vec![];
+        paragraphs(&doc.blocks[0], &mut ps);
+        assert!(
+            ps.iter()
+                .flat_map(|p| &p.children)
+                .any(|n| n.image.is_some())
+        );
+        assert!(
+            ps.iter()
+                .flat_map(|p| &p.children)
+                .all(|n| !n.text.contains('\u{a0}'))
+        );
     }
 
     #[test]

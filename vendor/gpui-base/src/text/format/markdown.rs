@@ -891,7 +891,7 @@ fn parse_paragraph(
                     .marks(vec![(0..text.len(), TextMark::default())]),
             );
         }
-        Node::Html(val) => match super::html::parse(&val.value, cx) {
+        Node::Html(val) => match super::html::parse_inline(&val.value, cx) {
             Ok(el) => {
                 if let Some(inline_text) =
                     append_inline_html_blocks(paragraph, Arc::unwrap_or_clone(el.blocks))

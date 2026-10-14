@@ -7,6 +7,7 @@
 //! conversation grouping, truthful status wording, HTML sanitization, and theme resolution.
 
 pub mod appearance;
+pub mod browser;
 pub mod calendar;
 pub mod compose;
 pub mod focus;
@@ -23,6 +24,7 @@ pub mod time;
 pub mod tz;
 
 pub use appearance::{AppearancePreference, ResolvedTheme, SystemAppearance};
+pub use browser::{prepare_document, BrowserDocument};
 pub use calendar::*;
 pub use focus::{classify_focus, FocusRule, FocusTab};
 pub use ids::*;

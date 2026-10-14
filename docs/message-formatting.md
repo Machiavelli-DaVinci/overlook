@@ -1,104 +1,129 @@
-# Message formatting: policy, review, and regression coverage
+# Message rendering and isolation
 
-## Why this is a pipeline problem
+## Browser message surface
 
-Email HTML is not ordinary Markdown. A `<div>` line, a zero-margin Outlook paragraph,
-wrapping text, an explicit `<br>`, and a genuinely separate paragraph must not all
-receive the same paragraph gap. Formatting must survive both sanitization and native
-layout; accepting a CSS declaration without rendering it is not sufficient.
+Received bodies now use an isolated, live Chromium document inside the native GPUI
+shell. Chromium performs the actual HTML/CSS layout and supplies bounded 512-CSS-pixel
+PNG tiles, decoded off the UI thread. The native reading pane owns scrolling and
+its draggable scrollbar: ordinary wheel/trackpad motion translates cached textures,
+without waiting for a browser frame. Uncached regions are captured incrementally;
+large jumps can briefly show an unpainted region while its tiles arrive. Twelve tiles
+per view, one active decode and revision guards bound storage and reject stale work.
+Same-message reflow retains painted tiles until their replacements arrive, rather
+than blanking the body. Consent/theme changes clear previous pixels; non-inline
+attachment downloads do not reload the browser document.
+A 2x browser backing surface preserves sharp text on supported HiDPI displays.
+GPUI forwards document-relative pointer, selection and keyboard input to the live DOM;
+Chromium root scrollbars are hidden. This is not a
+static screenshot substitute or an external browser window. Cards, rounded links,
+background panels, stylesheet cascade, responsive rules, tables and typography
+are rendered by the browser rather than approximated by native text layout.
 
-The review traced Gmail MIME decoding, original body storage, structural normalization,
-security sanitization, native HTML parsing/layout, quote folding, outgoing alternatives,
-composer quote previews, and printing. A read-only structural sample of 250 recent local
-messages found 203 with tables, 165 with stylesheets, and 139 with media queries. Only
-aggregate structure counts were retained; real message text is not committed as fixtures.
+`overlook-core::browser::prepare_document` starts from stored original HTML, not
+from the native sanitizer's lossy presentation projection. It preserves safe
+inline/head CSS and actual HTML/body root attributes, while removing active
+markup, event handlers, forms, embedded frames, metadata, base URLs, external
+stylesheet links and unsafe resource schemes. Original HTML in SQLite is never
+rewritten. Authored layout containers and full visible history remain intact;
+the old native quote splitting/folding is not applied to received browser bodies.
+CID image sources are normalized, then resolved from downloaded local attachment
+parts into data URLs. Unresolved CIDs cannot fetch through the browser.
 
-Original received HTML remains unchanged in SQLite. Changes to display policy do not
-require redownloading messages and must not rewrite stored originals or outgoing content
-when a user changes the app theme.
+Reader, authored composer preview, outgoing quote preview and outbox use this
+surface. Outgoing quote serialization still deliberately uses the existing safe
+CSS subset: its preview shows that serialized quote, not an untouched original.
+Native composer editing remains native. Printing still uses the separate safe
+printing projection; it is not yet guaranteed to match the new inline surface.
 
-## Design rules
+## Defense in depth
 
-1. **Security and presentation are separate concerns.** Remove executable markup,
-   handlers, unsafe URL schemes, hidden tracking/preheader content, and unapproved CSS.
-   Preserve explicitly supported, bounded presentation rather than stripping all styling.
-2. **Use one safe presentation contract.** Typography, block spacing, alignment, and
-   whitespace need matching sanitizer and renderer support. Reject unsupported resource
-   functions, positioning, imports, and arbitrary CSS; do not enable raw stylesheets.
-3. **Keep structural distinctions.** HTML flow lines and authored zero margins are not
-   Markdown paragraphs. Preserve hard breaks and intentional blank blocks. Markdown's
-   existing rendering defaults must remain independent of email HTML defaults.
-4. **Respect inheritance.** Inner styling overrides outer styling. Block text colors and
-   typography apply to descendants; semantic emphasis and explicit resets need deliberate
-   handling rather than an inside-out OR of flags.
-5. **Theme adaptation is local and attribute-scoped.** Never rewrite text nodes, URLs,
-   stored HTML, or sender formatting in outgoing mail because of the current theme.
-6. **Resource consent applies to every local preview.** Expanding a quoted original in
-   the composer must not bypass remote-image blocking. Printing observes the same consent.
-   Outbox previews use that same shared preview policy, not outgoing serialization directly.
-7. **Do not hide novel content.** A prefix shared with an earlier message is insufficient
-   evidence that an entire quote is redundant. Prefer showing extra history over hiding an
-   inline answer or annotation. Printing includes full visible history.
-8. **Both MIME alternatives preserve Unicode and visible content.** UTF-8 must never be
-   processed one byte at a time as characters. Generated plain-text quotes use the same
-   visibility-clean source as their HTML alternative.
+- Chromium's sandbox remains enabled. No `--no-sandbox`, debugging TCP port or
+  ordinary user browser profile is used. Each view has a private pipe, incognito
+  context and ephemeral, permission-restricted profile/home/cache directory.
+- Scripts are disabled by the engine before mail is loaded. Source scripts and
+  event handlers are also removed. Fixed trusted CDP controller expressions only
+  measure layout, selection and links; untrusted email JavaScript never runs.
+- A restrictive CSP is installed before authored markup. CSP is defense in depth,
+  **not** the resource-consent gate.
+- All browser requests are intercepted. Chromium requests are never continued.
+  Without consent, external images, fonts, CSS backgrounds and other resources
+  are blocked. With consent, only bounded anonymous HTTP(S) GET image/font/style
+  fetching is eligible; no user cookies, authentication or referrer are forwarded.
+  Private/local destinations are rejected by the actual connector resolver. Up to
+  five anonymous redirects are followed with per-hop URL validation; private targets,
+  credentials, unsafe schemes, loops and HTTPS downgrades remain blocked. Protocol-relative
+  resource URLs are normalized to HTTPS; arbitrary relative paths remain unsupported.
+  Two bounded fetching workers per view keep network waits off the input/render actor.
+- Browser-side DNS/proxy restrictions additionally constrain accidental requests.
+  Frames, document navigation, downloads and popups are isolated. External links
+  are handed to the native shell only after real user interaction; live anchor
+  targets are rewritten to inert links. This can affect href-value CSS selectors
+  and internal fragment links.
+- Chromium uses a short 0700 private runtime/profile directory in `/dev/shm`,
+  also its child-only `TMPDIR`. It does not inherit a quota-exhausted `/tmp` or a
+  deep project temp path; the latter can exceed Chromium's Unix socket limit.
+  The launcher does not force shared-memory/font buffers onto `/tmp`.
+- Four live browser views maximum; process RSS is polled with a 2 GiB watchdog per
+  view (not a hard cgroup memory limit). HTML, response bodies, queues and frames
+  are bounded. Document display height is capped at 100,000 CSS pixels; the stored
+  original is unchanged. Closing/collapsing a view cancels its worker, reaps subprocesses and
+  removes its private profile. Optional failed or cancelled resources do not hide the document.
+  Capture clips are padded to at least one physical pixel to avoid Chromium's
+  subpixel-tail capture timeout; padding is clipped by the native document surface.
+  On engine failure, available rendered tiles remain as an explicitly frozen preview
+  with a privacy-safe error code and **Retry**. Raw engine diagnostics are never shown;
+  retry preserves the prepared document, theme and resource-consent setting.
+- Remote consent remains an explicit per-message choice or the global **Remote
+  content** preference. The legacy persisted preference key remains compatible.
 
-## Review findings
+White is the fallback browser paper in every non-dark shell theme. Dark uses
+Chromium dark-mode emulation; sender-authored colors need not match the shell
+palette exactly. Fonts depend on installed system fonts and consent for authored
+remote fonts. Animation/transition playback is suppressed. Full DOM accessibility
+bridging is not implemented yet.
 
-The previous implementation removed all inline CSS except color; applied a generic
-paragraph gap to both `<p>` and `<div>`; deleted blank blocks and boundary breaks; and
-ignored block color inheritance. Sender font size and line height were replaced by app
-fallbacks. Additional findings included Unicode corruption in outgoing HTML, hidden
-content revealed by outgoing quote sanitization, composer quote previews permitting
-remote images, string-wide theme color replacement, and printing dropping folded history.
+## Runtime and packaging
 
-Native table parsing also needs actual header/footer semantics rather than treating every
-HTML table as a Markdown table. List item block boundaries and mixed-size text must be
-checked in the renderer, not only by examining serialized sanitized HTML.
+Chromium is required for message bodies. The Arch package depends on `chromium`.
+Other installations must provide a compatible Chromium executable on PATH, or set
+`OVERLOOK_BROWSER_BIN` to its file path. A missing engine or failed sandbox is an
+explicit rendering error, never a silent switch back to lossy native rendering.
+Do not disable the sandbox to work around an installation failure.
 
-## Regression workflow
+## Validation
 
-- `crates/overlook-core/tests/fixtures/formatting/` contains synthetic, sender-shaped mail.
-  Never commit private mailbox exports, access tokens, tracking links, or personal addresses.
-- Core integration tests exercise security, supported styling, visible text, whitespace,
-  quote preservation, and normalization stability.
-- Native renderer tests exercise parsed structure and layout. Sanitizer tests alone cannot
-  detect excessive gaps, mixed-font shaping, table header mistakes, or selection regressions.
-- MIME tests decode the generated alternatives and check actual Unicode text, not merely
-  the beginning of an encoded HTML part.
-- `cargo test --workspace` runs application/core/provider/store tests.
-- `cargo test --manifest-path vendor/gpui-base/Cargo.toml --lib --features test-support`
-  runs the vendored native renderer tests.
-
-An optional privacy-preserving diagnostic accepts NDJSON objects containing an `html`
-field and prints aggregate stability/resource counts only:
+All fixtures are synthetic. Never commit or export private mailbox bodies,
+tracking URLs, authentication material or screenshots of private messages.
 
 ```sh
-cargo run -p overlook-core --example formatting_audit < local-message-input.ndjson
+cargo test --workspace
+cargo test -p overlook browser_ -- --include-ignored --test-threads=1
+CARGO_TARGET_DIR="$PWD/target" cargo test --manifest-path vendor/gpui-base/Cargo.toml --lib --features test-support
+cargo build -p overlook
+git diff --check
 ```
 
-Do not commit that input file. The diagnostic does not contact mail providers, modify
-stored messages, or print message content. It checks parsed-DOM cleaning/reader
-idempotence, ignoring equivalent entity spellings and attribute order—not visual
-equivalence to Outlook. The full stored-HTML audit passed with zero DOM instability.
-Plain-text display separately preserves blank runs, indentation, CRLF, and hard breaks.
+Core browser tests cover inert markup, preserved stylesheet/table/root semantics,
+CID normalization, CSS URL safety and the CSP envelope. Real Chromium tests cover
+script suppression, live styles/geometry, selection, wheel input, link dispatch,
+HiDPI dimensions, full-document tile coordinates/cache eviction, real consented image decoding,
+redirect/private-target handling, slow-fetch responsiveness, request interception and
+subprocess/profile cleanup. Visual
+review at multiple widths/scales and light/dark modes remains necessary: passing
+structural tests alone does not prove an Outlook/reference-perfect result.
 
-## Explicit limits and follow-up gates
+## Native pipeline retained for other uses
 
-See [the native presentation contract](../vendor/gpui-base/HTML_FORMATTING.md) for
-exact capabilities, sizing bounds, and deliberate fallback behavior.
+The [native formatting contract](../vendor/gpui-base/HTML_FORMATTING.md) documents
+native Markdown/editor and legacy safe presentation behavior. Native regressions
+fixed during this work include paragraph state identity (independent HTML blocks
+must not overwrite one another's retained layouts), terminal break-only line-box
+semantics, and Unicode MIME alternatives. Full-frame Linux font tests cover those
+fixes. The prior aggregate audit established cleaning/reader DOM stability, not
+visual fidelity; it was never evidence that native text layout could reproduce
+browser containers.
 
-This is a native text/layout renderer, not a browser engine. Arbitrary stylesheet cascade,
-media queries, responsive multi-column newsletters, CSS positioning, complex nested layout
-tables, and true row/column spanning require additional layout capabilities or a separate
-HTML rendering architecture. A safe inline presentation subset is not a promise of exact
-Outlook/WebKit fidelity for those messages.
-
-Quoted CID images also need source inline parts to be carried into outgoing MIME; retaining
-a `cid:` URL alone does not make the image available to recipients. This needs a dedicated
-MIME/attachment lifecycle change rather than a spacing patch.
-
-Release review should compare the fixture corpus visually at multiple pane widths and
-scales, in Light and Dark, including selecting/copying text and blocked/allowed images.
-Automated structure, security, and layout tests reduce regressions; they do not replace
-that visual check. Do not declare browser-grade fidelity based solely on passing unit tests.
+Quoted CID images still need a dedicated outgoing MIME attachment lifecycle:
+keeping a CID URL or displaying a locally resolved image does not make it available
+to recipients. No theme or display change mutates the stored original or outgoing
+message content.
