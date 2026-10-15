@@ -464,6 +464,16 @@ impl MailWindow {
         let issue = self.provider_issues.get(&account.id).cloned();
         let email = account.email.clone();
         let is_gmail = account.provider == ProviderKind::Gmail;
+        let is_password_account = matches!(account.provider, ProviderKind::Imap | ProviderKind::Pop3);
+        let servers = if is_password_account { self.store.servers(&account.id).ok().flatten() } else { None };
+        let connection_line = match (account.provider, &servers) {
+            (ProviderKind::Gmail, _) => "Connected through the Gmail and Google Calendar APIs.".to_owned(),
+            (ProviderKind::Sample, _) => "Sample account with fictional mail; nothing leaves this device.".to_owned(),
+            (ProviderKind::Imap, Some(s)) => format!("Mail is read over IMAP from {} and sent through {}. Password kept in the system keyring.", s.incoming.address(), s.outgoing.address()),
+            (ProviderKind::Pop3, Some(s)) => format!("Mail is downloaded over POP3 from {} and sent through {}. This device holds the only copy.", s.incoming.address(), s.outgoing.address()),
+            (_, None) => "Server settings are not set up yet.".to_owned(),
+        };
+        let sign_in_label = super::sign_in_label_for(account.provider);
 
         let account_list = v_flex().gap(px(4.)).children(self.accounts.iter().map(|a| {
             let id = a.id.clone();
@@ -490,8 +500,8 @@ impl MailWindow {
             .gap(px(22.))
             .child(section("Your accounts", Some("Mail and calendar accounts on this device.")))
             .child(account_list)
-            .child(Button::new("settings-add-gmail").small().icon(icon("plus").size(px(14.))).label("Add Gmail account").on_click(cx.listener(|this, _, window, cx| this.start_google_sign_in(None, window, cx))))
-            .child(section(&format!("{}", account.email), Some(if is_gmail { "Connected through the Gmail and Google Calendar APIs." } else { "Sample account with fictional mail; nothing leaves this device." })))
+            .child(self.add_account_menu(cx))
+            .child(section(&format!("{}", account.email), Some(&connection_line)))
             .child(setting_row("Your name", "Shown as the sender on messages you write.", Input::new(&state.name_input).w(px(280.)).into_any_element()))
             .child(setting_row(
                 "Status",
@@ -500,7 +510,13 @@ impl MailWindow {
                     .gap(px(6.))
                     .when(issue.is_some(), |r| {
                         let e = email.clone();
-                        r.child(Button::new("settings-signin").small().label("Sign in again").on_click(cx.listener(move |this, _, window, cx| this.start_google_sign_in(Some(e.clone()), window, cx))))
+                        let id = account.id.clone();
+                        r.child(Button::new("settings-signin").small().label(sign_in_label).on_click(cx.listener(move |this, _, window, cx| this.sign_in_again_for(&id, Some(e.clone()), window, cx))))
+                    })
+                    .when(is_password_account, |r| {
+                        let id = account.id.clone();
+                        let kind = account.provider;
+                        r.child(Button::new("settings-servers").small().icon(icon("server").size(px(14.))).label("Server settings…").on_click(cx.listener(move |this, _, window, cx| this.open_account_setup(kind, super::SetupMode::Edit(id.clone()), window, cx))))
                     })
                     .child(Button::new("settings-sync").ghost().small().icon(icon("refresh-cw").size(px(14.))).label("Sync now").on_click(cx.listener(|this, _, window, cx| this.sync_now(window, cx))))
                     .into_any_element(),
@@ -536,9 +552,9 @@ impl MailWindow {
             })
             .child(setting_row("Use for new messages", "", self.signature_picker("default-new", &account.id, false, cx)))
             .child(setting_row("Use for replies and forwards", "", self.signature_picker("default-reply", &account.id, true, cx)))
-            .child(section("Automatic replies", Some("An out-of-office reply sent for you while it is on. Stored at Gmail, so it works even when Overlook is closed.")))
+            .child(section("Automatic replies", Some("An out-of-office reply sent for you while it is on. Stored at your mail service, so it works even when Overlook is closed.")))
             .children(self.render_vacation(state, &account, cx))
-            .child(section("Contacts", Some("Your Google Contacts and the people you have written to, for recipient suggestions and sender cards.")))
+            .child(section("Contacts", Some(if is_gmail { "Your Google Contacts and the people you have written to, for recipient suggestions and sender cards." } else { "The people you have written to, for recipient suggestions and sender cards." })))
             .child({
                 let has_access = self.providers.get(&account.id).is_some_and(|p| p.mail.has_contacts_access());
                 let count = self.store.contact_count(&account.id).unwrap_or(0);
@@ -842,6 +858,31 @@ fn hour_text(hour: u8) -> String {
 }
 
 impl MailWindow {
+    /// "Add account" with one entry per account type.
+    fn add_account_menu(&self, cx: &mut Context<Self>) -> AnyElement {
+        let t = cx.entity().downgrade();
+        Button::new("settings-add-account")
+            .small()
+            .icon(icon("plus").size(px(14.)))
+            .label("Add account")
+            .dropdown_caret(true)
+            .dropdown_menu(move |mut menu, _window, _cx| {
+                let g = t.clone();
+                menu = menu.item(PopupMenuItem::new("Gmail…").on_click(move |_, window, cx| {
+                    let _ = g.update(cx, |this, cx| this.start_google_sign_in(None, window, cx));
+                }));
+                let i = t.clone();
+                menu = menu.item(PopupMenuItem::new("IMAP…").on_click(move |_, window, cx| {
+                    let _ = i.update(cx, |this, cx| this.open_account_setup(ProviderKind::Imap, super::SetupMode::New, window, cx));
+                }));
+                let p = t.clone();
+                menu.item(PopupMenuItem::new("POP3 (coming soon)").on_click(move |_, window, cx| {
+                    let _ = p.update(cx, |this, cx| this.open_account_setup(ProviderKind::Pop3, super::SetupMode::New, window, cx));
+                }))
+            })
+            .into_any_element()
+    }
+
     fn signature_picker(&self, id: &'static str, account: &AccountId, reply: bool, cx: &mut Context<Self>) -> AnyElement {
         let ap = self.account_prefs_for(account);
         let current = if reply { ap.default_reply.clone() } else { ap.default_new.clone() };

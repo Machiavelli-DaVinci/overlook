@@ -136,7 +136,7 @@ fn sync_calendar(store: &Store, provider: &dyn CalendarProvider, account: &Accou
     set_calendar_status(store, acct, &SyncState::UpToDate);
 }
 
-pub const RATE_LIMIT_WORDING: &str = "Waiting for Gmail: it is limiting requests. Downloading continues in a moment.";
+pub const RATE_LIMIT_WORDING: &str = "Waiting: the mail service is limiting requests. Downloading continues in a moment.";
 
 /// Messages downloaded per batch before progress is committed to the store.
 const DOWNLOAD_BATCH: usize = 20;
@@ -289,6 +289,20 @@ fn drain_backlog(store: &Store, provider: &dyn MailProvider, account: &Account, 
     Ok(())
 }
 
+/// Keeps the store's `imap_folders` rows in step with an IMAP provider's checkpoint, so
+/// folder state can be read without parsing the checkpoint. The checkpoint stays
+/// authoritative; other providers have no folder rows.
+fn mirror_imap_folders(store: &Store, provider: &dyn MailProvider, account: &AccountId, checkpoint: Option<&str>) {
+    if provider.kind() != ProviderKind::Imap {
+        return;
+    }
+    if let Some(cp) = checkpoint {
+        if let Err(e) = store.replace_imap_folders(account, &overlook_provider::imap::folder_states(cp)) {
+            warn!("could not record IMAP folder state: {e}");
+        }
+    }
+}
+
 /// Downloads remote state. Returns the number of messages written.
 fn download(store: &Store, provider: &dyn MailProvider, account: &Account, outcome: &mut SyncOutcome) -> Result<usize, ProviderError> {
     let acct = &account.id;
@@ -302,6 +316,7 @@ fn download(store: &Store, provider: &dyn MailProvider, account: &Account, outco
         reconcile_incoming(store, acct, &mut snapshot.messages, &mut Vec::new());
         store.merge_remote_messages(&snapshot.messages, &protected).map_err(|e| ProviderError::Temporary(e.to_string()))?;
         store.set_checkpoint(acct, snapshot.checkpoint.as_deref()).map_err(|e| ProviderError::Temporary(e.to_string()))?;
+        mirror_imap_folders(store, provider, acct, snapshot.checkpoint.as_deref());
         outcome.downloaded += snapshot.messages.len();
         // Queue bodies that are not on disk yet; the backlog survives restarts.
         enqueue(store, acct, snapshot.message_ids, true);
@@ -334,6 +349,14 @@ fn download(store: &Store, provider: &dyn MailProvider, account: &Account, outco
                 if let Some(labels) = &changes.labels {
                     store.replace_labels(acct, labels).map_err(|e| ProviderError::Temporary(e.to_string()))?;
                 }
+                // Providers that mint local ids on first sight report deletions by provider id.
+                for pid in std::mem::take(&mut changes.deleted_provider_ids) {
+                    if let Ok(Some(id)) = store.message_id_for_provider_id(acct, &pid) {
+                        if !changes.deleted.contains(&id) {
+                            changes.deleted.push(id);
+                        }
+                    }
+                }
                 // A message that vanished from one folder and appeared in another is a move,
                 // not a deletion plus a new message.
                 reconcile_incoming(store, acct, &mut changes.upserts, &mut changes.deleted);
@@ -344,6 +367,7 @@ fn download(store: &Store, provider: &dyn MailProvider, account: &Account, outco
                 }
                 if let Some(new_cp) = changes.checkpoint.as_deref() {
                     store.set_checkpoint(acct, Some(new_cp)).map_err(|e| ProviderError::Temporary(e.to_string()))?;
+                    mirror_imap_folders(store, provider, acct, Some(new_cp));
                 }
                 outcome.downloaded += changes.upserts.len();
                 if !changes.message_ids.is_empty() {
@@ -616,7 +640,7 @@ pub async fn run_sync(store: Arc<Store>, provider: Arc<dyn MailProvider>, calend
 
 /// Minimal executor for provider futures inside the already-blocking download step.
 /// Provider futures do blocking I/O and never return `Pending`.
-fn pollster_block<F: std::future::Future>(f: F) -> F::Output {
+pub(crate) fn pollster_block<F: std::future::Future>(f: F) -> F::Output {
     use std::task::{Context, Poll, RawWaker, RawWakerVTable, Waker};
     fn noop(_: *const ()) {}
     fn clone(p: *const ()) -> RawWaker {
@@ -943,6 +967,81 @@ mod tests {
         assert_eq!(rows[0].body.text.as_deref(), Some("body 7"));
         assert!(!rows[0].conversation_id.0.is_empty());
         assert!(backlog(&store, &account.id).is_empty());
+    }
+
+    /// The whole read path against a real IMAP server through the store: two syncs on a
+    /// store that is closed and reopened in between, like an app restart. Run with the same
+    /// `OVERLOOK_IMAP_TEST_*` variables as the provider's ignored test.
+    #[test]
+    #[ignore]
+    fn imap_account_syncs_through_the_store_across_a_restart() {
+        let var = |n: &str| std::env::var(n).ok().filter(|v| !v.trim().is_empty());
+        let (Some(host), Some(user), Some(password)) = (var("OVERLOOK_IMAP_TEST_HOST"), var("OVERLOOK_IMAP_TEST_USER"), var("OVERLOOK_IMAP_TEST_PASSWORD")) else {
+            panic!("set OVERLOOK_IMAP_TEST_HOST, OVERLOOK_IMAP_TEST_USER and OVERLOOK_IMAP_TEST_PASSWORD");
+        };
+        let security = var("OVERLOOK_IMAP_TEST_SECURITY").and_then(|s| Security::from_key(&s)).unwrap_or(Security::Tls);
+        let port = var("OVERLOOK_IMAP_TEST_PORT").and_then(|p| p.parse().ok()).unwrap_or(ServerProtocol::Imap.default_port(security));
+        let servers = MailServers { incoming: ServerEndpoint::new(host, port, security, user.clone()), outgoing: ServerEndpoint::new("", 0, security, user.clone()), pop3: None, imap: None };
+        let account = Account { id: AccountId(format!("imap:{user}")), provider: ProviderKind::Imap, display_name: user.clone(), email: user, created_at: 0 };
+        let dir = std::env::temp_dir().join(format!("overlook-imap-test-{}", std::process::id()));
+        let _ = std::fs::remove_dir_all(&dir);
+        std::fs::create_dir_all(&dir).unwrap();
+        let path = dir.join("overlook.sqlite");
+        let provider = Arc::new(overlook_provider::imap::ImapProvider::new(servers.clone(), password.clone()).with_inbox_limit(20));
+
+        let store = Arc::new(Store::open(&path).unwrap());
+        store.upsert_account(&account).unwrap();
+        store.set_servers(&account.id, &servers).unwrap();
+        let outcome = block_on(run_sync(store.clone(), provider.clone(), None, account.clone()));
+        assert_eq!(outcome.state, Some(SyncState::UpToDate), "{outcome:?}");
+        let labels = store.labels(&account.id).unwrap();
+        assert!(labels.iter().any(|l| l.kind == LabelKind::Inbox));
+        let messages = store.messages_for_account(&account.id).unwrap();
+        eprintln!("first sync: {} labels, {} messages, {} folder rows", labels.len(), messages.len(), store.imap_folders(&account.id).unwrap().len());
+        assert!(messages.iter().all(|m| !m.conversation_id.0.is_empty() && m.provider_id.is_some()));
+        assert!(backlog(&store, &account.id).is_empty(), "every body was downloaded");
+        let bodies = messages.iter().filter(|m| m.body.is_cached()).count();
+        assert_eq!(bodies, messages.len(), "all bodies cached");
+        let threads: std::collections::BTreeSet<_> = messages.iter().map(|m| m.conversation_id.clone()).collect();
+        eprintln!("{} conversations; replies joined their parents: {}", threads.len(), messages.iter().filter(|m| m.in_reply_to.is_some()).all(|m| messages.iter().any(|p| p.rfc_message_id == m.in_reply_to && p.conversation_id == m.conversation_id) || !messages.iter().any(|p| p.rfc_message_id == m.in_reply_to)));
+        if let Some((m, a)) = messages.iter().find_map(|m| m.attachments.first().map(|a| (m, a))) {
+            let bytes = pollster_block(provider.fetch_attachment(&account, m, a)).unwrap();
+            eprintln!("attachment {} fetched: {} bytes", a.filename, bytes.len());
+            assert!(!bytes.is_empty());
+        }
+        drop(store);
+
+        // "Restart": reopen the database; the checkpoint drives an incremental cycle.
+        let store = Arc::new(Store::open(&path).unwrap());
+        let before = store.message_count(&account.id).unwrap();
+        let outcome = block_on(run_sync(store.clone(), provider.clone(), None, account.clone()));
+        assert_eq!(outcome.state, Some(SyncState::UpToDate), "{outcome:?}");
+        assert_eq!(store.message_count(&account.id).unwrap(), before, "a quiet cycle changes nothing");
+        assert!(!store.imap_folders(&account.id).unwrap().is_empty(), "folder rows are mirrored from the checkpoint");
+        eprintln!("second sync after reopen: {} downloaded, state {:?}", outcome.downloaded, outcome.state);
+        let _ = std::fs::remove_dir_all(&dir);
+    }
+
+    #[test]
+    fn deletions_by_provider_id_and_folder_rows_are_recorded() {
+        let (store, account, provider) = imap_seeded();
+        block_on(run_sync(store.clone(), provider.clone(), None, account.clone()));
+        assert!(store.imap_folders(&account.id).unwrap().is_empty(), "the scripted checkpoint is not an IMAP checkpoint");
+        let z = by_rfc(&store, "<z@x>");
+        let mut cp = overlook_provider::imap::Checkpoint { version: overlook_provider::imap::Checkpoint::VERSION, ..Default::default() };
+        cp.folders.insert("INBOX".into(), overlook_provider::imap::FolderCursor { kind: "inbox".into(), uidvalidity: 1, highest_uid: 3, known: "1:3".into(), delimiter: Some("/".into()), ..Default::default() });
+        *provider.changes.lock().unwrap() = Some(RemoteChanges {
+            deleted_provider_ids: vec![ProviderId("INBOX\u{1f}1\u{1f}3".into()), ProviderId("INBOX\u{1f}1\u{1f}99".into())],
+            checkpoint: Some(cp.to_json()),
+            ..Default::default()
+        });
+        let outcome = block_on(run_sync(store.clone(), provider.clone(), None, account.clone()));
+        assert_eq!(outcome.state, Some(SyncState::UpToDate));
+        assert!(store.message(&z.id).unwrap().is_none(), "resolved through the provider id");
+        assert_eq!(store.message_count(&account.id).unwrap(), 2, "an unknown provider id is ignored");
+        let rows = store.imap_folders(&account.id).unwrap();
+        assert_eq!(rows.len(), 1);
+        assert_eq!((rows[0].path.as_str(), rows[0].uidvalidity, rows[0].highest_uid), ("INBOX", Some(1), 3));
     }
 
     #[test]

@@ -49,7 +49,8 @@ Google Calendar on the same OAuth client, with the `calendar.events` and `calend
 
 `Ctrl ,` or the gear in the header opens a Settings dialog (an overlay with a page list). Every control writes immediately and is applied without restart. Preferences live in `overlook_core::prefs` (`Prefs` per profile under the `prefs` setting, `AccountPrefs` per account under `account_prefs:<id>`).
 
-- **Accounts**: account list, add Gmail, your name (the sender name on outgoing mail), status with Sign in again / Sync now, **signature** (plain text) with "include in new messages" and "include in replies and forwards" toggles, remove account from this device.
+- **Accounts**: account list, an "Add account" menu (Gmail sign-in, IMAP, POP3 coming soon), your name (the sender name on outgoing mail), status with Sign in again (Gmail) or Update password (IMAP) / Sync now, **Server settings…** for IMAP accounts, **signature** (plain text) with "include in new messages" and "include in replies and forwards" toggles, remove account from this device.
+- **IMAP accounts** (`crates/overlook-app/src/ui/account_setup.rs`): step 1 asks for name, address and password; Continue looks the domain up (built-in presets for the common providers, then Thunderbird's ISPDB, then `mail.<domain>`) and fills step 2, where host / port / security (SSL/TLS, STARTTLS, none for localhost only) and user name for IMAP and SMTP can be changed, "use the same password for sending" toggled, and **Test connection** probes both servers off the UI thread and shows the server's own error text. Saving writes the account, its server settings (store) and passwords (keyring), builds the provider and starts the first download. Folders appear as labels (Inbox, Sent, Trash, Spam, Archive by SPECIAL-USE or name; everything else as a user label); mail is read over IMAP with the sync interval from General. Mailbox changes and sending for IMAP accounts arrive with the next milestone; until then local changes are kept but reported as not sent. `OVERLOOK_SIGN_IN=imap` opens the dialog at launch.
 - **General**: theme, density, reading pane, start-up module (Mail / Calendar / last used), 12/24-hour clock, week start, new-mail notifications (off / Focused only / all), event reminders, sync interval (30 s to 15 min).
 - **Mail**: Focused Inbox, sender pictures, preview text, mark as read (when selected / after 3 s / never), remote images (block / always show), default reply (reply / reply all), quote original in replies, attachment save folder, Inbox messages to download (100 / 300 / 1,000; changing it re-lists the mailboxes and queues what is missing).
 - **Calendar**: working hours (shaded outside in Day/Week), default event length, default reminder, show declined events, event reminders.
@@ -268,6 +269,8 @@ Composer header fields: `Enter` moves to the next field.
 The sidebar and list panes are resizable; sizes persist in `settings`. The layout menu in the header switches the reading pane between right and below, and density between comfortable and compact; both persist.
 
 ## Known gaps (tracked for the next sessions)
+
+- IMAP accounts are read-only until the write path lands (plan milestone M3): marking read, starring, archiving and trashing are queued locally and the replay reports them as not sent; sending over SMTP is not wired to the Outbox yet. POP3 is not available. See `llm-docs/imap-pop3-implementation-plan.md`.
 
 - Gmail: no attachment download for received mail yet, no progressive download beyond the newest 150 messages, no `cid:` inline images, and bodies are fetched one request per message (the Gmail batch endpoint would cut request count).
 - Composer is plain text. Rich text, signatures, and HTML output are phase 1 items; `body_html` is already stored separately.

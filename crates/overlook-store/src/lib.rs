@@ -244,7 +244,15 @@ impl Store {
                         merged.conversation_id = local.conversation_id.clone();
                     }
                     if !merged.body.is_cached() {
+                        // A header-only row (IMAP flag refresh, new mail before its body
+                        // arrives) must not blank what the body download already filled in.
                         merged.body = local.body;
+                        if merged.snippet.is_empty() {
+                            merged.snippet = local.snippet;
+                        }
+                        if merged.invitation.is_none() {
+                            merged.invitation = local.invitation;
+                        }
                     }
                     if merged.attachments.is_empty() {
                         merged.attachments = local.attachments;
@@ -1022,6 +1030,42 @@ impl Store {
                 }
                 tx.execute("DELETE FROM message_labels WHERE message_id=?1", [&message.0])?;
                 tx.execute("INSERT OR IGNORE INTO message_labels(message_id, label_id) VALUES(?1,?2)", params![message.0, label.0])?;
+            }
+            Ok(())
+        })
+    }
+
+    // ------------------------------------------------------------ IMAP folders
+
+    /// The account's IMAP folder rows, mirrored from the provider's checkpoint after each
+    /// cycle. Diagnostic and settings-dialog reading only: the checkpoint is authoritative.
+    pub fn imap_folders(&self, account: &AccountId) -> Result<Vec<ImapFolder>> {
+        self.with_conn(|c| {
+            let mut stmt = c.prepare("SELECT path, uidvalidity, highest_uid, highest_modseq, delimiter, special_use, subscribed FROM imap_folders WHERE account_id=?1 ORDER BY path")?;
+            let rows = stmt.query_map([&account.0], |r| {
+                Ok(ImapFolder {
+                    path: r.get(0)?,
+                    uidvalidity: r.get::<_, Option<i64>>(1)?.map(|v| v as u32),
+                    highest_uid: r.get::<_, i64>(2)? as u32,
+                    highest_modseq: r.get::<_, Option<i64>>(3)?.map(|v| v as u64),
+                    delimiter: r.get(4)?,
+                    special_use: r.get(5)?,
+                    subscribed: r.get::<_, i64>(6)? != 0,
+                })
+            })?;
+            Ok(rows.collect::<std::result::Result<Vec<_>, _>>()?)
+        })
+    }
+
+    /// Replaces the account's IMAP folder rows.
+    pub fn replace_imap_folders(&self, account: &AccountId, folders: &[ImapFolder]) -> Result<()> {
+        self.with_tx(|tx| {
+            tx.execute("DELETE FROM imap_folders WHERE account_id=?1", [&account.0])?;
+            for f in folders {
+                tx.execute(
+                    "INSERT INTO imap_folders(account_id, path, uidvalidity, highest_uid, highest_modseq, delimiter, special_use, subscribed) VALUES(?1,?2,?3,?4,?5,?6,?7,?8)",
+                    params![account.0, f.path, f.uidvalidity.map(i64::from), i64::from(f.highest_uid), f.highest_modseq.map(|v| v as i64), f.delimiter, f.special_use, f.subscribed as i64],
+                )?;
             }
             Ok(())
         })
@@ -2243,6 +2287,43 @@ mod tests {
             .with_conn(|c| Ok((c.query_row("SELECT COUNT(*) FROM imap_folders", [], |r| r.get(0))?, c.query_row("SELECT COUNT(*) FROM pop3_seen", [], |r| r.get(0))?)))
             .unwrap();
         assert_eq!((folders, seen), (0, 0), "cursor rows cascade with the account");
+    }
+
+    #[test]
+    fn imap_folder_rows_round_trip() {
+        let store = Store::open_in_memory().unwrap();
+        seeded(&store);
+        let acct = AccountId::from("acct-1");
+        let rows = vec![
+            ImapFolder { path: "INBOX".into(), uidvalidity: Some(17), highest_uid: 42, highest_modseq: None, delimiter: Some("/".into()), special_use: None, subscribed: true },
+            ImapFolder { path: "Sent".into(), uidvalidity: Some(18), highest_uid: 3, highest_modseq: Some(900), delimiter: Some("/".into()), special_use: Some("\\Sent".into()), subscribed: false },
+        ];
+        store.replace_imap_folders(&acct, &rows).unwrap();
+        assert_eq!(store.imap_folders(&acct).unwrap(), rows);
+        store.replace_imap_folders(&acct, &rows[1..]).unwrap();
+        assert_eq!(store.imap_folders(&acct).unwrap().len(), 1, "replaced, not appended");
+        assert!(store.imap_folders(&AccountId::from("nobody")).unwrap().is_empty());
+    }
+
+    #[test]
+    fn header_only_refresh_keeps_snippet_and_invitation() {
+        let store = Store::open_in_memory().unwrap();
+        seeded(&store);
+        let mut full = message("h1", "Invite", "You are invited", &["label-inbox"]);
+        full.invitation = overlook_core::ics::parse_invitation("BEGIN:VCALENDAR\r\nMETHOD:REQUEST\r\nBEGIN:VEVENT\r\nUID:ev1\r\nSUMMARY:Standup\r\nDTSTART:20261014T090000Z\r\nEND:VEVENT\r\nEND:VCALENDAR\r\n");
+        assert!(full.invitation.is_some());
+        store.merge_remote_messages(&[full.clone()], &BTreeSet::new()).unwrap();
+        let mut headers_only = full.clone();
+        headers_only.body = Body::default();
+        headers_only.snippet = String::new();
+        headers_only.invitation = None;
+        headers_only.is_read = true;
+        store.merge_remote_messages(&[headers_only], &BTreeSet::new()).unwrap();
+        let stored = store.message(&full.id).unwrap().unwrap();
+        assert!(stored.is_read, "flags come from the refresh");
+        assert_eq!(stored.body, full.body);
+        assert_eq!(stored.snippet, full.snippet);
+        assert_eq!(stored.invitation, full.invitation);
     }
 
     #[test]

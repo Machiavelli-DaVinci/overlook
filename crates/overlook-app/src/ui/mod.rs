@@ -1,5 +1,6 @@
 //! The main mail window: header, sidebar, message list, reader, composer, status bar.
 
+mod account_setup;
 mod calendar;
 mod composer;
 mod contacts;
@@ -17,6 +18,7 @@ use crate::{credentials, providers};
 use crate::sync::{run_sync, SyncOutcome};
 use crate::theme::{self, ActivePalette, Palette};
 use crate::SETTING_APPEARANCE;
+pub use account_setup::{AccountSetup, SetupMode};
 pub use calendar::{CalView, Module, NewEvent};
 pub use composer::Composer;
 pub use settings::{SettingsPage, SettingsState};
@@ -221,6 +223,14 @@ pub enum ListRow {
     Draft(Draft),
 }
 
+/// "Sign in again" for Google accounts, "Update password" for password accounts.
+pub(crate) fn sign_in_label_for(provider: ProviderKind) -> &'static str {
+    match provider {
+        ProviderKind::Imap | ProviderKind::Pop3 => "Update password",
+        _ => "Sign in again",
+    }
+}
+
 /// A Google sign-in in progress (the browser has been opened).
 pub struct SignIn {
     cancel: Arc<AtomicBool>,
@@ -341,6 +351,8 @@ pub struct MailWindow {
     pub(crate) prefs: Prefs,
     pub(crate) account_prefs: HashMap<AccountId, AccountPrefs>,
     pub(crate) settings: Option<SettingsState>,
+    /// The IMAP/POP3 account dialog, when open.
+    pub(crate) account_setup: Option<AccountSetup>,
     pub(crate) update: UpdateState,
     /// Generation counter for delayed mark-as-read timers.
     mark_read_generation: u64,
@@ -375,7 +387,7 @@ impl MailWindow {
         let mut providers: HashMap<AccountId, providers::AccountProviders> = HashMap::new();
         let mut provider_issues = HashMap::new();
         for a in &accounts {
-            match providers::providers_for(a, &sample) {
+            match providers::providers_for(a, &sample, &store) {
                 Ok(p) => {
                     providers.insert(a.id.clone(), p);
                 }
@@ -515,6 +527,7 @@ impl MailWindow {
             prefs,
             account_prefs,
             settings: None,
+            account_setup: None,
             mark_read_generation: 0,
             last_sync_tick: now(),
             sidebar_width,
@@ -549,8 +562,10 @@ impl MailWindow {
         // session is replayed before anything else happens.
         this.sync_all(window, cx);
         // `OVERLOOK_SIGN_IN=gmail` opens the Google sign-in immediately (first-run helper).
-        if std::env::var("OVERLOOK_SIGN_IN").is_ok_and(|v| v == "gmail") {
-            this.start_google_sign_in(None, window, cx);
+        match std::env::var("OVERLOOK_SIGN_IN").as_deref() {
+            Ok("gmail") => this.start_google_sign_in(None, window, cx),
+            Ok("imap") => this.open_account_setup(ProviderKind::Imap, SetupMode::New, window, cx),
+            _ => {}
         }
 
         // First update check shortly after launch, then once a day from the periodic loop.
@@ -624,6 +639,37 @@ impl MailWindow {
 
     pub(crate) fn active_issue(&self) -> Option<&String> {
         self.provider_issues.get(&self.account.id)
+    }
+
+    /// What the "fix the credentials" action is called for the active account.
+    pub(crate) fn sign_in_again_label(&self) -> &'static str {
+        sign_in_label_for(self.account.provider)
+    }
+
+    /// Reopens the credentials flow for the active account: the Google sign-in, or the
+    /// server dialog with the password field focused for IMAP/POP3 accounts.
+    pub(crate) fn sign_in_again(&mut self, hint: Option<String>, window: &mut Window, cx: &mut Context<Self>) {
+        let id = self.account.id.clone();
+        self.sign_in_again_for(&id, hint, window, cx);
+    }
+
+    pub(crate) fn sign_in_again_for(&mut self, account: &AccountId, hint: Option<String>, window: &mut Window, cx: &mut Context<Self>) {
+        match self.accounts.iter().find(|a| &a.id == account).map(|a| a.provider) {
+            Some(ProviderKind::Imap) | Some(ProviderKind::Pop3) => {
+                let kind = self.accounts.iter().find(|a| &a.id == account).map(|a| a.provider).unwrap_or(ProviderKind::Imap);
+                self.open_account_setup(kind, SetupMode::UpdatePassword(account.clone()), window, cx);
+            }
+            _ => self.start_google_sign_in(hint, window, cx),
+        }
+    }
+
+    /// The provider's name in status lines ("Searching Gmail…").
+    pub(crate) fn provider_name(&self, account: &AccountId) -> &'static str {
+        match self.accounts.iter().find(|a| &a.id == account).map(|a| a.provider) {
+            Some(ProviderKind::Sample) => "the sample server",
+            Some(ProviderKind::Gmail) => "Gmail",
+            _ => "the mail server",
+        }
     }
 
     pub(crate) fn is_syncing_active(&self) -> bool {
@@ -1374,7 +1420,7 @@ impl MailWindow {
     /// What the search covered, for the line above the results.
     fn search_coverage_line(&self, acct: &AccountId) -> String {
         let local = self.store.search_coverage(acct).map(|c| c.sentence()).unwrap_or_default();
-        let provider = if self.is_sample(acct) { "the sample server" } else { "Gmail" };
+        let provider = self.provider_name(acct);
         let online = match &self.online_search {
             OnlineSearch::Idle => String::new(),
             OnlineSearch::Searching => format!(" · Searching {provider}…"),
@@ -1859,7 +1905,11 @@ impl MailWindow {
                     _ => {}
                 }
                 if matches!(outcome.state, Some(SyncState::SignInRequired)) {
-                    this.provider_issues.insert(account.id.clone(), "Sign in again to continue syncing. Your local drafts are safe.".into());
+                    let wording = match account.provider {
+                        ProviderKind::Imap | ProviderKind::Pop3 => providers::PASSWORD_NEEDED_WORDING,
+                        _ => "Sign in again to continue syncing. Your local drafts are safe.",
+                    };
+                    this.provider_issues.insert(account.id.clone(), wording.into());
                 }
                 this.reload(cx);
                 if first_download && outcome.downloaded > 0 {
@@ -1910,7 +1960,9 @@ impl MailWindow {
         });
     }
     fn on_escape(&mut self, _: &Escape, window: &mut Window, cx: &mut Context<Self>) {
-        if self.quick_look.is_some() {
+        if self.account_setup.is_some() {
+            self.close_account_setup(window, cx);
+        } else if self.quick_look.is_some() {
             self.quick_look = None;
             cx.notify();
         } else if self.settings.is_some() {
@@ -1977,8 +2029,8 @@ impl MailWindow {
     pub(crate) fn rebuild_providers_for_download_size(&mut self, window: &mut Window, cx: &mut Context<Self>) {
         crate::set_inbox_limit(self.prefs.inbox_messages as usize);
         let accounts = self.accounts.clone();
-        for a in accounts.iter().filter(|a| a.provider == ProviderKind::Gmail) {
-            if let Ok(bundle) = providers::providers_for(a, &self.sample) {
+        for a in accounts.iter().filter(|a| matches!(a.provider, ProviderKind::Gmail | ProviderKind::Imap)) {
+            if let Ok(bundle) = providers::providers_for(a, &self.sample, &self.store) {
                 self.providers.insert(a.id.clone(), bundle);
             }
             // Drop the coverage marker so the next sync lists the mailboxes again.
@@ -2421,7 +2473,7 @@ impl MailWindow {
         let (icon_name, text, action, color): (&str, String, Option<(&str, bool)>, Hsla) = if self.signin.is_some() {
             ("globe", "Finish signing in to Google in your browser. Overlook is waiting for the sign-in to complete.".into(), Some(("Cancel", false)), p.accent)
         } else if let Some(reason) = self.active_issue() {
-            ("key-round", reason.clone(), Some(("Sign in again", true)), p.warning)
+            ("key-round", reason.clone(), Some((self.sign_in_again_label(), true)), p.warning)
         } else {
             return None;
         };
@@ -2441,7 +2493,7 @@ impl MailWindow {
                 .children(action.map(|(label, sign_in)| {
                     Button::new("banner-action").small().label(label).on_click(cx.listener(move |this, _, window, cx| {
                         if sign_in {
-                            this.start_google_sign_in(Some(email.clone()), window, cx);
+                            this.sign_in_again(Some(email.clone()), window, cx);
                         } else {
                             this.cancel_sign_in(cx);
                         }
@@ -2606,6 +2658,7 @@ impl Render for MailWindow {
             .child(div().flex_1().min_h_0().child(self.render_body(cx)))
             .child(self.render_status_bar(cx))
             .when(self.settings.is_some(), |d| d.child(self.render_settings(cx)))
+            .when(self.account_setup.is_some(), |d| d.child(self.render_account_setup(cx)))
             .when(self.quick_look.is_some(), |d| d.child(self.render_quick_look(cx)))
     }
 }

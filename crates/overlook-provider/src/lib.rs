@@ -5,8 +5,10 @@
 //! touch the store directly, which keeps "what we asked for" and "what the server has"
 //! separate.
 
+pub mod autoconfig;
 pub mod calendar;
 pub mod gmail;
+pub mod imap;
 pub mod mime;
 pub mod outgoing;
 pub mod sample;
@@ -71,6 +73,10 @@ pub struct RemoteChanges {
     pub upserts: Vec<Message>,
     /// Messages removed at the provider (local ids).
     pub deleted: Vec<MessageId>,
+    /// Messages removed at the provider, by provider id, for providers that do not know
+    /// local ids (IMAP mints them on first sight). The sync engine resolves these through
+    /// the store and treats them like `deleted`.
+    pub deleted_provider_ids: Vec<ProviderId>,
     /// Provider ids whose bodies still need downloading (new mail reported header-only).
     /// The sync engine adds them to the persisted backlog.
     pub message_ids: Vec<ProviderId>,

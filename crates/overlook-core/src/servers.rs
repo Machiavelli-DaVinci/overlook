@@ -147,6 +147,23 @@ pub struct ImapPolicy {
     pub expunge_on_trash: bool,
 }
 
+/// Sync state of one IMAP folder, as mirrored into the store's `imap_folders` table from
+/// the provider's checkpoint after each cycle. The checkpoint stays authoritative; this row
+/// exists so the settings dialog and diagnostics can see folders without parsing it.
+#[derive(Clone, Debug, PartialEq, Eq, Serialize, Deserialize, Default)]
+#[serde(default)]
+pub struct ImapFolder {
+    /// The raw folder path, as the server names it (also the label's `provider_id`).
+    pub path: String,
+    pub uidvalidity: Option<u32>,
+    pub highest_uid: u32,
+    pub highest_modseq: Option<u64>,
+    pub delimiter: Option<String>,
+    /// RFC 6154 attribute such as `\Sent`, when the server advertised one.
+    pub special_use: Option<String>,
+    pub subscribed: bool,
+}
+
 /// Everything needed to reach an IMAP or POP3 account and its SMTP server, except passwords.
 #[derive(Clone, Debug, PartialEq, Eq, Serialize, Deserialize)]
 pub struct MailServers {

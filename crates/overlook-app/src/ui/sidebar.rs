@@ -100,6 +100,7 @@ impl MailWindow {
         let active_id = self.account.id.clone();
         let active_email = self.account.email.clone();
         let needs_sign_in = self.active_issue().is_some();
+        let sign_in_label = self.sign_in_again_label();
         let this = cx.entity().downgrade();
         let state_color = match status.state {
             SyncState::UpToDate => p.success,
@@ -217,11 +218,15 @@ impl MailWindow {
                                 menu = menu.item(PopupMenuItem::new("Add Gmail account…").on_click(move |_, window, cx| {
                                     let _ = t.update(cx, |this, cx| this.start_google_sign_in(None, window, cx));
                                 }));
+                                let t = this.clone();
+                                menu = menu.item(PopupMenuItem::new("Add IMAP account…").on_click(move |_, window, cx| {
+                                    let _ = t.update(cx, |this, cx| this.open_account_setup(ProviderKind::Imap, super::SetupMode::New, window, cx));
+                                }));
                                 if needs_sign_in {
                                     let t = this.clone();
                                     let email = active_email.clone();
-                                    menu = menu.item(PopupMenuItem::new("Sign in again").on_click(move |_, window, cx| {
-                                        let _ = t.update(cx, |this, cx| this.start_google_sign_in(Some(email.clone()), window, cx));
+                                    menu = menu.item(PopupMenuItem::new(sign_in_label).on_click(move |_, window, cx| {
+                                        let _ = t.update(cx, |this, cx| this.sign_in_again(Some(email.clone()), window, cx));
                                     }));
                                 }
                                 let t = this.clone();

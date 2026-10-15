@@ -96,7 +96,7 @@ fn main() {
         return;
     }
     if args.iter().any(|a| a == "--help" || a == "-h") {
-        println!("Overlook {} — a clear view of what matters.\n\nUsage: overlook [mailto:…] [--version] [--help]\n\nEnvironment:\n  OVERLOOK_DATA_DIR      profile directory (default ~/.local/share/overlook)\n  OVERLOOK_CONFIG_DIR    directory holding google-oauth-client.json (default ~/.config/overlook)\n  OVERLOOK_SIGN_IN=gmail start the Google sign-in at launch\n  OVERLOOK_BROWSER_BIN  compatible Chromium executable (default PATH discovery)\n  RUST_LOG=overlook=debug tracing output", env!("CARGO_PKG_VERSION"));
+        println!("Overlook {} — a clear view of what matters.\n\nUsage: overlook [mailto:…] [--version] [--help]\n\nEnvironment:\n  OVERLOOK_DATA_DIR      profile directory (default ~/.local/share/overlook)\n  OVERLOOK_CONFIG_DIR    directory holding google-oauth-client.json (default ~/.config/overlook)\n  OVERLOOK_SIGN_IN=gmail start the Google sign-in at launch (imap: open the IMAP account setup)\n  OVERLOOK_BROWSER_BIN  compatible Chromium executable (default PATH discovery)\n  RUST_LOG=overlook=debug tracing output", env!("CARGO_PKG_VERSION"));
         return;
     }
     tracing_subscriber::fmt()

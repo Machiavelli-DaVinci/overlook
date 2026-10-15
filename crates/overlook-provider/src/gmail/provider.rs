@@ -470,6 +470,7 @@ impl MailProvider for GmailProvider {
                 upserts,
                 deleted: deleted.iter().map(|id| mapping::local_message_id(&account.id, id)).collect(),
                 message_ids: Vec::new(),
+                deleted_provider_ids: Vec::new(),
                 checkpoint: Some(new_checkpoint),
             })
         })

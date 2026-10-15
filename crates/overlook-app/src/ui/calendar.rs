@@ -733,6 +733,20 @@ impl MailWindow {
                         .child(Button::new("cal-signin").small().label("Sign in again").on_click(cx.listener(move |this, _, window, cx| this.start_google_sign_in(Some(email.clone()), window, cx)))),
                 )
             }
+            _ if matches!(self.account.provider, ProviderKind::Imap | ProviderKind::Pop3) => Some(
+                h_flex()
+                    .items_center()
+                    .gap(px(10.))
+                    .px(px(16.))
+                    .h(px(40.))
+                    .bg(p.chip)
+                    .border_b_1()
+                    .border_color(p.divider)
+                    .text_size(px(13.))
+                    .text_color(p.muted)
+                    .child(icon("info").size(px(16.)).text_color(p.muted))
+                    .child("This account has no calendar. Calendars come with Gmail accounts; switch accounts to see one."),
+            ),
             _ if self.account.provider == ProviderKind::Sample && self.cal_status != SyncState::UpToDate => Some(
                 h_flex()
                     .items_center()

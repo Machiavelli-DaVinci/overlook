@@ -4,7 +4,7 @@
 Not a real server: it answers the handful of commands the spike issues with Dovecot-shaped
 responses. User: spike / password: secret.
 """
-import base64, socket, socketserver, threading, time, sys
+import base64, email, email.policy, re, socket, socketserver, threading, time, sys
 
 IMAP_PORT, SMTP_PORT = 1143, 2525
 USER, PASSWORD = "spike", "secret"
@@ -68,6 +68,27 @@ def envelope(raw):
     frm = addr(header(raw, "From"))
     return (f"({quoted(header(raw,'Date'))} {quoted(header(raw,'Subject'))} {frm} {frm} {frm} "
             f"{addr(header(raw,'To'))} {addr(header(raw,'Cc'))} NIL {quoted(header(raw,'In-Reply-To'))} {quoted(header(raw,'Message-ID'))})")
+
+def section_bytes(raw, spec):
+    """BODY[<spec>] bytes: '' (whole), HEADER, TEXT, n.m, n.m.MIME — served from the raw
+    message so the client sees what a real server would send."""
+    head, _, body = raw.partition(b"\r\n\r\n")
+    if spec == "": return raw
+    if spec.upper() == "HEADER": return head + b"\r\n\r\n"
+    if spec.upper() == "TEXT": return body
+    msg = email.message_from_bytes(raw, policy=email.policy.compat32)
+    want_mime = spec.upper().endswith(".MIME")
+    numbers = [int(n) for n in (spec[:-5] if want_mime else spec).split(".")]
+    part = msg
+    for n in numbers:
+        if part.is_multipart(): part = part.get_payload()[n - 1]
+        elif n != 1: return b""
+    part_bytes = part.as_bytes()
+    phead, _, pbody = part_bytes.partition(b"\r\n\r\n")
+    if b"\r\n\r\n" not in part_bytes:  # compat32 may emit bare LF
+        phead, _, pbody = part_bytes.partition(b"\n\n")
+        phead = phead.replace(b"\n", b"\r\n"); pbody = pbody.replace(b"\n", b"\r\n")
+    return phead + b"\r\n" if want_mime else pbody
 
 def parse_set(s, uids):
     out = set()
@@ -143,8 +164,14 @@ class Imap(socketserver.StreamRequestHandler):
                         if "RFC822.SIZE" in items: parts.append(f"RFC822.SIZE {len(raw)}")
                         if "ENVELOPE" in items: parts.append("ENVELOPE " + envelope(raw))
                         head = f"* {i+1} FETCH (" + " ".join(parts)
-                        if "BODY.PEEK[]" in items or "BODY[]" in items:
-                            self.wfile.write((head + f" BODY[] {{{len(raw)}}}\r\n").encode()); self.wfile.write(raw); self.send(")")
+                        sections = re.findall(r"BODY(?:\.PEEK)?\[([^\]]*)\](<0\.(\d+)>)?", items)
+                        if sections:
+                            self.wfile.write(head.encode())
+                            for spec, partial, limit in sections:
+                                data = section_bytes(raw, spec)
+                                if partial: data = data[:int(limit)]
+                                self.wfile.write(f" BODY[{spec}]{'<0>' if partial else ''} {{{len(data)}}}\r\n".encode()); self.wfile.write(data)
+                            self.send(")")
                         else:
                             self.send(head + ")")
                     self.send(f"{tag} OK Fetch completed.")
