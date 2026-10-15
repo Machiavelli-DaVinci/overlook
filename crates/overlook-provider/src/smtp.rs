@@ -421,3 +421,46 @@ mod tests {
         assert!(matches!(transport(addr).send("jason@example.com", &[], MESSAGE), Err(ProviderError::Rejected(_))));
     }
 }
+
+#[cfg(test)]
+mod real_server {
+    //! Against a real SMTP server, for the interoperability matrix. Run with
+    //! `OVERLOOK_SMTP_TEST_HOST=smtp.example.com OVERLOOK_SMTP_TEST_USER=… OVERLOOK_SMTP_TEST_PASSWORD=…
+    //! cargo test -p overlook-provider real_smtp -- --ignored --nocapture`; optional
+    //! `OVERLOOK_SMTP_TEST_PORT`, `OVERLOOK_SMTP_TEST_SECURITY=tls|starttls` (default
+    //! `starttls` on 587), `OVERLOOK_SMTP_TEST_FROM` (default: the user name) and
+    //! `OVERLOOK_SMTP_TEST_TO`: without a recipient the test only connects, authenticates
+    //! and quits; with one it also sends one short message there.
+    use super::*;
+    use overlook_core::ServerProtocol;
+
+    #[test]
+    #[ignore]
+    fn real_smtp_server_round_trip() {
+        let var = |n: &str| std::env::var(n).ok().filter(|v| !v.trim().is_empty());
+        let (Some(host), Some(user), Some(password)) = (var("OVERLOOK_SMTP_TEST_HOST"), var("OVERLOOK_SMTP_TEST_USER"), var("OVERLOOK_SMTP_TEST_PASSWORD")) else {
+            panic!("set OVERLOOK_SMTP_TEST_HOST, OVERLOOK_SMTP_TEST_USER and OVERLOOK_SMTP_TEST_PASSWORD");
+        };
+        let security = var("OVERLOOK_SMTP_TEST_SECURITY").and_then(|s| Security::from_key(&s)).unwrap_or(Security::StartTls);
+        let port = var("OVERLOOK_SMTP_TEST_PORT").and_then(|p| p.parse().ok()).unwrap_or(ServerProtocol::Smtp.default_port(security));
+        let from = var("OVERLOOK_SMTP_TEST_FROM").or_else(|| user.contains('@').then(|| user.clone())).expect("set OVERLOOK_SMTP_TEST_FROM when the user name is not an address");
+        let transport = Transport::new(ServerEndpoint::new(host.clone(), port, security, user), password);
+        transport.probe().unwrap();
+        eprintln!("smtp: connected to {host}:{port} ({}) and authenticated", security.as_key());
+        let Some(to) = var("OVERLOOK_SMTP_TEST_TO") else {
+            eprintln!("smtp: OVERLOOK_SMTP_TEST_TO not set; nothing sent");
+            return;
+        };
+        let id = format!("<interop-{}-{}@overlook.lastrefuge.ai>", std::process::id(), overlook_core::time::now());
+        let message = lettre::Message::builder()
+            .from(format!("Overlook interop test <{from}>").parse().unwrap())
+            .to(to.parse().unwrap())
+            .subject("Overlook SMTP interoperability test")
+            .message_id(Some(id.clone()))
+            .body(format!("Sent by Overlook's ignored real-server test over {} to {host}.\r\n.A line starting with a dot, to check dot-stuffing.\r\n", security.as_key()))
+            .unwrap()
+            .formatted();
+        let reply = transport.send(&from, &[to.clone()], &message).unwrap();
+        eprintln!("smtp: {host} accepted {id} for {to}: {reply}");
+    }
+}

@@ -10,12 +10,12 @@ Gmail is a service; IMAP and POP3 are protocols for accessing mail. Gmail suppor
 
 The proposed roadmap is:
 
-| Stage | Deliverable | Estimated effort |
-|---|---|---:|
-| Foundation | Visual direction, interactive native prototype, technical validation | 2–4 weeks |
-| Phase 1 | Beautiful, dependable Gmail client | 12–18 weeks |
-| Phase 2 | General IMAP accounts with SMTP sending | 8–12 weeks |
-| Phase 3 | POP3 accounts using the existing SMTP system | 4–6 weeks |
+| Stage | Deliverable | Estimated effort | Status (15 October 2026) |
+|---|---|---:|---|
+| Foundation | Visual direction, interactive native prototype, technical validation | 2–4 weeks | Done (see [the foundation plan](foundation-implementation-plan.md)) |
+| Phase 1 | Beautiful, dependable Gmail client | 12–18 weeks | In daily use |
+| Phase 2 | General IMAP accounts with SMTP sending | 8–12 weeks | Built through milestone M5 of the [IMAP and POP3 plan](imap-pop3-implementation-plan.md): setup dialog with autoconfiguration, folders as labels, incremental sync with `CONDSTORE`/`QRESYNC`, `IDLE`, moves, flags, SMTP with the Sent copy, server-side search. Verified against scripted servers only; the real-server matrix needs a test account. XOAUTH2 (Microsoft 365) outstanding. |
+| Phase 3 | POP3 accounts using the existing SMTP system | 4–6 weeks | Built (milestone M4): download-and-keep with `.eml` primary storage, retention policy, backup. Scripted servers only. |
 
 These are planning estimates for **two experienced full-time engineers with part-time design and testing support**: approximately 6–10 months overall. Re-estimate after the foundation stage; public Gmail approval is an additional external dependency.
 

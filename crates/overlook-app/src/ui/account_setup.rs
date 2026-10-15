@@ -70,6 +70,12 @@ pub struct AccountSetup {
     pub delete_after_days: Entity<InputState>,
     /// POP3 retention: delete the server copy when a message is moved to Trash.
     pub delete_when_trashed: bool,
+    /// IMAP folder overrides (`ImapPolicy`): empty means "found automatically".
+    pub archive_folder: Entity<InputState>,
+    pub sent_folder: Entity<InputState>,
+    pub trash_folder: Entity<InputState>,
+    /// IMAP: without a Trash folder, flag `\Deleted` and expunge instead of making one.
+    pub expunge_on_trash: bool,
     /// What the background task is doing, while it runs.
     pub busy: Option<&'static str>,
     /// Where the server settings came from.
@@ -148,6 +154,10 @@ impl MailWindow {
         let out_user = field(cx, "Usually your email address", outgoing.as_ref().map(|e| e.username.clone()).unwrap_or_else(|| email_value.clone()));
         let policy = servers.as_ref().and_then(|s| s.pop3.clone()).unwrap_or_default();
         let delete_after_days = field(cx, "never", policy.delete_after_days.map(|d| d.to_string()).unwrap_or_default());
+        let imap_policy = servers.as_ref().and_then(|s| s.imap.clone()).unwrap_or_default();
+        let archive_folder = field(cx, "Found automatically (or created as Archive)", imap_policy.archive_folder.clone().unwrap_or_default());
+        let sent_folder = field(cx, "Found automatically", imap_policy.sent_folder.clone().unwrap_or_default());
+        let trash_folder = field(cx, "Found automatically (or created as Trash)", imap_policy.trash_folder.clone().unwrap_or_default());
         let out_password = cx.new(|cx| InputState::new(window, cx).placeholder("Outgoing server password").masked(true));
         let same_password = match account.as_ref() {
             Some(a) => !matches!(credentials::load_password(&a.id, credentials::KIND_PASSWORD_OUTGOING), Ok(Some(_))),
@@ -180,6 +190,10 @@ impl MailWindow {
             leave_on_server: policy.leave_on_server,
             delete_after_days,
             delete_when_trashed: policy.delete_on_server_when_trashed,
+            archive_folder,
+            sent_folder,
+            trash_folder,
+            expunge_on_trash: imap_policy.expunge_on_trash,
             busy: None,
             note: None,
             error: None,
@@ -310,6 +324,13 @@ impl MailWindow {
         cx.notify();
     }
 
+    fn setup_toggle_expunge_on_trash(&mut self, expunge: bool, cx: &mut Context<Self>) {
+        if let Some(setup) = self.account_setup.as_mut() {
+            setup.expunge_on_trash = expunge;
+        }
+        cx.notify();
+    }
+
     /// The server settings as typed, validated. The password is `None` when it may stay as
     /// saved (edit mode with the field left empty).
     fn setup_servers(&self, cx: &App) -> Result<(MailServers, Option<String>, Option<String>), String> {
@@ -354,7 +375,6 @@ impl MailWindow {
         if !setup.same_password && out_password.is_none() && !matches!(setup.mode, SetupMode::Edit(_)) {
             return Err("Enter the outgoing server’s password, or use the same password for both.".into());
         }
-        let existing = setup.account_id().and_then(|id| self.store.servers(id).ok().flatten());
         let (pop3, imap) = match setup.kind {
             ProviderKind::Pop3 => {
                 let days = value(&setup.delete_after_days);
@@ -365,7 +385,11 @@ impl MailWindow {
                 };
                 (Some(Pop3Policy { leave_on_server: setup.leave_on_server, delete_after_days: if setup.leave_on_server { delete_after_days } else { None }, delete_on_server_when_trashed: setup.delete_when_trashed }), None)
             }
-            _ => (None, existing.and_then(|s| s.imap)),
+            _ => {
+                let folder = |e: &Entity<InputState>| Some(value(e)).filter(|v| !v.is_empty());
+                let policy = ImapPolicy { archive_folder: folder(&setup.archive_folder), sent_folder: folder(&setup.sent_folder), trash_folder: folder(&setup.trash_folder), expunge_on_trash: setup.expunge_on_trash };
+                (None, Some(policy).filter(|p| *p != ImapPolicy::default()))
+            }
         };
         Ok((MailServers { incoming, outgoing, pop3, imap }, password, out_password))
     }
@@ -505,6 +529,9 @@ impl MailWindow {
         };
         self.providers.insert(account.id.clone(), bundle);
         self.provider_issues.remove(&account.id);
+        // The IDLE watcher follows the provider: started for a new account, restarted when
+        // the settings change.
+        self.refresh_idle_watchers();
         let _ = self.store.set_sync_state(&account.id, &SyncState::Syncing, None);
         self.accounts = self.store.accounts().unwrap_or_default();
         if self.account.id == account.id {
@@ -571,12 +598,11 @@ impl MailWindow {
                 .into_any_element(),
             SetupStep::Servers => v_flex()
                 .gap(px(12.))
-                .when(!matches!(setup.mode, SetupMode::New), |d| {
-                    d.child(field("Your name", Input::new(&setup.name).into_any_element()))
-                        .child(field("Email address", Input::new(&setup.email).into_any_element()))
-                        .child(field("Password", Input::new(&setup.password).into_any_element()))
-                        .child(divider(&p))
-                })
+                // Always shown: a new account has no way back to the first step, and the
+                // address or password may need correcting after a failed test.
+                .child(h_flex().gap(px(10.)).child(div().flex_1().child(field("Your name", Input::new(&setup.name).into_any_element()))).child(div().flex_1().child(field("Email address", Input::new(&setup.email).into_any_element()))))
+                .child(field("Password", Input::new(&setup.password).into_any_element()))
+                .child(divider(&p))
                 .children(setup.note.clone().map(|n| div().text_size(px(12.)).text_color(p.muted).child(n)))
                 .child(div().text_size(px(13.)).font_weight(FontWeight::SEMIBOLD).child(format!("Incoming ({})", setup.incoming_name())))
                 .child(h_flex().gap(px(10.)).child(div().flex_1().child(field("Host", Input::new(&setup.in_host).into_any_element()))).child(div().w(px(90.)).child(field("Port", Input::new(&setup.in_port).into_any_element()))).child(field("Security", self.security_picker("setup-in-security", true, setup.in_security, cx))))
@@ -586,6 +612,15 @@ impl MailWindow {
                 .child(field("User name", Input::new(&setup.out_user).into_any_element()))
                 .child(h_flex().items_center().gap(px(10.)).child(Switch::new("setup-same-password").checked(setup.same_password).label("Use the same password for sending").on_click(cx.listener(|this, checked: &bool, _w, cx| this.setup_toggle_same_password(*checked, cx)))))
                 .when(!setup.same_password, |d| d.child(field("Outgoing password", Input::new(&setup.out_password).into_any_element())))
+                .when(!is_pop3, |d| {
+                    d.child(div().text_size(px(13.)).font_weight(FontWeight::SEMIBOLD).pt(px(6.)).child("Folders on the server"))
+                        .child(div().text_size(px(12.)).text_color(p.muted).child("Sent, Trash and Archive are found from the server’s folder list. Name a folder here only when the server gets it wrong (paths as the server names them, like INBOX/Archive)."))
+                        .child(field("Archive folder", Input::new(&setup.archive_folder).into_any_element()))
+                        .child(field("Sent folder", Input::new(&setup.sent_folder).into_any_element()))
+                        .child(field("Trash folder", Input::new(&setup.trash_folder).into_any_element()))
+                        .child(h_flex().items_center().gap(px(10.)).child(Switch::new("setup-expunge-on-trash").checked(setup.expunge_on_trash).label("Delete permanently when the server has no Trash folder").on_click(cx.listener(|this, checked: &bool, _w, cx| this.setup_toggle_expunge_on_trash(*checked, cx)))))
+                        .when(setup.expunge_on_trash, |d| d.child(div().text_size(px(12.)).text_color(p.muted).child("Without a Trash folder, deleting a message removes it from the server at once instead of creating one.")))
+                })
                 .when(is_pop3, |d| {
                     d.child(div().text_size(px(13.)).font_weight(FontWeight::SEMIBOLD).pt(px(6.)).child("On the server"))
                         .child(h_flex().items_center().gap(px(10.)).child(Switch::new("setup-leave-on-server").checked(setup.leave_on_server).label("Leave messages on the server after downloading").on_click(cx.listener(|this, checked: &bool, _w, cx| this.setup_toggle_leave_on_server(*checked, cx)))))
@@ -643,6 +678,9 @@ impl MailWindow {
                 v_flex()
                     .id("account-setup-dialog")
                     .w(px(560.))
+                    // A flex child with `min_h_0` needs a definite height to fill; without
+                    // this the body and footer collapse to nothing.
+                    .h(px(if setup.step == SetupStep::Basics { 400. } else { 1060. }))
                     .max_w(relative(0.94))
                     .max_h(relative(0.92))
                     .rounded(px(12.))

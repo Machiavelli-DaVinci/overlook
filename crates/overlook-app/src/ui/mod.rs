@@ -267,6 +267,11 @@ pub struct MailWindow {
     providers: HashMap<AccountId, providers::AccountProviders>,
     /// Why an account has no provider (shown as “Sign-in required”).
     provider_issues: HashMap<AccountId, String>,
+    /// The `IDLE` thread per IMAP account (see `overlook_provider::imap::idle`); each one
+    /// reports Inbox changes through `idle_events`, which `watch_idle_events` turns into a
+    /// sync of that account. Rebuilt by `refresh_idle_watchers` whenever `providers` change.
+    idle_watchers: HashMap<AccountId, overlook_provider::imap::idle::IdleWatcher>,
+    idle_events: tokio::sync::mpsc::UnboundedSender<AccountId>,
     signin: Option<SignIn>,
     /// The account whose mail the window shows.
     account: Account,
@@ -402,6 +407,7 @@ impl MailWindow {
         let search_input = cx.new(|cx| InputState::new(window, cx).placeholder("Search mail"));
         let contact_search = cx.new(|cx| InputState::new(window, cx).placeholder("Search contacts"));
         let mut subs = Vec::new();
+        let (idle_tx, idle_rx) = tokio::sync::mpsc::unbounded_channel::<AccountId>();
         subs.push(cx.subscribe_in(&contact_search, window, |this, state, event: &InputEvent, _window, cx| {
             if matches!(event, InputEvent::Change) {
                 this.contact_query = state.read(cx).value().to_string();
@@ -456,6 +462,8 @@ impl MailWindow {
             sample,
             accounts,
             providers,
+            idle_watchers: HashMap::new(),
+            idle_events: idle_tx,
             provider_issues,
             signin: None,
             account,
@@ -564,6 +572,9 @@ impl MailWindow {
         // Synchronize on startup for every reachable account; queued work from a previous
         // session is replayed before anything else happens.
         this.sync_all(window, cx);
+        // IMAP IDLE: one thread per account asks for a sync the moment the Inbox changes.
+        this.watch_idle_events(idle_rx, window, cx);
+        this.refresh_idle_watchers();
         // `OVERLOOK_SIGN_IN=gmail` opens the Google sign-in immediately (first-run helper).
         match std::env::var("OVERLOOK_SIGN_IN").as_deref() {
             Ok("gmail") => this.start_google_sign_in(None, window, cx),
@@ -668,11 +679,15 @@ impl MailWindow {
     }
 
     /// The provider's name in status lines ("Searching Gmail…").
-    pub(crate) fn provider_name(&self, account: &AccountId) -> &'static str {
+    pub(crate) fn provider_name(&self, account: &AccountId) -> String {
         match self.accounts.iter().find(|a| &a.id == account).map(|a| a.provider) {
-            Some(ProviderKind::Sample) => "the sample server",
-            Some(ProviderKind::Gmail) => "Gmail",
-            _ => "the mail server",
+            Some(ProviderKind::Sample) => "the sample server".into(),
+            Some(ProviderKind::Gmail) => "Gmail".into(),
+            Some(ProviderKind::Imap) => match self.providers.get(account).and_then(|p| p.imap.as_ref()) {
+                Some(imap) => imap.servers().incoming.host.clone(),
+                None => "the IMAP server".into(),
+            },
+            _ => "the mail server".into(),
         }
     }
 
@@ -725,10 +740,11 @@ impl MailWindow {
         self.providers.remove(&id);
         self.provider_issues.remove(&id);
         self.syncing.remove(&id);
+        self.refresh_idle_watchers();
         self.accounts = self.store.accounts().unwrap_or_default();
         if self.accounts.is_empty() {
             if let Ok(sample) = crate::seed_sample_account(&self.store) {
-                self.providers.insert(sample.id.clone(), providers::AccountProviders { mail: Arc::new(self.sample.clone()), calendar: Some(Arc::new(self.sample.clone())) });
+                self.providers.insert(sample.id.clone(), providers::AccountProviders::new(Arc::new(self.sample.clone()), Some(Arc::new(self.sample.clone()))));
                 self.accounts.push(sample);
             }
         }
@@ -1474,13 +1490,15 @@ impl MailWindow {
                     let ids = provider.search(&account, &query, 60).await?;
                     let missing: Vec<ProviderId> = ids
                         .into_iter()
-                        .filter(|pid| store.message(&MessageId(format!("{}:{}", account.id.0, pid.0))).ok().flatten().is_none())
+                        .filter(|pid| store.message_id_for_provider_id(&account.id, pid).ok().flatten().is_none())
                         .take(FETCH_LIMIT)
                         .collect();
                     if missing.is_empty() {
                         return Ok::<usize, overlook_provider::ProviderError>(0);
                     }
-                    let messages = provider.fetch_messages(&account, &missing, &labels).await?;
+                    let mut messages = provider.fetch_messages(&account, &missing, &labels).await?;
+                    // IMAP rows arrive without a conversation; thread them like a sync would.
+                    crate::sync::reconcile_incoming(&store, &account.id, &mut messages, &mut Vec::new());
                     let protected = store.pending_message_ids(&account.id).unwrap_or_default();
                     store.merge_remote_messages(&messages, &protected).map_err(|e| overlook_provider::ProviderError::Temporary(e.to_string()))?;
                     Ok(messages.len())
@@ -2062,7 +2080,53 @@ impl MailWindow {
             // Drop the coverage marker so the next sync lists the mailboxes again.
             let _ = self.store.set_setting(&format!("download_coverage:{}", a.id.0), &0u32);
         }
+        self.refresh_idle_watchers();
         self.sync_all(window, cx);
+    }
+
+    /// Starts an `IDLE` thread for every IMAP account that has a provider and stops the
+    /// ones whose account or provider went away. A provider rebuilt with new settings gets a
+    /// fresh thread (the old one is dropped, which shuts its socket). Idempotent.
+    pub(crate) fn refresh_idle_watchers(&mut self) {
+        let wanted: HashMap<AccountId, Arc<overlook_provider::imap::ImapProvider>> = self.providers.iter().filter_map(|(id, p)| p.imap.clone().map(|imap| (id.clone(), imap))).collect();
+        self.idle_watchers.retain(|id, _| wanted.contains_key(id));
+        for (id, provider) in wanted {
+            let tag = Arc::as_ptr(&provider) as usize;
+            let stale = self.idle_watchers.get(&id).is_some_and(|w| w.tag() != tag);
+            if stale {
+                self.idle_watchers.remove(&id);
+            }
+            if self.idle_watchers.contains_key(&id) {
+                continue;
+            }
+            let events = self.idle_events.clone();
+            let account = id.clone();
+            let watcher = provider.idle_watcher(move |event| {
+                if event == overlook_provider::imap::idle::IdleEvent::Changed {
+                    let _ = events.send(account.clone());
+                }
+            });
+            self.idle_watchers.insert(id, watcher.with_tag(tag));
+        }
+    }
+
+    /// Turns `IDLE` reports into syncs of the account that changed. Runs for the window's
+    /// lifetime; the channel wakes the task, so nothing polls.
+    fn watch_idle_events(&mut self, mut events: tokio::sync::mpsc::UnboundedReceiver<AccountId>, window: &mut Window, cx: &mut Context<Self>) {
+        cx.spawn_in(window, async move |this, cx| {
+            while let Some(id) = events.recv().await {
+                let alive = this.update_in(cx, |this, window, cx| {
+                    if this.connected(&id) {
+                        this.next_retry.remove(&id);
+                        this.sync_account(id, window, cx);
+                    }
+                });
+                if alive.is_err() {
+                    break;
+                }
+            }
+        })
+        .detach();
     }
     fn on_reply_all(&mut self, _: &ReplyAll, window: &mut Window, cx: &mut Context<Self>) {
         self.reply(DraftKind::ReplyAll, window, cx);

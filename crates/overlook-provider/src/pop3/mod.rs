@@ -95,9 +95,15 @@ pub struct SeenEntry {
     pub size: u64,
     /// The server no longer lists it.
     pub deleted_on_server: bool,
+    /// When the server was first seen not to list it (ms since the epoch); cleared when it
+    /// reappears. Drives [`Checkpoint::prune`].
+    pub deleted_at: Option<i64>,
 }
 
-/// The ledger of every UIDL ever listed: the sync checkpoint.
+/// The ledger of every UIDL ever listed: the sync checkpoint. Entries for UIDLs the server
+/// stopped listing are pruned once they have been gone for [`Checkpoint::PRUNE_AFTER_MS`],
+/// and the oldest of them go first when more than [`Checkpoint::DELETED_CAP`] remain, so the
+/// JSON parsed every cycle stays bounded by the maildrop's size.
 #[derive(Debug, Clone, Default, PartialEq, Eq, Serialize, Deserialize)]
 #[serde(default)]
 pub struct Checkpoint {
@@ -107,6 +113,27 @@ pub struct Checkpoint {
 
 impl Checkpoint {
     pub const VERSION: u32 = 1;
+    /// How long a UIDL stays in the ledger after the server stopped listing it (30 days):
+    /// long enough that a maildrop restored from a backup does not download its mail twice.
+    pub const PRUNE_AFTER_MS: i64 = 30 * 86_400_000;
+    /// Entries for vanished UIDLs kept at most, oldest pruned first.
+    pub const DELETED_CAP: usize = 10_000;
+
+    /// Drops ledger entries for UIDLs that have been gone from the server long enough, and
+    /// the oldest gone ones beyond the cap. Entries the server still lists are never
+    /// touched. Returns how many were removed.
+    pub fn prune(&mut self, now: i64) -> usize {
+        let before = self.entries.len();
+        self.entries.retain(|_, e| !(e.deleted_on_server && e.deleted_at.is_some_and(|at| now.saturating_sub(at) >= Self::PRUNE_AFTER_MS)));
+        let mut gone: Vec<(i64, String)> = self.entries.iter().filter(|(_, e)| e.deleted_on_server).map(|(u, e)| (e.deleted_at.unwrap_or(e.seen_at), u.clone())).collect();
+        if gone.len() > Self::DELETED_CAP {
+            gone.sort();
+            for (_, uidl) in gone.iter().take(gone.len() - Self::DELETED_CAP) {
+                self.entries.remove(uidl);
+            }
+        }
+        before - self.entries.len()
+    }
 
     pub fn parse(text: &str) -> Result<Self, ProviderError> {
         let cp: Checkpoint = serde_json::from_str(text).map_err(|_| ProviderError::CheckpointExpired)?;
@@ -250,11 +277,16 @@ impl Pop3Provider {
                     Err(e) => return Err(e),
                 }
             }
-            cp.entries.insert((*uidl).to_owned(), SeenEntry { id: id.0, seen_at: now, size, deleted_on_server: false });
+            cp.entries.insert((*uidl).to_owned(), SeenEntry { id: id.0, seen_at: now, size, deleted_on_server: false, deleted_at: None });
             ids.push(ProviderId((*uidl).to_owned()));
         }
         for (uidl, entry) in cp.entries.iter_mut() {
             entry.deleted_on_server = !on_server.contains_key(uidl.as_str());
+            entry.deleted_at = match (entry.deleted_on_server, entry.deleted_at) {
+                (false, _) => None,
+                (true, Some(at)) => Some(at),
+                (true, None) => Some(now),
+            };
         }
 
         // Retention: only messages whose bytes are on disk, never ones listed just now.
@@ -267,6 +299,7 @@ impl Pop3Provider {
             match client.dele(*n) {
                 Ok(()) => {
                     entry.deleted_on_server = true;
+                    entry.deleted_at = Some(now);
                     deleted += 1;
                 }
                 Err(ProviderError::Rejected(words)) => warn!("pop3: {} would not delete message {n}: {words}", self.servers.incoming.host),
@@ -275,6 +308,10 @@ impl Pop3Provider {
         }
         // QUIT commits the deletions; a lost connection here means they may not have happened.
         client.quit()?;
+        let pruned = cp.prune(now);
+        if pruned > 0 {
+            info!("pop3: dropped {pruned} ledger entries for mail gone from {} for over 30 days", self.servers.incoming.host);
+        }
         if !ids.is_empty() || deleted > 0 {
             info!("pop3: {} new of {} on {}, {deleted} deleted there", ids.len(), listing.len(), self.servers.incoming.host);
         }
@@ -349,7 +386,7 @@ impl Pop3Provider {
                 }
                 Err(e) => return Err(e),
             };
-            let entry = guard.cp.entries.entry(pid.0.clone()).or_insert_with(|| SeenEntry { id: Self::local_id(account).0, seen_at: now(), size: bytes.len() as u64, deleted_on_server: false });
+            let entry = guard.cp.entries.entry(pid.0.clone()).or_insert_with(|| SeenEntry { id: Self::local_id(account).0, seen_at: now(), size: bytes.len() as u64, deleted_on_server: false, deleted_at: None });
             let id = MessageId(entry.id.clone());
             self.write_raw(&id, &bytes)?;
             out.push(message_from_rfc822(account, &bytes, id, &Self::inbox_flags(account, &pid.0, entry.seen_at)));
@@ -493,14 +530,38 @@ mod unit {
     #[test]
     fn checkpoint_round_trips_and_rejects_other_shapes() {
         let mut cp = Checkpoint { version: Checkpoint::VERSION, ..Default::default() };
-        cp.entries.insert("u1".into(), SeenEntry { id: "pop3:j:abc".into(), seen_at: 5, size: 10, deleted_on_server: true });
+        cp.entries.insert("u1".into(), SeenEntry { id: "pop3:j:abc".into(), seen_at: 5, size: 10, deleted_on_server: true, deleted_at: Some(6) });
         let json = cp.to_json();
         assert_eq!(Checkpoint::parse(&json).unwrap(), cp);
+        let old = Checkpoint::parse(r#"{"version":1,"entries":{"u2":{"id":"pop3:j:def","seen_at":1,"size":2,"deleted_on_server":true}}}"#).unwrap();
+        assert_eq!(old.entries["u2"].deleted_at, None, "a ledger written before pruning existed still parses");
         assert_eq!(Checkpoint::parse("12345"), Err(ProviderError::CheckpointExpired));
         assert_eq!(Checkpoint::parse(r#"{"version":9}"#), Err(ProviderError::CheckpointExpired));
         let rows = seen_rows(&json);
         assert_eq!(rows, vec![Pop3Seen { uidl: "u1".into(), seen_at: 5, deleted_on_server: true }]);
         assert!(seen_rows("garbage").is_empty());
+    }
+
+    #[test]
+    fn ledger_prunes_long_gone_uidls_and_caps_the_rest() {
+        let day = 86_400_000;
+        let entry = |seen_at: i64, deleted_at: Option<i64>| SeenEntry { id: "x".into(), seen_at, size: 1, deleted_on_server: deleted_at.is_some(), deleted_at };
+        let mut cp = Checkpoint { version: Checkpoint::VERSION, ..Default::default() };
+        cp.entries.insert("live-old".into(), entry(0, None));
+        cp.entries.insert("gone-recently".into(), entry(0, Some(100 * day - 29 * day)));
+        cp.entries.insert("gone-long-ago".into(), entry(0, Some(100 * day - 31 * day)));
+        // Written before `deleted_at` existed: counts as gone since first seen.
+        cp.entries.insert("gone-untimed".into(), SeenEntry { id: "y".into(), seen_at: 0, size: 1, deleted_on_server: true, deleted_at: None });
+        assert_eq!(cp.prune(100 * day), 1);
+        assert_eq!(cp.entries.keys().collect::<Vec<_>>(), vec!["gone-recently", "gone-untimed", "live-old"], "a live UIDL is never pruned however old; recent and untimed gone ones stay");
+
+        let mut big = Checkpoint { version: Checkpoint::VERSION, ..Default::default() };
+        for i in 0..(Checkpoint::DELETED_CAP + 5) {
+            big.entries.insert(format!("g{i:06}"), entry(0, Some(i as i64)));
+        }
+        big.entries.insert("live".into(), entry(0, None));
+        assert_eq!(big.prune(10), 5, "the oldest beyond the cap go first");
+        assert!(!big.entries.contains_key("g000000") && big.entries.contains_key("g000005") && big.entries.contains_key("live"));
     }
 
     #[test]

@@ -792,3 +792,288 @@ fn real_imap_server_round_trip() {
     eprintln!("changes: {} upserts, {} deleted, {} bodies queued", changes.upserts.len(), changes.deleted_provider_ids.len(), changes.message_ids.len());
     p.disconnect();
 }
+
+// ------------------------------------------------------- M5: fast paths, search, IDLE
+
+fn condstore_mailbox(qresync: bool) -> FakeState {
+    let mut state = mailbox();
+    state.capabilities = format!("IMAP4rev1 UIDPLUS MOVE IDLE SPECIAL-USE LITERAL+ ENABLE CONDSTORE{}", if qresync { " QRESYNC" } else { "" });
+    state
+}
+
+#[test]
+fn qresync_changes_come_from_changedsince_and_vanished() {
+    let server = serve(condstore_mailbox(true));
+    let p = provider(&server);
+    let acct = account();
+    let snap = block(p.fetch_snapshot(&acct)).unwrap();
+    let caps = p.capabilities();
+    assert!(caps.condstore && caps.qresync && caps.literal_plus, "{caps:?}");
+    assert!(server.lock().log.iter().any(|l| l.contains("ENABLE QRESYNC")));
+    let cp = Checkpoint::parse(snap.checkpoint.as_deref().unwrap()).unwrap();
+    assert!(cp.folders["INBOX"].highest_modseq > 0, "the snapshot records HIGHESTMODSEQ");
+    let searches_before = server.lock().commands("UID SEARCH ALL");
+
+    // A quiet cycle costs one EXAMINE per folder and nothing else.
+    let quiet = block(p.fetch_changes(&acct, &cp.to_json())).unwrap();
+    assert!(quiet.upserts.is_empty() && quiet.deleted_provider_ids.is_empty() && quiet.message_ids.is_empty());
+    {
+        let state = server.lock();
+        assert_eq!(state.commands("UID SEARCH ALL"), searches_before, "no UID SEARCH ALL with QRESYNC");
+        assert_eq!(state.commands("CHANGEDSINCE"), 0, "an unchanged HIGHESTMODSEQ skips the fetch");
+    }
+    let cp = quiet.checkpoint.unwrap();
+
+    {
+        let mut s = server.lock();
+        let inbox = s.folder_mut("INBOX");
+        inbox.set_flags(2, &["\\Seen"]);
+        inbox.remove(3);
+        inbox.add(FakeMessage::new(&[], "15-Oct-2026 08:00:00 +0000", msg(&["From: new@example.com", "To: jason@example.com", "Subject: Fresh", "Message-ID: <fresh@example.com>", "Date: Thu, 15 Oct 2026 08:00:00 +0000"], "new body\r\n")));
+        // Touched but not flipped: a STORE that set a flag the cursor already knew.
+        inbox.set_flags(1, &["\\Seen"]);
+        s.folder_mut("Work/Clients").set_flags(1, &["\\Flagged"]);
+    }
+    let changes = block(p.fetch_changes(&acct, &cp)).unwrap();
+    assert_eq!(changes.deleted_provider_ids, vec![pid("INBOX", 1760400000, 3)], "VANISHED reported the expunge");
+    assert_eq!(changes.message_ids, vec![pid("INBOX", 1760400000, 6)]);
+    let subjects: Vec<(&str, bool, bool)> = changes.upserts.iter().map(|m| (m.subject.as_str(), m.is_read, m.is_starred)).collect();
+    assert_eq!(subjects, vec![("Fresh", false, false), ("Re: Plain hello", true, false), ("Contract", false, true)], "new mail, then flipped flags, in every folder every cycle");
+    {
+        let state = server.lock();
+        assert_eq!(state.commands("UID SEARCH ALL"), searches_before, "deletions came from VANISHED");
+        assert!(state.log.iter().any(|l| l.contains("(CHANGEDSINCE") && l.contains("VANISHED)")), "{:?}", state.log);
+        assert!(state.log.iter().any(|l| l.contains("UID FETCH 6:* (UID)")), "new mail is found above the cursor: {:?}", state.log);
+    }
+    let parsed = Checkpoint::parse(changes.checkpoint.as_deref().unwrap()).unwrap();
+    let inbox = &parsed.folders["INBOX"];
+    assert_eq!((inbox.known.as_str(), inbox.seen.as_str(), inbox.flagged.as_str(), inbox.highest_uid), ("1:2,4:6", "1:2", "", 6));
+    assert_eq!(inbox.highest_modseq, server.lock().folder("INBOX").highest_modseq);
+    assert_eq!(parsed.folders["Work/Clients"].flagged, "1");
+
+    // Another quiet cycle after the changes: still nothing, still no search.
+    let again = block(p.fetch_changes(&acct, &parsed.to_json())).unwrap();
+    assert!(again.upserts.is_empty() && again.deleted_provider_ids.is_empty());
+    assert_eq!(server.lock().commands("UID SEARCH ALL"), searches_before);
+}
+
+#[test]
+fn condstore_without_qresync_keeps_the_uid_diff_for_deletions() {
+    let server = serve(condstore_mailbox(false));
+    let p = provider(&server);
+    let acct = account();
+    let snap = block(p.fetch_snapshot(&acct)).unwrap();
+    let caps = p.capabilities();
+    assert!(caps.condstore && !caps.qresync, "{caps:?}");
+    assert!(!server.lock().log.iter().any(|l| l.contains("ENABLE")), "nothing to enable");
+    let cp = snap.checkpoint.unwrap();
+    let searches_before = server.lock().commands("UID SEARCH ALL");
+    {
+        let mut s = server.lock();
+        let inbox = s.folder_mut("INBOX");
+        inbox.set_flags(2, &["\\Seen"]);
+        inbox.remove(3);
+    }
+    let changes = block(p.fetch_changes(&acct, &cp)).unwrap();
+    assert_eq!(changes.deleted_provider_ids, vec![pid("INBOX", 1760400000, 3)]);
+    assert_eq!(changes.upserts.iter().map(|m| m.subject.as_str()).collect::<Vec<_>>(), vec!["Re: Plain hello"]);
+    let state = server.lock();
+    assert_eq!(state.commands("UID SEARCH ALL"), searches_before + 3, "one per non-empty folder: the diff still finds deletions");
+    assert!(state.log.iter().any(|l| l.contains("(CHANGEDSINCE") && !l.contains("VANISHED")), "{:?}", state.log);
+    assert!(!state.log.iter().any(|l| l.contains("(UID FLAGS))")), "no full flag refresh: {:?}", state.log);
+}
+
+#[test]
+fn a_checkpoint_without_modseq_takes_the_plain_path_once() {
+    let server = serve(condstore_mailbox(true));
+    let p = provider(&server);
+    let acct = account();
+    let snap = block(p.fetch_snapshot(&acct)).unwrap();
+    let mut cp = Checkpoint::parse(snap.checkpoint.as_deref().unwrap()).unwrap();
+    for cursor in cp.folders.values_mut() {
+        cursor.highest_modseq = 0;
+    }
+    server.lock().folder_mut("INBOX").set_flags(2, &["\\Seen"]);
+    let before = server.lock().commands("UID SEARCH ALL");
+    let changes = block(p.fetch_changes(&acct, &cp.to_json())).unwrap();
+    assert_eq!(changes.upserts.iter().map(|m| m.subject.as_str()).collect::<Vec<_>>(), vec!["Re: Plain hello"]);
+    assert_eq!(server.lock().commands("UID SEARCH ALL"), before + 3, "an old checkpoint is read the slow way");
+    let parsed = Checkpoint::parse(changes.checkpoint.as_deref().unwrap()).unwrap();
+    assert!(parsed.folders.values().all(|c| c.highest_modseq > 0), "and records MODSEQ for the next cycle");
+}
+
+#[test]
+fn server_search_runs_text_search_per_folder() {
+    let mut state = mailbox();
+    state.folder_mut("Trash").add(FakeMessage::new(&[], "01-Oct-2026 00:00:00 +0000", msg(&["From: x@example.com", "Subject: Contract draft", "Message-ID: <trash-1@example.com>"], "old contract\r\n")));
+    let server = serve(state);
+    let p = provider(&server);
+    let acct = account();
+    let hits = block(p.search(&acct, "contract", 60)).unwrap();
+    assert_eq!(hits, vec![pid("Work/Clients", 1760400002, 2), pid("Work/Clients", 1760400002, 1)], "newest first within a folder; Trash is not searched");
+    let hits = block(p.search(&acct, "plain HELLO", 60)).unwrap();
+    assert_eq!(hits, vec![pid("INBOX", 1760400000, 2), pid("INBOX", 1760400000, 1), pid("Sent", 1760400001, 1)], "Inbox first; every word must match");
+    assert_eq!(block(p.search(&acct, "plain hello", 2)).unwrap().len(), 2, "the limit holds across folders");
+    assert_eq!(block(p.search(&acct, "Grégoire", 60)).unwrap(), vec![pid("INBOX", 1760400000, 2)], "non-ASCII words go as literals");
+    assert!(block(p.search(&acct, "   ", 60)).unwrap().is_empty());
+    let state = server.lock();
+    assert!(state.log.iter().any(|l| l.contains("UID SEARCH TEXT \"plain\" TEXT \"HELLO\"")), "{:?}", state.log);
+    assert!(state.log.iter().any(|l| l.contains("UID SEARCH CHARSET UTF-8 TEXT \"Grégoire\"")), "the literal arrived: {:?}", state.log);
+    assert!(!state.log.iter().any(|l| l.contains("EXAMINE \"Trash\"")));
+}
+
+fn idle_events(server: &FakeServer) -> (idle::IdleWatcher, std::sync::mpsc::Receiver<idle::IdleEvent>) {
+    let (tx, rx) = std::sync::mpsc::channel();
+    let watcher = provider(server).idle_watcher(move |event| {
+        let _ = tx.send(event);
+    });
+    (watcher, rx)
+}
+
+#[test]
+fn idle_reports_inbox_changes_and_stops_at_once() {
+    let server = serve(mailbox());
+    let (mut watcher, rx) = idle_events(&server);
+    let deadline = std::time::Instant::now() + Duration::from_secs(5);
+    while server.lock().commands(" IDLE") == 0 {
+        assert!(std::time::Instant::now() < deadline, "IDLE was never issued: {:?}", server.lock().log);
+        std::thread::sleep(Duration::from_millis(20));
+    }
+    assert!(rx.recv_timeout(Duration::from_millis(500)).is_err(), "nothing reported while nothing changes");
+    server.lock().folder_mut("INBOX").add(FakeMessage::new(&[], "15-Oct-2026 08:00:00 +0000", msg(&["From: new@example.com", "Subject: Delivered", "Message-ID: <idle-1@example.com>"], "body\r\n")));
+    assert_eq!(rx.recv_timeout(Duration::from_secs(5)), Ok(idle::IdleEvent::Changed), "new mail is reported within seconds: {:?}", server.lock().log);
+    // A flag change made elsewhere is reported too, and IDLE is re-entered in between.
+    server.lock().folder_mut("INBOX").set_flags(1, &[]);
+    assert_eq!(rx.recv_timeout(Duration::from_secs(5)), Ok(idle::IdleEvent::Changed));
+    {
+        let state = server.lock();
+        assert!(state.commands(" IDLE") >= 2, "{:?}", state.log);
+        assert!(state.log.iter().any(|l| l.contains("EXAMINE \"INBOX\"")));
+        assert_eq!(state.connections, 1, "one extra connection, never the provider's");
+    }
+    let started = std::time::Instant::now();
+    watcher.stop();
+    assert!(started.elapsed() < Duration::from_secs(2), "stopping shuts the socket down instead of waiting for the IDLE timeout");
+    assert!(!watcher.is_running());
+}
+
+#[test]
+fn idle_reconnects_after_a_dropped_connection() {
+    let server = serve(mailbox());
+    let (mut watcher, rx) = idle_events(&server);
+    let deadline = std::time::Instant::now() + Duration::from_secs(5);
+    while server.lock().commands(" IDLE") == 0 {
+        assert!(std::time::Instant::now() < deadline);
+        std::thread::sleep(Duration::from_millis(20));
+    }
+    server.lock().kill_idle = true;
+    // Backoff after a working session is the first step (2 s); the second connection then IDLEs again.
+    let deadline = std::time::Instant::now() + Duration::from_secs(10);
+    while server.lock().connections < 2 || server.lock().commands(" IDLE") < 2 {
+        assert!(std::time::Instant::now() < deadline, "no reconnect: {:?}", server.lock().log);
+        std::thread::sleep(Duration::from_millis(50));
+    }
+    server.lock().folder_mut("INBOX").add(FakeMessage::new(&[], "15-Oct-2026 08:00:00 +0000", msg(&["From: new@example.com", "Subject: After reconnect", "Message-ID: <idle-2@example.com>"], "body\r\n")));
+    assert_eq!(rx.recv_timeout(Duration::from_secs(5)), Ok(idle::IdleEvent::Changed));
+    watcher.stop();
+}
+
+#[test]
+fn idle_ends_on_servers_without_it_or_with_a_refused_login() {
+    let server = serve(FakeState { capabilities: "IMAP4rev1 UIDPLUS MOVE SPECIAL-USE".into(), ..mailbox() });
+    let (watcher, rx) = idle_events(&server);
+    assert_eq!(rx.recv_timeout(Duration::from_secs(5)), Ok(idle::IdleEvent::Unsupported));
+    std::thread::sleep(Duration::from_millis(100));
+    assert!(!watcher.is_running(), "polling is the fallback; the thread is gone");
+    assert!(server.lock().log.iter().any(|l| l.contains("LOGOUT")));
+
+    let server = serve(FakeState { login: Login::AuthFailed, ..mailbox() });
+    let (watcher, rx) = idle_events(&server);
+    assert_eq!(rx.recv_timeout(Duration::from_secs(5)), Ok(idle::IdleEvent::SignInRequired));
+    std::thread::sleep(Duration::from_millis(100));
+    assert!(!watcher.is_running());
+    assert_eq!(server.lock().connections, 1, "a refused password is not retried");
+}
+
+/// The write path against a real server, for the interoperability matrix. Same variables as
+/// [`real_imap_server_round_trip`]; run with
+/// `cargo test -p overlook-provider real_imap_server_write -- --ignored --nocapture`.
+/// Everything happens in a folder of its own (`Overlook-Test-<pid>`), created and deleted
+/// here: a message is appended to it with a raw session, then the provider lists the new
+/// folder, downloads the message, stars it, marks it read, moves it to Trash and expunges
+/// it there, and the folder is deleted. Nothing else in the account is touched.
+#[test]
+#[ignore]
+fn real_imap_server_write_round_trip() {
+    let var = |n: &str| std::env::var(n).ok().filter(|v| !v.trim().is_empty());
+    let (Some(host), Some(user), Some(password)) = (var("OVERLOOK_IMAP_TEST_HOST"), var("OVERLOOK_IMAP_TEST_USER"), var("OVERLOOK_IMAP_TEST_PASSWORD")) else {
+        panic!("set OVERLOOK_IMAP_TEST_HOST, OVERLOOK_IMAP_TEST_USER and OVERLOOK_IMAP_TEST_PASSWORD");
+    };
+    let security = var("OVERLOOK_IMAP_TEST_SECURITY").and_then(|s| Security::from_key(&s)).unwrap_or(Security::Tls);
+    let port = var("OVERLOOK_IMAP_TEST_PORT").and_then(|p| p.parse().ok()).unwrap_or(ServerProtocol::Imap.default_port(security));
+    let endpoint = ServerEndpoint::new(host.clone(), port, security, user.clone());
+    let servers = MailServers { incoming: endpoint.clone(), outgoing: ServerEndpoint::new("", 0, security, user.clone()), pop3: None, imap: None };
+    let p = ImapProvider::new(servers, password.clone()).with_inbox_limit(20);
+    let acct = Account { id: AccountId(format!("imap:{user}")), provider: ProviderKind::Imap, display_name: user.clone(), email: user, created_at: 0 };
+    let pid = std::process::id();
+    let rfc_id = format!("<write-test-{pid}@overlook.lastrefuge.ai>");
+
+    // A raw session plays "another client": it makes the scratch folder and a message in it.
+    let mut other = connection::connect(&endpoint, &password, Duration::from_secs(30)).unwrap();
+    let delimiter = other.list(Some(""), Some("")).ok().and_then(|names| names.iter().next().and_then(|n| n.delimiter().map(str::to_owned))).unwrap_or_else(|| "/".into());
+    let prefix = if other.list(Some(""), Some("*")).map(|names| names.iter().all(|n| n.name() == "INBOX" || n.name().starts_with(&format!("INBOX{delimiter}")))).unwrap_or(false) { format!("INBOX{delimiter}") } else { String::new() };
+    let scratch = format!("{prefix}Overlook-Test-{pid}");
+    other.create(&scratch).unwrap();
+    let raw = format!("From: Overlook test <test@overlook.lastrefuge.ai>\r\nTo: {}\r\nSubject: Overlook IMAP write test {pid}\r\nMessage-ID: {rfc_id}\r\nDate: Wed, 15 Oct 2026 12:00:00 +0000\r\nMIME-Version: 1.0\r\nContent-Type: text/plain; charset=utf-8\r\n\r\nThis message exists only for Overlook's write-path test and is deleted by it.\r\n", acct.email);
+    other.append(&scratch, raw.as_bytes()).finish().unwrap();
+    eprintln!("created {scratch:?} with one message");
+
+    let outcome = (|| -> Result<(), String> {
+        block(p.probe()).map_err(|e| e.to_string())?;
+        eprintln!("capabilities: {:?}", p.capabilities());
+        let snap = block(p.fetch_snapshot(&acct)).map_err(|e| format!("snapshot: {e}"))?;
+        let labels = snap.labels.clone();
+        let label = labels.iter().find(|l| l.provider_id.as_ref().is_some_and(|x| x.0 == scratch)).ok_or("the scratch folder was not listed")?.clone();
+        let wanted: Vec<ProviderId> = snap.message_ids.iter().filter(|id| MessageRef::parse(id).is_some_and(|r| r.folder == scratch)).cloned().collect();
+        if wanted.len() != 1 {
+            return Err(format!("expected one queued message in {scratch}, got {}", wanted.len()));
+        }
+        let mut messages = block(p.fetch_messages(&acct, &wanted, &labels)).map_err(|e| format!("fetch: {e}"))?;
+        let mut message = messages.pop().ok_or("the message did not download")?;
+        if message.rfc_message_id.as_deref() != Some(rfc_id.as_str()) || message.label_ids.iter().next() != Some(&label.id) {
+            return Err(format!("unexpected message: {:?} in {:?}", message.rfc_message_id, message.label_ids));
+        }
+        message.id = MessageId(format!("{}:write-test", acct.id.0));
+        let ops = |kind: OperationKind| PendingOperation { id: OperationId::from("op"), account_id: acct.id.clone(), seq: 1, kind, state: OperationState::Pending, attempts: 0, last_error: None, created_at: 0, updated_at: 0 };
+        block(p.apply(&acct, &ops(OperationKind::SetStarred { message_ids: vec![message.id.clone()], starred: true }), std::slice::from_ref(&message), &labels)).map_err(|e| format!("star: {e}"))?;
+        block(p.apply(&acct, &ops(OperationKind::SetRead { message_ids: vec![message.id.clone()], read: true }), std::slice::from_ref(&message), &labels)).map_err(|e| format!("read: {e}"))?;
+        let changes = block(p.fetch_changes(&acct, snap.checkpoint.as_deref().unwrap())).map_err(|e| format!("changes: {e}"))?;
+        let seen = changes.upserts.iter().find(|m| m.rfc_message_id.as_deref() == Some(rfc_id.as_str())).ok_or("the flag changes were not reported back")?;
+        if !(seen.is_read && seen.is_starred) {
+            return Err(format!("flags did not stick: read {} starred {}", seen.is_read, seen.is_starred));
+        }
+        eprintln!("flags: \\Flagged and \\Seen stored and read back");
+        let applied = block(p.apply(&acct, &ops(OperationKind::Trash { message_ids: vec![message.id.clone()] }), std::slice::from_ref(&message), &labels)).map_err(|e| format!("trash: {e}"))?;
+        let (_, new_pid, trash_label) = applied.provider_ids.first().ok_or("the move reported no new provider id")?;
+        let moved = MessageRef::parse(new_pid).ok_or("bad provider id after the move")?;
+        eprintln!("moved to {:?} (uid {}, label {}){}", moved.folder, moved.uid, trash_label.0, if applied.labels.is_empty() { "" } else { ", Trash folder created on demand" });
+        // Clean up the server copy: flag \Deleted and expunge just that UID.
+        let mut session = connection::connect(&endpoint, &password, Duration::from_secs(30)).unwrap();
+        session.select(&moved.folder).map_err(|e| e.to_string())?;
+        let found = session.uid_search(format!("HEADER Message-ID \"{rfc_id}\"")).map_err(|e| e.to_string())?;
+        if !found.contains(&moved.uid) {
+            return Err(format!("the moved message was not found at uid {} in {}", moved.uid, moved.folder));
+        }
+        session.uid_store(moved.uid.to_string(), "+FLAGS.SILENT (\\Deleted)").map_err(|e| e.to_string())?;
+        if session.uid_expunge(moved.uid.to_string()).is_err() {
+            let _ = session.expunge();
+        }
+        let _ = session.logout();
+        Ok(())
+    })();
+    other.delete(&scratch).unwrap();
+    let _ = other.logout();
+    p.disconnect();
+    eprintln!("deleted {scratch:?}");
+    outcome.unwrap();
+}

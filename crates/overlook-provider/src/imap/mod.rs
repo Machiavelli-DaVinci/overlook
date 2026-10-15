@@ -1,17 +1,25 @@
-//! `MailProvider` for IMAP accounts (plan milestones M2, the read path, and M3, the write
-//! path and sending).
+//! `MailProvider` for IMAP accounts (plan milestones M2, the read path; M3, the write path
+//! and sending; M5, `IDLE`, the `CONDSTORE`/`QRESYNC` fast paths and server-side search).
 //!
 //! - `connection`: TLS / STARTTLS / plaintext-to-localhost sessions and the error mapping.
 //! - `folders`: `LIST` results as [`Label`] rows.
 //! - `structure`: `BODYSTRUCTURE`-driven partial download of large messages.
 //! - `uidset`: sequence sets for the cursors.
+//! - `idle`: the per-account `IDLE` thread that asks for a sync when the Inbox changes.
 //!
 //! One connection per account serves every call, under a mutex; a dropped connection is
 //! reopened once before the call reports [`ProviderError::Offline`]. The checkpoint the sync
 //! engine stores is the JSON of all folder cursors ([`Checkpoint`]): per folder its
-//! `UIDVALIDITY`, the highest UID seen, and the UIDs Overlook holds with their `\Seen` and
-//! `\Flagged` state, so `fetch_changes` can find new mail, flag changes and deletions with
-//! a `UID SEARCH ALL` and a `UID FETCH (FLAGS)` per folder, without server extensions.
+//! `UIDVALIDITY`, the highest UID seen, the `HIGHESTMODSEQ` last seen, and the UIDs
+//! Overlook holds with their `\Seen` and `\Flagged` state, so `fetch_changes` can find new
+//! mail, flag changes and deletions with a `UID SEARCH ALL` and a `UID FETCH (FLAGS)` per
+//! folder on any server. When the server advertises `CONDSTORE`, one
+//! `UID FETCH <known> (UID FLAGS) (CHANGEDSINCE <modseq>)` replaces the flag refresh; with
+//! `QRESYNC` enabled, its `VANISHED` response replaces the `UID SEARCH ALL` diff for
+//! deletions too, and new mail is read with `UID FETCH <highest+1>:* (UID)`.
+//!
+//! Server-side search is `UID SEARCH TEXT` per folder (Spam and Trash excluded), Inbox
+//! first, with `CHARSET UTF-8` and a `LITERAL+` literal for non-ASCII words.
 //!
 //! Message identity, from the plan: local ids are `<account>:<uuid>` minted on first sight
 //! (the sync engine adopts the stored id for a provider id already on disk); `provider_id`
@@ -39,6 +47,7 @@
 
 pub mod connection;
 pub mod folders;
+pub mod idle;
 pub mod structure;
 pub mod uidset;
 
@@ -51,7 +60,7 @@ use crate::mime::{headers_from_rfc822, message_from_rfc822, MessageFlags};
 use crate::{build_raw, draft_message_id, smtp, AppliedChanges, BoxFuture, MailProvider, MailboxSnapshot, ProviderError, RemoteChanges, SendContext, SendOutcome, SentReceipt};
 use connection::{map_error, Session};
 use folders::FolderInfo;
-use imap::types::Flag;
+use imap::types::{Flag, UnsolicitedResponse};
 use imap_proto::types::{MessageSection, Response, ResponseCode, SectionPath, UidSetMember};
 use overlook_core::time::now;
 use overlook_core::*;
@@ -59,7 +68,7 @@ use serde::{Deserialize, Serialize};
 use std::collections::{BTreeMap, BTreeSet, HashMap, HashSet};
 use std::sync::Mutex;
 use std::time::Duration;
-use tracing::{info, warn};
+use tracing::{debug, info, warn};
 
 /// Socket connect/read/write timeout. A hung server must not stall the sync thread.
 pub const DEFAULT_TIMEOUT: Duration = Duration::from_secs(30);
@@ -96,6 +105,9 @@ pub struct FolderCursor {
     pub uidvalidity: u32,
     /// Highest UID ever seen in this folder; new mail has a higher UID.
     pub highest_uid: u32,
+    /// `HIGHESTMODSEQ` when the folder was last read, for `CHANGEDSINCE`; 0 when the server
+    /// has no `CONDSTORE` or the folder has not been read since the extension was adopted.
+    pub highest_modseq: u64,
     /// UIDs Overlook holds (sequence set).
     pub known: String,
     /// Subset of `known` that carried `\Seen` when last checked.
@@ -157,7 +169,7 @@ pub fn folder_states(checkpoint: &str) -> Vec<ImapFolder> {
     let Ok(cp) = Checkpoint::parse(checkpoint) else { return Vec::new() };
     cp.folders
         .into_iter()
-        .map(|(path, c)| ImapFolder { path, uidvalidity: (c.uidvalidity != 0).then_some(c.uidvalidity), highest_uid: c.highest_uid, highest_modseq: None, delimiter: c.delimiter, special_use: c.special_use, subscribed: c.subscribed })
+        .map(|(path, c)| ImapFolder { path, uidvalidity: (c.uidvalidity != 0).then_some(c.uidvalidity), highest_uid: c.highest_uid, highest_modseq: (c.highest_modseq != 0).then_some(c.highest_modseq), delimiter: c.delimiter, special_use: c.special_use, subscribed: c.subscribed })
         .collect()
 }
 
@@ -192,9 +204,14 @@ pub struct Capabilities {
     pub special_use: bool,
     pub move_: bool,
     pub uidplus: bool,
+    /// `CONDSTORE` (or `QRESYNC`, which implies it): `CHANGEDSINCE` flag fetches work.
     pub condstore: bool,
+    /// `QRESYNC` was advertised **and** enabled on this connection (`ENABLE QRESYNC`), so
+    /// `VANISHED` reports deletions.
     pub qresync: bool,
     pub idle: bool,
+    /// `LITERAL+` / `LITERAL-`: non-synchronising literals, used for non-ASCII search words.
+    pub literal_plus: bool,
 }
 
 /// The folder a connection has open.
@@ -215,6 +232,8 @@ struct Conn {
     relist_pending: bool,
     /// The Sent folder path from the last listing, for `APPEND` and `reconcile_send`.
     sent_path: Option<String>,
+    /// Every selectable folder from the last listing with its label kind, for search.
+    folders: Vec<(String, LabelKind)>,
 }
 
 impl Conn {
@@ -295,6 +314,48 @@ impl Conn {
         Ok(self.session().uid_search("ALL").map_err(|e| map_error(&e))?.into_iter().collect())
     }
 
+    /// UIDs above `highest` in the open folder (`UID FETCH <highest+1>:* (UID)`). A server
+    /// answers `n:*` with its highest message even when that is below `n`, hence the filter.
+    fn uids_above(&mut self, highest: u32) -> Result<BTreeSet<u32>, ProviderError> {
+        let fetches = self.session().uid_fetch(format!("{}:*", highest.saturating_add(1)), "(UID)").map_err(|e| map_error(&e))?;
+        Ok(fetches.iter().filter_map(|f| f.uid).filter(|u| *u > highest).collect())
+    }
+
+    /// `UID FETCH <uids> (UID FLAGS) (CHANGEDSINCE <modseq> [VANISHED])`: the UIDs whose
+    /// flags changed since `modseq` (with their current `\Seen` / `\Flagged` state) and,
+    /// with `vanished` (QRESYNC enabled), the UIDs of the set that were expunged.
+    fn changed_since(&mut self, uids: &BTreeSet<u32>, modseq: u64, vanished: bool) -> Result<ChangedSince, ProviderError> {
+        let mut out = ChangedSince::default();
+        let modifier = if vanished { format!("(CHANGEDSINCE {modseq} VANISHED)") } else { format!("(CHANGEDSINCE {modseq})") };
+        for chunk in uidset::chunks(uids, FETCH_CHUNK) {
+            let fetches = self.session().uid_fetch(&chunk, format!("(UID FLAGS) {modifier}")).map_err(|e| map_error(&e))?;
+            for f in fetches.iter() {
+                let Some(uid) = f.uid else { continue };
+                out.changed.insert(uid);
+                if f.flags().contains(&Flag::Seen) {
+                    out.seen.insert(uid);
+                }
+                if f.flags().contains(&Flag::Flagged) {
+                    out.flagged.insert(uid);
+                }
+            }
+            for response in self.session().take_all_unsolicited() {
+                if let UnsolicitedResponse::Vanished { uids, .. } = response {
+                    for range in uids {
+                        out.vanished.extend(range);
+                    }
+                }
+            }
+        }
+        Ok(out)
+    }
+
+    /// Keeps the selectable folders of a listing for search and the Sent `APPEND`.
+    fn remember_folders(&mut self, classified: &[(FolderInfo, LabelKind)]) {
+        self.sent_path = classified.iter().find(|(_, k)| *k == LabelKind::Sent).map(|(f, _)| f.path.clone());
+        self.folders = classified.iter().filter(|(f, _)| f.selectable()).map(|(f, k)| (f.path.clone(), *k)).collect();
+    }
+
     /// `(UID FLAGS)` for a set, as `(seen, flagged)`, plus every UID the server answered for.
     fn flags_for(&mut self, uids: &BTreeSet<u32>) -> Result<(BTreeSet<u32>, BTreeSet<u32>, BTreeSet<u32>), ProviderError> {
         let (mut present, mut seen, mut flagged) = (BTreeSet::new(), BTreeSet::new(), BTreeSet::new());
@@ -326,6 +387,17 @@ impl Conn {
         }
         Ok(folders)
     }
+}
+
+/// What a `CHANGEDSINCE` fetch reported.
+#[derive(Debug, Default)]
+struct ChangedSince {
+    /// UIDs of the set whose MODSEQ is above the cursor (their flags may have changed).
+    changed: BTreeSet<u32>,
+    seen: BTreeSet<u32>,
+    flagged: BTreeSet<u32>,
+    /// UIDs of the set the server reported `VANISHED` (QRESYNC only).
+    vanished: BTreeSet<u32>,
 }
 
 /// How far the last send attempt of a draft got in this process, for `reconcile_send`.
@@ -365,7 +437,7 @@ impl ImapProvider {
             outgoing_password: None,
             inbox_limit: 100,
             timeout: DEFAULT_TIMEOUT,
-            conn: Mutex::new(Conn { session: None, selected: None, caps: Capabilities::default(), relist_pending: false, sent_path: None }),
+            conn: Mutex::new(Conn { session: None, selected: None, caps: Capabilities::default(), relist_pending: false, sent_path: None, folders: Vec::new() }),
             send_phases: Mutex::new(HashMap::new()),
         }
     }
@@ -396,6 +468,12 @@ impl ImapProvider {
         &self.servers
     }
 
+    /// Starts the account's `IDLE` thread on its own connection (see [`idle`]). The
+    /// callback runs on that thread; the app turns it into a sync request.
+    pub fn idle_watcher(&self, on_event: impl Fn(idle::IdleEvent) + Send + 'static) -> idle::IdleWatcher {
+        idle::watch(self.servers.incoming.clone(), self.password.clone(), self.timeout, on_event)
+    }
+
     /// Server extensions seen at login, once connected.
     pub fn capabilities(&self) -> Capabilities {
         self.conn.lock().map(|c| c.caps).unwrap_or_default()
@@ -419,14 +497,28 @@ impl ImapProvider {
         }
         let mut session = connection::connect(&self.servers.incoming, &self.password, self.timeout)?;
         let caps = session.capabilities().map_err(|e| map_error(&e))?;
-        conn.caps = Capabilities {
+        let mut capabilities = Capabilities {
             special_use: caps.has_str("SPECIAL-USE"),
             move_: caps.has_str("MOVE"),
             uidplus: caps.has_str("UIDPLUS"),
             condstore: caps.has_str("CONDSTORE"),
-            qresync: caps.has_str("QRESYNC"),
+            qresync: false,
             idle: caps.has_str("IDLE"),
+            literal_plus: caps.has_str("LITERAL+") || caps.has_str("LITERAL-"),
         };
+        // QRESYNC must be enabled per connection (RFC 7162); a server that answers without
+        // `* ENABLED QRESYNC` gets the CONDSTORE path, or the plain one.
+        if caps.has_str("ENABLE") && caps.has_str("QRESYNC") {
+            match session.run("ENABLE QRESYNC") {
+                Ok((lines, _)) => {
+                    let text = String::from_utf8_lossy(&lines).to_ascii_uppercase();
+                    capabilities.qresync = text.contains("ENABLED") && text.contains("QRESYNC");
+                    capabilities.condstore |= capabilities.qresync;
+                }
+                Err(e) => debug!("imap: ENABLE QRESYNC failed ({e}); using CONDSTORE or polling"),
+            }
+        }
+        conn.caps = capabilities;
         conn.session = Some(session);
         conn.selected = None;
         Ok(())
@@ -623,19 +715,20 @@ impl ImapProvider {
         }
         cp.folders = next;
         cp.listed_at = now();
-        conn.sent_path = classified.iter().find(|(_, k)| *k == LabelKind::Sent).map(|(f, _)| f.path.clone());
+        conn.remember_folders(&classified);
         conn.relist_pending = false;
         Ok((labels, deleted))
     }
 
     /// Selects the newest N of a folder as its cursor and returns their provider ids,
     /// newest first.
-    fn reset_folder(&self, conn: &mut Conn, path: &str, cursor: &mut FolderCursor, uidvalidity: u32, server: &BTreeSet<u32>) -> Result<Vec<ProviderId>, ProviderError> {
+    fn reset_folder(&self, conn: &mut Conn, path: &str, cursor: &mut FolderCursor, uidvalidity: u32, modseq: u64, server: &BTreeSet<u32>) -> Result<Vec<ProviderId>, ProviderError> {
         let limit = self.folder_limit(cursor.label_kind());
         let keep: BTreeSet<u32> = server.iter().rev().take(limit).copied().collect();
         let (_, seen, flagged) = if keep.is_empty() { Default::default() } else { conn.flags_for(&keep)? };
         cursor.uidvalidity = uidvalidity;
         cursor.highest_uid = server.iter().next_back().copied().unwrap_or(0);
+        cursor.highest_modseq = if conn.caps.condstore { modseq } else { 0 };
         cursor.set_flags(&keep, &seen, &flagged);
         cursor.fresh = false;
         Ok(keep.iter().rev().map(|uid| MessageRef::provider_id(path, uidvalidity, *uid)).collect())
@@ -661,7 +754,7 @@ impl ImapProvider {
                 };
                 let uidvalidity = mailbox.uid_validity.unwrap_or(0);
                 let server = if mailbox.exists == 0 { BTreeSet::new() } else { conn.uid_search_all()? };
-                ids.extend(self.reset_folder(conn, &path, cursor, uidvalidity, &server)?);
+                ids.extend(self.reset_folder(conn, &path, cursor, uidvalidity, mailbox.highest_mod_seq.unwrap_or(0), &server)?);
             }
             info!("imap: {} folders, {} recent messages queued for download", cp.folders.len(), ids.len());
             Ok(MailboxSnapshot { labels, messages: Vec::new(), message_ids: ids, checkpoint: Some(cp.to_json()) })
@@ -696,24 +789,45 @@ impl ImapProvider {
                     Err(e) => return Err(e),
                 };
                 let uidvalidity = mailbox.uid_validity.unwrap_or(0);
-                let server = if mailbox.exists == 0 { BTreeSet::new() } else { conn.uid_search_all()? };
+                let server_modseq = mailbox.highest_mod_seq.unwrap_or(0);
                 if cursor.fresh || cursor.uidvalidity != uidvalidity {
                     if !cursor.fresh {
                         info!("imap: UIDVALIDITY of {path} changed; re-listing the folder");
                         changes.deleted_provider_ids.extend(cursor.known_set().into_iter().map(|uid| MessageRef::provider_id(&path, cursor.uidvalidity, uid)));
                     }
-                    changes.message_ids.extend(self.reset_folder(conn, &path, cursor, uidvalidity, &server)?);
+                    let server = if mailbox.exists == 0 { BTreeSet::new() } else { conn.uid_search_all()? };
+                    changes.message_ids.extend(self.reset_folder(conn, &path, cursor, uidvalidity, server_modseq, &server)?);
                     continue;
                 }
-                let known = cursor.known_set();
+                let mut known = cursor.known_set();
                 let (mut seen, mut flagged) = (uidset::decode(&cursor.seen), uidset::decode(&cursor.flagged));
-                // Deletions: known locally, gone from the server.
-                let gone: Vec<u32> = known.difference(&server).copied().collect();
-                changes.deleted_provider_ids.extend(gone.iter().map(|uid| MessageRef::provider_id(&path, uidvalidity, *uid)));
-                let mut known: BTreeSet<u32> = known.intersection(&server).copied().collect();
-                // New mail: above the highest UID seen, newest first, bounded per cycle.
                 let limit = self.folder_limit(cursor.label_kind()).max(200);
-                let new: BTreeSet<u32> = server.iter().rev().filter(|u| **u > cursor.highest_uid).take(limit).copied().collect();
+                // The fast path needs CONDSTORE on both sides of the cursor; QRESYNC (enabled
+                // on this connection) additionally makes VANISHED report deletions.
+                let fast = conn.caps.condstore && cursor.highest_modseq > 0 && server_modseq > 0;
+                let qresync = fast && conn.caps.qresync;
+                // Without QRESYNC the whole UID list is the only way to see deletions.
+                let server_all: Option<BTreeSet<u32>> = if qresync {
+                    None
+                } else if mailbox.exists == 0 {
+                    Some(BTreeSet::new())
+                } else {
+                    Some(conn.uid_search_all()?)
+                };
+                let since = if fast && server_modseq != cursor.highest_modseq && !known.is_empty() { conn.changed_since(&known, cursor.highest_modseq, qresync)? } else { ChangedSince::default() };
+                // Deletions: known locally, gone from the server.
+                let gone: BTreeSet<u32> = match &server_all {
+                    Some(all) => known.difference(all).copied().collect(),
+                    None => since.vanished.intersection(&known).copied().collect(),
+                };
+                changes.deleted_provider_ids.extend(gone.iter().map(|uid| MessageRef::provider_id(&path, uidvalidity, *uid)));
+                known.retain(|u| !gone.contains(u));
+                // New mail: above the highest UID seen, newest first, bounded per cycle.
+                let new: BTreeSet<u32> = match &server_all {
+                    Some(all) => all.iter().rev().filter(|u| **u > cursor.highest_uid).take(limit).copied().collect(),
+                    None if mailbox.uid_next.is_some_and(|next| next <= cursor.highest_uid.saturating_add(1)) => BTreeSet::new(),
+                    None => conn.uids_above(cursor.highest_uid)?.into_iter().rev().take(limit).collect(),
+                };
                 if !new.is_empty() {
                     let (rows, new_seen, new_flagged) = Self::fetch_headers(conn, account, &path, uidvalidity, &new)?;
                     changes.message_ids.extend(rows.iter().filter_map(|m| m.provider_id.clone()));
@@ -722,20 +836,48 @@ impl ImapProvider {
                     seen.extend(new_seen);
                     flagged.extend(new_flagged);
                 }
-                // Flag changes: the Inbox every cycle, other folders now and then.
-                let refresh = cursor.label_kind() == LabelKind::Inbox || cp.cycle % FLAG_REFRESH_EVERY == 0;
                 let old: BTreeSet<u32> = known.difference(&new).copied().collect();
-                if refresh && !old.is_empty() {
-                    let (_, now_seen, now_flagged) = conn.flags_for(&old)?;
-                    let changed: BTreeSet<u32> = old.iter().filter(|u| seen.contains(u) != now_seen.contains(u) || flagged.contains(u) != now_flagged.contains(u)).copied().collect();
-                    if !changed.is_empty() {
-                        let (rows, _, _) = Self::fetch_headers(conn, account, &path, uidvalidity, &changed)?;
+                if fast {
+                    // Flag changes: only what CHANGEDSINCE reported, re-fetched when the
+                    // \Seen or \Flagged state actually differs from the cursor.
+                    let touched: BTreeSet<u32> = since.changed.intersection(&old).copied().collect();
+                    let flipped: BTreeSet<u32> = touched.iter().filter(|u| seen.contains(u) != since.seen.contains(u) || flagged.contains(u) != since.flagged.contains(u)).copied().collect();
+                    if !flipped.is_empty() {
+                        let (rows, _, _) = Self::fetch_headers(conn, account, &path, uidvalidity, &flipped)?;
                         changes.upserts.extend(rows);
                     }
-                    seen = seen.difference(&old).copied().chain(now_seen).collect();
-                    flagged = flagged.difference(&old).copied().chain(now_flagged).collect();
+                    for uid in &touched {
+                        if since.seen.contains(uid) {
+                            seen.insert(*uid);
+                        } else {
+                            seen.remove(uid);
+                        }
+                        if since.flagged.contains(uid) {
+                            flagged.insert(*uid);
+                        } else {
+                            flagged.remove(uid);
+                        }
+                    }
+                } else {
+                    // Flag changes: the Inbox every cycle, other folders now and then.
+                    let refresh = cursor.label_kind() == LabelKind::Inbox || cp.cycle % FLAG_REFRESH_EVERY == 0;
+                    if refresh && !old.is_empty() {
+                        let (_, now_seen, now_flagged) = conn.flags_for(&old)?;
+                        let changed: BTreeSet<u32> = old.iter().filter(|u| seen.contains(u) != now_seen.contains(u) || flagged.contains(u) != now_flagged.contains(u)).copied().collect();
+                        if !changed.is_empty() {
+                            let (rows, _, _) = Self::fetch_headers(conn, account, &path, uidvalidity, &changed)?;
+                            changes.upserts.extend(rows);
+                        }
+                        seen = seen.difference(&old).copied().chain(now_seen).collect();
+                        flagged = flagged.difference(&old).copied().chain(now_flagged).collect();
+                    }
                 }
-                cursor.highest_uid = cursor.highest_uid.max(server.iter().next_back().copied().unwrap_or(0));
+                let top = match &server_all {
+                    Some(all) => all.iter().next_back().copied(),
+                    None => mailbox.uid_next.map(|n| n.saturating_sub(1)).or_else(|| new.iter().next_back().copied()),
+                };
+                cursor.highest_uid = cursor.highest_uid.max(top.unwrap_or(0));
+                cursor.highest_modseq = if conn.caps.condstore { server_modseq } else { 0 };
                 cursor.set_flags(&known, &seen, &flagged);
             }
             for path in vanished {
@@ -775,6 +917,59 @@ impl ImapProvider {
                     continue;
                 }
                 out.extend(Self::fetch_bodies(conn, account, path, *uidvalidity, uids)?);
+            }
+            Ok(out)
+        })
+    }
+
+    /// `UID SEARCH TEXT` for every word, folder by folder (Inbox first, Spam and Trash
+    /// skipped), newest UIDs first within a folder, up to `limit` provider ids.
+    fn search_server(&self, query: &str, limit: usize) -> Result<Vec<ProviderId>, ProviderError> {
+        let words: Vec<String> = query.split_whitespace().map(|w| w.trim_matches('"').to_owned()).filter(|w| !w.is_empty()).collect();
+        if words.is_empty() || limit == 0 {
+            return Ok(Vec::new());
+        }
+        self.with_session(|conn| {
+            if conn.folders.is_empty() {
+                let listed = conn.list_folders()?;
+                let classified = folders::classify(&listed, self.servers.imap.as_ref());
+                conn.remember_folders(&classified);
+            }
+            let criteria = search_criteria(&words, conn.caps.literal_plus);
+            if criteria.is_empty() {
+                return Ok(Vec::new());
+            }
+            let mut out: Vec<ProviderId> = Vec::new();
+            let folders = conn.folders.clone();
+            for (path, _) in folders.iter().filter(|(_, kind)| !matches!(kind, LabelKind::Spam | LabelKind::Trash)) {
+                let mailbox = match conn.examine(path) {
+                    Ok(m) => m,
+                    Err(ProviderError::Rejected(_)) => continue,
+                    Err(e) => return Err(e),
+                };
+                if mailbox.exists == 0 {
+                    continue;
+                }
+                let validity = mailbox.uid_validity.unwrap_or(0);
+                let hits = match conn.session().uid_search(&criteria) {
+                    Ok(hits) => hits,
+                    // A server that cannot search this way (charset, TEXT) says so per folder.
+                    Err(imap::Error::No(no)) => {
+                        warn!("imap: search in {path} refused: {}", no.information);
+                        continue;
+                    }
+                    Err(imap::Error::Bad(bad)) => {
+                        warn!("imap: search in {path} rejected: {}", bad.information);
+                        continue;
+                    }
+                    Err(e) => return Err(map_error(&e)),
+                };
+                let mut hits: Vec<u32> = hits.into_iter().collect();
+                hits.sort_unstable_by(|a, b| b.cmp(a));
+                out.extend(hits.into_iter().take(limit - out.len()).map(|uid| MessageRef::provider_id(path, validity, uid)));
+                if out.len() >= limit {
+                    break;
+                }
             }
             Ok(out)
         })
@@ -1184,6 +1379,27 @@ fn quote_mailbox(name: &str) -> String {
     format!("\"{}\"", name.replace('\\', "\\\\").replace('"', "\\\""))
 }
 
+/// `SEARCH` criteria for `words`: `TEXT "<word>"` per word (all must match). Non-ASCII words
+/// need `CHARSET UTF-8` and a literal, which is only sent when the server takes
+/// non-synchronising literals (`{n+}`); otherwise those words are left out. Empty when
+/// nothing can be searched.
+pub fn search_criteria(words: &[String], literal_plus: bool) -> String {
+    let mut terms: Vec<String> = Vec::new();
+    let mut non_ascii = false;
+    for word in words {
+        if word.is_ascii() {
+            terms.push(format!("TEXT {}", quote_mailbox(word)));
+        } else if literal_plus {
+            non_ascii = true;
+            terms.push(format!("TEXT {{{}+}}\r\n{}", word.len(), word));
+        }
+    }
+    if terms.is_empty() {
+        return String::new();
+    }
+    format!("{}{}", if non_ascii { "CHARSET UTF-8 " } else { "" }, terms.join(" "))
+}
+
 fn expand_uid_set(set: &[UidSetMember]) -> Vec<u32> {
     let mut out = Vec::new();
     for m in set {
@@ -1281,6 +1497,11 @@ impl MailProvider for ImapProvider {
         Box::pin(async move { self.attachment(&message, &attachment) })
     }
 
+    fn search(&self, _account: &Account, query: &str, limit: usize) -> BoxFuture<'_, Result<Vec<ProviderId>, ProviderError>> {
+        let query = query.to_owned();
+        Box::pin(async move { self.search_server(&query, limit) })
+    }
+
     fn send(&self, account: &Account, draft: &Draft, context: SendContext) -> BoxFuture<'_, Result<SentReceipt, ProviderError>> {
         let account = account.clone();
         let draft = draft.clone();
@@ -1308,14 +1529,16 @@ mod unit {
     #[test]
     fn checkpoint_round_trips_and_rejects_other_versions() {
         let mut cp = Checkpoint { version: Checkpoint::VERSION, listed_at: 5, cycle: 2, folders: BTreeMap::new() };
-        cp.folders.insert("INBOX".into(), FolderCursor { kind: "inbox".into(), uidvalidity: 7, highest_uid: 9, known: "3:9".into(), seen: "3:5".into(), flagged: "9".into(), delimiter: Some("/".into()), special_use: None, subscribed: true, fresh: false });
+        cp.folders.insert("INBOX".into(), FolderCursor { kind: "inbox".into(), uidvalidity: 7, highest_uid: 9, highest_modseq: 42, known: "3:9".into(), seen: "3:5".into(), flagged: "9".into(), delimiter: Some("/".into()), special_use: None, subscribed: true, fresh: false });
         let json = cp.to_json();
         assert_eq!(Checkpoint::parse(&json).unwrap(), cp);
         assert_eq!(Checkpoint::parse("12345"), Err(ProviderError::CheckpointExpired), "a Gmail history id is not ours");
         assert_eq!(Checkpoint::parse(r#"{"version":99}"#), Err(ProviderError::CheckpointExpired));
         let rows = folder_states(&json);
         assert_eq!(rows.len(), 1);
-        assert_eq!((rows[0].path.as_str(), rows[0].uidvalidity, rows[0].highest_uid, rows[0].delimiter.as_deref()), ("INBOX", Some(7), 9, Some("/")));
+        assert_eq!((rows[0].path.as_str(), rows[0].uidvalidity, rows[0].highest_uid, rows[0].highest_modseq, rows[0].delimiter.as_deref()), ("INBOX", Some(7), 9, Some(42), Some("/")));
+        let old: Checkpoint = Checkpoint::parse(r#"{"version":1,"folders":{"INBOX":{"kind":"inbox","uidvalidity":7,"highest_uid":9,"known":"3:9"}}}"#).unwrap();
+        assert_eq!(old.folders["INBOX"].highest_modseq, 0, "a checkpoint written before CONDSTORE support still parses");
     }
 
     #[test]
@@ -1326,6 +1549,15 @@ mod unit {
         let p = ImapProvider::new(servers, "pw").with_inbox_limit(300);
         assert_eq!((p.folder_limit(LabelKind::Inbox), p.folder_limit(LabelKind::Sent), p.folder_limit(LabelKind::Spam)), (300, 120, 30));
         assert!(!format!("{p:?}").contains("pw"), "the password never appears in Debug output");
+    }
+
+    #[test]
+    fn search_criteria_quote_ascii_and_use_literals_for_the_rest() {
+        let words = |w: &[&str]| w.iter().map(|s| (*s).to_owned()).collect::<Vec<_>>();
+        assert_eq!(search_criteria(&words(&["invoice", "q\"uote"]), false), "TEXT \"invoice\" TEXT \"q\\\"uote\"");
+        assert_eq!(search_criteria(&words(&["café"]), true), "CHARSET UTF-8 TEXT {5+}\r\ncafé");
+        assert_eq!(search_criteria(&words(&["café", "bill"]), false), "TEXT \"bill\"", "a non-ASCII word is dropped without LITERAL+");
+        assert_eq!(search_criteria(&words(&["café"]), false), "");
     }
 
     #[test]

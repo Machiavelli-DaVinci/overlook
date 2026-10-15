@@ -13,6 +13,13 @@ Write path (M3): CREATE, UID STORE (±FLAGS[.SILENT]), UID COPY and UID MOVE wit
 UID EXPUNGE / EXPUNGE, APPEND with APPENDUID, UID SEARCH HEADER <name> <value>, all against
 every folder.
 
+M5: ENABLE QRESYNC, HIGHESTMODSEQ on SELECT/EXAMINE, MODSEQ per message, UID FETCH …
+(CHANGEDSINCE n [VANISHED]) with "* VANISHED (EARLIER)" for expunged UIDs, IDLE (changes to
+the selected folder are pushed as EXISTS / EXPUNGE / FETCH until DONE), UID SEARCH TEXT
+(with CHARSET and LITERAL+ literals; every word must occur in the decoded message), and the
+control command XDELIVER [subject…], which appends a fresh message to INBOX (what the IDLE
+test uses as "new mail arriving").
+
 Fault injection, for the exit-criterion run (any connection, no login needed):
   XDROPAFTER <word> [n]      the next n (default 1) commands whose line contains <word>
                              (case-insensitive, e.g. "UID MOVE", "APPEND", "UID FETCH") are
@@ -29,11 +36,11 @@ PASS, STAT, LIST, UIDL, TOP, RETR, DELE, RSET, NOOP, QUIT, with DELE committed o
 discarded otherwise. STLS is refused. XDROPAFTER / XFAILNEXT / XSTATE work there too; a
 POP3 DELE + QUIT removes the message from INBOX for the IMAP side as well.
 """
-import base64, email, email.policy, re, socketserver, threading, time
+import base64, email, email.policy, re, select, socketserver, threading, time
 
 IMAP_PORT, POP3_PORT, SMTP_PORT = 1143, 1110, 2525
 USER, PASSWORD = "spike", "secret"
-CAPS = "IMAP4rev1 UIDPLUS MOVE IDLE SPECIAL-USE LITERAL+ ENABLE"
+CAPS = "IMAP4rev1 UIDPLUS MOVE IDLE SPECIAL-USE LITERAL+ ENABLE CONDSTORE QRESYNC"
 
 def msg(headers, body):
     return ("\r\n".join(headers) + "\r\n\r\n" + body).encode()
@@ -41,12 +48,27 @@ def msg(headers, body):
 class Folder:
     def __init__(self, attrs, uidvalidity):
         self.attrs, self.uidvalidity = attrs, uidvalidity
-        self.messages = {}  # uid -> [flags(list), internaldate, bytes]
+        self.messages = {}  # uid -> [flags(list), internaldate, bytes, modseq]
         self.next_uid = 1
-    def add(self, flags, idate, raw):
+        self.highest_modseq = 1   # CONDSTORE
+        self.expunged = []        # (uid, modseq) for VANISHED
+        self.generation = 0       # bumped by every change, for IDLE
+    def bump(self):
+        self.highest_modseq += 1; self.generation += 1
+        return self.highest_modseq
+    def add(self, flags, idate, raw, _modseq=None):
         uid = self.next_uid; self.next_uid += 1
-        self.messages[uid] = [list(flags), idate, raw]
+        self.messages[uid] = [list(flags), idate, raw, self.bump()]
         return uid
+    def remove(self, uid):
+        if uid in self.messages:
+            del self.messages[uid]; self.expunged.append((uid, self.bump()))
+    def set_flags(self, uid, flags):
+        self.messages[uid][0] = flags; self.messages[uid][3] = self.bump()
+    def last_changed(self):
+        if not self.messages: return None
+        uid = max(self.messages, key=lambda u: self.messages[u][3])
+        return sorted(self.messages).index(uid) + 1, uid
 
 FOLDERS = {
     "INBOX": Folder(["\\HasNoChildren"], 1760400000),
@@ -139,6 +161,32 @@ def section_bytes(raw, spec):
         phead = phead.replace(b"\n", b"\r\n"); pbody = pbody.replace(b"\n", b"\r\n")
     return phead + b"\r\n" if want_mime else pbody
 
+def tokenize(criteria):
+    """SEARCH words, with quoted strings (already unquoted) kept together."""
+    out, cur, quoted_, escaped = [], "", False, False
+    for c in criteria:
+        if quoted_:
+            if escaped: cur += c; escaped = False
+            elif c == "\\": escaped = True
+            elif c == '"': quoted_ = False; out.append(cur); cur = ""
+            else: cur += c
+        elif c == '"': quoted_ = True
+        elif c == " ":
+            if cur: out.append(cur); cur = ""
+        else: cur += c
+    if cur: out.append(cur)
+    return out
+
+def searchable_text(raw):
+    """What SEARCH TEXT matches: decoded headers and text parts, lower-cased."""
+    m = email.message_from_bytes(raw, policy=email.policy.default)
+    text = "".join(f"{k}: {v}\n" for k, v in m.items())
+    for part in m.walk():
+        if part.get_content_maintype() == "text":
+            try: text += part.get_content() + "\n"
+            except Exception: pass
+    return (text + raw.decode(errors="replace")).lower()
+
 def parse_set(s, uids):
     uids = list(uids)
     out = set()
@@ -181,10 +229,19 @@ class Imap(socketserver.StreamRequestHandler):
     def handle(self):
         self.send(f"* OK [CAPABILITY {CAPS}] Spike IMAP ready.")
         box = None
+        self.watched = (0, 0)
         while True:
             line = self.rfile.readline()
             if not line: return
             text = line.decode(errors="replace").rstrip("\r\n")
+            # LITERAL+ at the end of the line (SEARCH words): read the bytes and the rest.
+            while text.endswith("+}") and "{" in text:
+                open_at = text.rindex("{")
+                try: size = int(text[open_at + 1:-2])
+                except ValueError: break
+                literal = self.rfile.read(size).decode(errors="replace")
+                rest = self.rfile.readline().decode(errors="replace").rstrip("\r\n")
+                text = text[:open_at] + quoted(literal) + rest
             print("IMAP <", text if "LOGIN" not in text.upper() else text.split()[0] + " LOGIN ****", flush=True)
             tag, _, rest = text.partition(" ")
             cmd, _, args = rest.partition(" ")
@@ -217,11 +274,12 @@ class Imap(socketserver.StreamRequestHandler):
                 if f is None:
                     self.send(f"{tag} NO Mailbox doesn't exist: {path}"); continue
                 box = path
-                with LOCK: n, nxt, uv = len(f.messages), f.next_uid, f.uidvalidity
+                with LOCK: n, nxt, uv, hm = len(f.messages), f.next_uid, f.uidvalidity, f.highest_modseq; self.watched = (n, f.generation)
                 self.send("* FLAGS (\\Answered \\Flagged \\Deleted \\Seen \\Draft)")
                 self.send("* OK [PERMANENTFLAGS (\\Answered \\Flagged \\Deleted \\Seen \\Draft \\*)] Flags permitted.")
                 self.send(f"* {n} EXISTS"); self.send("* 0 RECENT")
                 self.send(f"* OK [UIDVALIDITY {uv}] UIDs valid"); self.send(f"* OK [UIDNEXT {nxt}] Predicted next UID")
+                self.send(f"* OK [HIGHESTMODSEQ {hm}] Highest")
                 self.send(f"{tag} OK [{'READ-WRITE' if cmd == 'SELECT' else 'READ-ONLY'}] {cmd.title()} completed")
             elif cmd == "CREATE":
                 path = unquote(args)
@@ -229,6 +287,10 @@ class Imap(socketserver.StreamRequestHandler):
                     exists = path in FOLDERS
                     if not exists: FOLDERS[path] = Folder(["\\HasNoChildren"], 1760500000 + len(FOLDERS))
                 self.send(f"{tag} NO [ALREADYEXISTS] Mailbox already exists" if exists else f"{tag} OK Create completed.")
+            elif cmd == "DELETE":
+                path = unquote(args)
+                with LOCK: gone = FOLDERS.pop(path, None) is not None
+                self.send(f"{tag} OK Delete completed." if gone else f"{tag} NO Mailbox doesn't exist: {path}")
             elif cmd == "UID":
                 sub, _, sargs = args.partition(" ")
                 sub = sub.upper()
@@ -236,14 +298,22 @@ class Imap(socketserver.StreamRequestHandler):
                 if f is None:
                     self.send(f"{tag} BAD No mailbox selected"); continue
                 if sub == "SEARCH":
-                    crit = sargs.strip()
+                    tokens = tokenize(sargs.strip()); hits = None; i = 0; bad = None
                     with LOCK:
-                        if crit.upper() == "ALL": hits = sorted(f.messages)
-                        elif crit.upper().startswith("HEADER "):
-                            _, name, value = crit.split(None, 2); value = unquote(value)
-                            hits = [u for u, v in f.messages.items() if header(v[2], name) == value]
-                        else: hits = []
-                    self.send("* SEARCH" + "".join(f" {u}" for u in hits)); self.send(f"{tag} OK Search completed.")
+                        while i < len(tokens):
+                            key = tokens[i].upper()
+                            if key == "ALL": found = sorted(f.messages); i += 1
+                            elif key == "CHARSET": i += 2; continue
+                            elif key == "HEADER":
+                                name, value = tokens[i + 1], tokens[i + 2]
+                                found = [u for u, v in f.messages.items() if header(v[2], name) == value]; i += 3
+                            elif key == "TEXT":
+                                word = tokens[i + 1].lower()
+                                found = [u for u, v in f.messages.items() if word in searchable_text(v[2])]; i += 2
+                            else: bad = key; break
+                            hits = found if hits is None else [u for u in hits if u in found]
+                    if bad: self.send(f"{tag} BAD Unknown search key {bad}"); continue
+                    self.send("* SEARCH" + "".join(f" {u}" for u in sorted(hits or []))); self.send(f"{tag} OK Search completed.")
                 elif sub == "FETCH":
                     self.fetch(tag, f, sargs)
                 elif sub == "STORE":
@@ -258,7 +328,7 @@ class Imap(socketserver.StreamRequestHandler):
                             if item.startswith("+"): cur += [x for x in flags if x not in cur]
                             elif item.startswith("-"): cur = [x for x in cur if x not in flags]
                             else: cur = list(flags)
-                            f.messages[u][0] = cur
+                            f.set_flags(u, cur)
                             if not item.upper().endswith(".SILENT"): lines.append(f"* {i+1} FETCH (UID {u} FLAGS ({' '.join(cur)}))")
                     for l in lines: self.send(l)
                     self.send(f"{tag} OK Store completed.")
@@ -273,7 +343,7 @@ class Imap(socketserver.StreamRequestHandler):
                         seqs = []
                         if sub == "MOVE":
                             seqs = [i + 1 for i, u in enumerate(sorted(f.messages)) if u in uids]
-                            for u in uids: del f.messages[u]
+                            for u in uids: f.remove(u)
                         tv = t.uidvalidity
                     code = f"[COPYUID {tv} {encode_set(p[0] for p in pairs)} {encode_set(p[1] for p in pairs)}] " if pairs else ""
                     if sub == "MOVE":
@@ -308,6 +378,12 @@ class Imap(socketserver.StreamRequestHandler):
                 self.send(f"{tag} OK [APPENDUID {tv} {uid}] Append completed.")
             elif cmd == "NOOP":
                 self.send(f"{tag} OK NOOP completed.")
+            elif cmd == "ENABLE":
+                enabled = [c.upper() for c in args.split() if c.upper() in CAPS.split()]
+                if enabled: self.send("* ENABLED " + " ".join(enabled))
+                self.send(f"{tag} OK Enabled.")
+            elif cmd == "IDLE":
+                self.idle(tag, box)
             elif cmd == "LOGOUT":
                 self.send("* BYE Logging out"); self.send(f"{tag} OK Logout completed."); return
             else:
@@ -329,29 +405,72 @@ class Imap(socketserver.StreamRequestHandler):
                 FAULTS["smtp_drop_after_data"] = True
             elif cmd == "XSTATE":
                 for path, f in FOLDERS.items():
-                    self.send(f"* XSTATE {quoted(path)} uidvalidity={f.uidvalidity} uids={encode_set(f.messages) or '-'} flags={[(u, v[0]) for u, v in f.messages.items()]}")
+                    self.send(f"* XSTATE {quoted(path)} uidvalidity={f.uidvalidity} modseq={f.highest_modseq} uids={encode_set(f.messages) or '-'} flags={[(u, v[0]) for u, v in f.messages.items()]}")
+            elif cmd == "XDELIVER":
+                subject = args.strip() or f"Delivered at {time.strftime('%H:%M:%S')}"
+                stamp = time.strftime("%a, %d %b %Y %H:%M:%S +0000", time.gmtime())
+                raw = msg(["From: courier@example.com", "To: spike@example.com", f"Subject: {subject}",
+                           f"Message-ID: <deliver-{int(time.time()*1000)}@example.com>", f"Date: {stamp}"], f"{subject}\r\n")
+                uid = FOLDERS["INBOX"].add([], time.strftime("%d-%b-%Y %H:%M:%S +0000", time.gmtime()), raw)
+                self.send(f"* XDELIVER INBOX uid={uid}")
             else:
                 self.send(f"{tag} BAD Unknown control command"); return
         print(f"IMAP control: {cmd} {args}", flush=True)
         self.send(f"{tag} OK {cmd} armed")
+
+    def idle(self, tag, box):
+        """Pushes the selected folder's changes until DONE. Changes between a DONE and the
+        next IDLE are reported at once, as a real server does, through self.watched."""
+        self.send("+ idling")
+        while True:
+            # select() instead of a socket timeout: a timed-out buffered reader cannot be
+            # read again in Python.
+            readable, _, _ = select.select([self.request], [], [], 0.05)
+            if readable:
+                line = self.rfile.readline()
+                if not line: return
+                self.send(f"{tag} OK Idle completed." if line.strip().upper() == b"DONE" else f"{tag} BAD Expected DONE")
+                return
+            with LOCK:
+                f = FOLDERS.get(box)
+                if f is None: continue
+                exists, generation = len(f.messages), f.generation
+                if (exists, generation) == self.watched: continue
+                before = self.watched[0]
+                if exists > before: out = [f"* {exists} EXISTS", "* 1 RECENT"]
+                elif exists < before: out = [f"* {min(before, exists + 1)} EXPUNGE"]
+                else:
+                    lc = f.last_changed()
+                    out = [f"* {lc[0]} FETCH (UID {lc[1]} FLAGS ({' '.join(f.messages[lc[1]][0])}))"] if lc else []
+                self.watched = (exists, generation)
+            for l in out:
+                print("IMAP > " + l, flush=True); self.send(l)
 
     def expunge(self, tag, f, sset):
         with LOCK:
             wanted = parse_set(sset, f.messages) if sset else list(f.messages)
             gone = [u for u in sorted(f.messages) if u in wanted and "\\Deleted" in f.messages[u][0]]
             seqs = [i + 1 for i, u in enumerate(sorted(f.messages)) if u in gone]
-            for u in gone: del f.messages[u]
+            for u in gone: f.remove(u)
         for s in reversed(seqs): self.send(f"* {s} EXPUNGE")
         self.send(f"{tag} OK Expunge completed.")
 
     def fetch(self, tag, f, sargs):
         sset, _, items = sargs.partition(" ")
-        items = items.strip("()").upper()
+        items = items.strip().upper()
+        since, vanished = None, False
+        m = re.search(r"\(CHANGEDSINCE (\d+)( VANISHED)?\)", items)
+        if m:
+            since, vanished = int(m.group(1)), bool(m.group(2)); items = items[:m.start()]
+        items = items.strip().strip("()")
         with LOCK:
-            uids = parse_set(sset, f.messages)
-            rows = [(i, u, list(f.messages[u])) for i, u in enumerate(sorted(f.messages)) if u in uids]
-        for i, u, (flags, idate, raw) in rows:
-            parts = [f"UID {u}"]
+            universe = list(f.messages) + [u for u, _ in f.expunged]   # n:* reaches past expunges
+            uids = parse_set(sset, universe)
+            rows = [(i, u, list(f.messages[u])) for i, u in enumerate(sorted(f.messages)) if u in uids and (since is None or f.messages[u][3] > since)]
+            gone = encode_set(u for u, ms in f.expunged if vanished and ms > since and u in uids)
+        if gone: self.send(f"* VANISHED (EARLIER) {gone}")
+        for i, u, (flags, idate, raw, modseq) in rows:
+            parts = [f"UID {u}", f"MODSEQ ({modseq})"]
             if "FLAGS" in items: parts.append(f"FLAGS ({' '.join(flags)})")
             if "INTERNALDATE" in items: parts.append(f'INTERNALDATE "{idate}"')
             if "RFC822.SIZE" in items: parts.append(f"RFC822.SIZE {len(raw)}")
@@ -519,7 +638,7 @@ class Pop3(socketserver.StreamRequestHandler):
             elif cmd == "QUIT":
                 if authed:
                     with LOCK:
-                        for n in marked: FOLDERS["INBOX"].messages.pop(uids[n - 1], None)
+                        for n in marked: FOLDERS["INBOX"].remove(uids[n - 1])
                     if marked: print(f"POP3 committed {len(marked)} deletion(s)", flush=True)
                 self.send("+OK Logging out."); return
             else:

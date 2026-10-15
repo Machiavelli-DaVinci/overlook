@@ -25,6 +25,14 @@ pub enum ProviderIssue {
 pub struct AccountProviders {
     pub mail: Arc<dyn MailProvider>,
     pub calendar: Option<Arc<dyn CalendarProvider>>,
+    /// The same provider as `mail` when it is an IMAP one, for the `IDLE` watcher.
+    pub imap: Option<Arc<ImapProvider>>,
+}
+
+impl AccountProviders {
+    pub fn new(mail: Arc<dyn MailProvider>, calendar: Option<Arc<dyn CalendarProvider>>) -> Self {
+        Self { mail, calendar, imap: None }
+    }
 }
 
 pub fn gmail_providers(account: &Account, tokens: OAuthTokens) -> Result<AccountProviders, String> {
@@ -40,17 +48,15 @@ pub fn gmail_providers(account: &Account, tokens: OAuthTokens) -> Result<Account
         }),
     ));
     let inbox_limit = crate::store_prefs_inbox_limit();
-    Ok(AccountProviders {
-        mail: Arc::new(GmailProvider::new(client.clone()).with_inbox_limit(inbox_limit)),
-        calendar: Some(Arc::new(GoogleCalendarProvider::new(client))),
-    })
+    Ok(AccountProviders::new(Arc::new(GmailProvider::new(client.clone()).with_inbox_limit(inbox_limit)), Some(Arc::new(GoogleCalendarProvider::new(client)))))
 }
 
 /// An IMAP account: one connection for mail, SMTP for sending, no calendar. The outgoing
 /// password is the incoming one unless a separate one was stored at setup.
 pub fn imap_providers(servers: MailServers, password: String, outgoing_password: Option<String>) -> AccountProviders {
     let inbox_limit = crate::store_prefs_inbox_limit();
-    AccountProviders { mail: Arc::new(ImapProvider::new(servers, password).with_outgoing_password(outgoing_password).with_inbox_limit(inbox_limit)), calendar: None }
+    let provider = Arc::new(ImapProvider::new(servers, password).with_outgoing_password(outgoing_password).with_inbox_limit(inbox_limit));
+    AccountProviders { mail: provider.clone(), calendar: None, imap: Some(provider) }
 }
 
 /// Where a POP3 account's downloaded messages live: `<data dir>/raw/<account>/`, one `.eml`
@@ -62,7 +68,7 @@ pub fn raw_dir_for(account: &AccountId) -> std::path::PathBuf {
 /// A POP3 account: one session per sync, SMTP for sending, no calendar. The local store
 /// and `raw/` hold the only copy of its mail.
 pub fn pop3_providers(account: &AccountId, servers: MailServers, password: String, outgoing_password: Option<String>) -> AccountProviders {
-    AccountProviders { mail: Arc::new(Pop3Provider::new(servers, password, raw_dir_for(account)).with_outgoing_password(outgoing_password)), calendar: None }
+    AccountProviders::new(Arc::new(Pop3Provider::new(servers, password, raw_dir_for(account)).with_outgoing_password(outgoing_password)), None)
 }
 
 /// The stored passwords of an IMAP or POP3 account: the incoming one, and the outgoing one
@@ -87,7 +93,7 @@ fn stored_passwords(account: &Account) -> Result<(String, Option<String>), Provi
 /// Builds the providers for `account`, reading stored tokens or passwords where needed.
 pub fn providers_for(account: &Account, sample: &SampleProvider, store: &Store) -> Result<AccountProviders, ProviderIssue> {
     match account.provider {
-        ProviderKind::Sample => Ok(AccountProviders { mail: Arc::new(sample.clone()), calendar: Some(Arc::new(sample.clone())) }),
+        ProviderKind::Sample => Ok(AccountProviders::new(Arc::new(sample.clone()), Some(Arc::new(sample.clone())))),
         ProviderKind::Gmail => match credentials::load_tokens(&account.id) {
             Ok(Some(tokens)) => gmail_providers(account, tokens).map_err(ProviderIssue::SignInRequired),
             Ok(None) => Err(ProviderIssue::SignInRequired("Sign in again to continue syncing. Your local drafts are safe.".into())),

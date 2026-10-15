@@ -124,13 +124,33 @@ fn starttls_by_hand(host: &str, tcp: TcpStream) -> Result<TcpStream, ProviderErr
     }
 }
 
+/// The IDLE thread's read timeout is set through the `imap` crate's trait; the TLS stream
+/// exposes its socket, so one implementation serves every security mode.
+impl imap::extensions::idle::SetReadTimeout for Stream {
+    fn set_read_timeout(&mut self, timeout: Option<Duration>) -> imap::error::Result<()> {
+        match self {
+            Stream::Plain(s) => TcpStream::set_read_timeout(s, timeout),
+            Stream::Tls(s) => TcpStream::set_read_timeout(&s.sock, timeout),
+        }
+        .map_err(imap::Error::Io)
+    }
+}
+
 /// Connects, secures the connection as the endpoint asks, and logs in.
 pub fn connect(endpoint: &ServerEndpoint, password: &str, timeout: Duration) -> Result<Session, ProviderError> {
+    connect_with_socket(endpoint, password, timeout).map(|(session, _)| session)
+}
+
+/// Like [`connect`], also returning a handle on the underlying socket. Shutting that handle
+/// down from another thread unblocks a read in progress, which is how the IDLE watcher is
+/// stopped promptly.
+pub fn connect_with_socket(endpoint: &ServerEndpoint, password: &str, timeout: Duration) -> Result<(Session, TcpStream), ProviderError> {
     if endpoint.is_insecure_remote() {
         return Err(ProviderError::Rejected(format!("refusing to connect to {} without encryption", endpoint.host)));
     }
     let host = endpoint.host.trim();
     let tcp = tcp_connect(endpoint, timeout)?;
+    let socket = tcp.try_clone().map_err(|_| ProviderError::Offline)?;
     let mut client = match endpoint.security {
         Security::Tls => {
             let mut c = imap::Client::new(wrap_tls(host, tcp)?);
@@ -154,7 +174,8 @@ pub fn connect(endpoint: &ServerEndpoint, password: &str, timeout: Duration) -> 
     if endpoint.username.trim().is_empty() {
         return Err(ProviderError::SignInRequired);
     }
-    client.login(endpoint.username.trim(), password).map_err(|(e, _)| login_error(&e))
+    let session = client.login(endpoint.username.trim(), password).map_err(|(e, _)| login_error(&e))?;
+    Ok((session, socket))
 }
 
 /// Which family of problem a response text's bracketed code announces.

@@ -427,23 +427,36 @@ impl MailWindow {
                             .text_size(px(11.))
                             .text_color(state_color)
                             .child(icon(if outbox { "clock" } else { "check" }).size(px(12.)).text_color(state_color))
-                            .child(state)
+                            // The state wording can be long ("Delivery uncertain: …"); it
+                            // gives way so the buttons stay inside the row.
+                            .child(div().flex_1().min_w_0().truncate().child(state))
                             .when(undecided, |row| {
-                                let id = draft_id.clone();
-                                row.child(div().flex_1()).child(
+                                let resend = draft_id.clone();
+                                let discard = draft_id.clone();
+                                row.child(
                                     Button::new(SharedString::from(format!("resend-{}", draft_id)))
                                         .ghost()
                                         .xsmall()
                                         .label("Send again")
                                         .on_click(cx.listener(move |this, _, window, cx| {
                                             cx.stop_propagation();
-                                            this.resend_draft(id.clone(), window, cx);
+                                            this.resend_draft(resend.clone(), window, cx);
+                                        })),
+                                )
+                                .child(
+                                    Button::new(SharedString::from(format!("discard-{}", draft_id)))
+                                        .ghost()
+                                        .xsmall()
+                                        .label("Discard")
+                                        .on_click(cx.listener(move |this, _, window, cx| {
+                                            cx.stop_propagation();
+                                            this.discard_send(discard.clone(), window, cx);
                                         })),
                                 )
                             })
                             .when(cancellable, |row| {
                                 let id = draft_id.clone();
-                                row.child(div().flex_1()).child(
+                                row.child(
                                     Button::new(SharedString::from(format!("cancel-{}", draft_id)))
                                         .ghost()
                                         .xsmall()

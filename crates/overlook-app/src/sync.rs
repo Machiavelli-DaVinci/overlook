@@ -193,7 +193,7 @@ fn enqueue_bodies(store: &Store, account: &AccountId, ids: Vec<ProviderId>) {
 ///    that message after a move made elsewhere: it keeps the local id and leaves `deleted`.
 /// 3. A message without a conversation keeps the conversation its row already has;
 ///    the rest are threaded by `In-Reply-To` / `References` against the store.
-fn reconcile_incoming(store: &Store, account: &AccountId, messages: &mut [Message], deleted: &mut Vec<MessageId>) {
+pub(crate) fn reconcile_incoming(store: &Store, account: &AccountId, messages: &mut [Message], deleted: &mut Vec<MessageId>) {
     let vanished: Vec<Message> = if deleted.is_empty() || messages.iter().all(|m| m.rfc_message_id.is_none()) {
         Vec::new()
     } else {
@@ -1443,6 +1443,49 @@ mod tests {
             self.writer.write_all(format!("{command}\r\n").as_bytes()).unwrap();
             self.line()
         }
+    }
+
+    /// IDLE against `scripts/spike-mail-servers.py` (start it first): a watcher on its own
+    /// connection reports new mail within seconds of `XDELIVER`, and the sync that follows
+    /// stores the message with its body. Run with
+    /// `cargo test -p overlook imap_idle -- --ignored --nocapture`.
+    #[test]
+    #[ignore]
+    fn imap_idle_delivers_new_mail_against_the_spike_servers() {
+        use overlook_provider::imap::idle::IdleEvent;
+        let imap_port: u16 = std::env::var("OVERLOOK_SPIKE_IMAP_PORT").ok().and_then(|p| p.parse().ok()).unwrap_or(1143);
+        let servers = MailServers { incoming: ServerEndpoint::new("127.0.0.1", imap_port, Security::None, "spike"), outgoing: ServerEndpoint::new("127.0.0.1", 2525, Security::None, "spike"), pop3: None, imap: None };
+        let account = Account { id: AccountId::from("imap:spike@example.com"), provider: ProviderKind::Imap, display_name: "Spike".into(), email: "spike@example.com".into(), created_at: 0 };
+        let dir = std::env::temp_dir().join(format!("overlook-spike-idle-{}", std::process::id()));
+        let _ = std::fs::remove_dir_all(&dir);
+        std::fs::create_dir_all(&dir).unwrap();
+        let store = Arc::new(Store::open(&dir.join("overlook.sqlite")).unwrap());
+        store.upsert_account(&account).unwrap();
+        store.set_servers(&account.id, &servers).unwrap();
+        let live = Arc::new(ImapProvider::new(servers, "secret").with_timeout(Duration::from_secs(5)).with_inbox_limit(20));
+        let outcome = block_on(run_sync(store.clone(), live.clone(), None, account.clone()));
+        assert_eq!(outcome.state, Some(SyncState::UpToDate), "{outcome:?}");
+        eprintln!("capabilities: {:?}", live.capabilities());
+
+        let (tx, rx) = std::sync::mpsc::channel();
+        let mut watcher = live.idle_watcher(move |event| {
+            let _ = tx.send(event);
+        });
+        std::thread::sleep(Duration::from_secs(1));
+        assert!(rx.try_recv().is_err(), "nothing to report yet");
+        let subject = format!("Idle delivery {}", std::process::id());
+        let started = std::time::Instant::now();
+        Raw::connect(imap_port).imap(&format!("XDELIVER {subject}"));
+        assert_eq!(rx.recv_timeout(Duration::from_secs(10)), Ok(IdleEvent::Changed));
+        let latency = started.elapsed();
+        assert!(latency < Duration::from_secs(5), "reported after {latency:?}");
+        let outcome = block_on(run_sync(store.clone(), live.clone(), None, account.clone()));
+        assert_eq!(outcome.state, Some(SyncState::UpToDate), "{outcome:?}");
+        let delivered = store.messages_for_account(&account.id).unwrap().into_iter().find(|m| m.subject == subject).expect("the delivered message is in the store");
+        assert!(delivered.body.is_cached() && delivered.label_ids.iter().any(|l| l.as_str().ends_with(":INBOX")));
+        eprintln!("IDLE reported the delivery after {latency:?}; the following sync stored {:?} (sync took {:?})", delivered.subject, started.elapsed() - latency);
+        watcher.stop();
+        let _ = std::fs::remove_dir_all(&dir);
     }
 
     /// The plan's M3 exit criterion against `scripts/spike-mail-servers.py` (start it first;

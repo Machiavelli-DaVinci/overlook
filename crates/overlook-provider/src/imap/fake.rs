@@ -1,14 +1,23 @@
 //! A scripted IMAP server for the provider tests, shaped like Dovecot's responses.
 //!
 //! It answers the commands the provider issues (`CAPABILITY`, `LOGIN`, `NOOP`, `LIST`,
-//! `LSUB`, `EXAMINE`/`SELECT`, `CREATE`, `UID SEARCH` (`ALL` and `HEADER Message-ID`),
-//! `UID FETCH` with every item the provider asks for, `UID STORE`, `UID COPY` and `UID MOVE`
-//! with `COPYUID`, `UID EXPUNGE`/`EXPUNGE`, `APPEND` with `APPENDUID`, `LOGOUT`) from a
+//! `LSUB`, `EXAMINE`/`SELECT`, `CREATE`, `UID SEARCH` (`ALL`, `HEADER Message-ID` and
+//! `TEXT`, with `CHARSET` and `LITERAL+` literals), `UID FETCH` with every item the
+//! provider asks for, `UID STORE`, `UID COPY` and `UID MOVE` with `COPYUID`,
+//! `UID EXPUNGE`/`EXPUNGE`, `APPEND` with `APPENDUID`, `ENABLE`, `IDLE`, `LOGOUT`) from a
 //! mutable mailbox the test can change between calls, and can misbehave on request: refuse
 //! the login, say `BYE`, drop the connection before or after a command, answer a command
 //! with a scripted `NO`, or report a folder as in use. Sections (`BODY[2.1]`,
 //! `BODY[2.1.MIME]`, `BODY[TEXT]`) are served from the raw message through `mail-parser`'s
 //! part offsets.
+//!
+//! When the capability string names `CONDSTORE` (and `QRESYNC`), every message carries a
+//! MODSEQ, folders track `HIGHESTMODSEQ` and the UIDs they expunged, `UID FETCH … 
+//! (CHANGEDSINCE n [VANISHED])` answers only what changed, and `* VANISHED (EARLIER)` lists
+//! the expunged UIDs. Change the mailbox through [`FakeFolder::add`],
+//! [`FakeFolder::set_flags`] and [`FakeFolder::remove`] so the sequence numbers move.
+//! `IDLE` answers `+ idling`, reports the selected folder's changes as `EXISTS`, `EXPUNGE`
+//! or `FETCH` lines while it runs, and ends on `DONE` (or when `kill_idle` is set).
 //!
 //! Compiled for this crate's tests and, with the `fake-servers` feature, for other crates'
 //! tests that drive the real provider through the sync engine.
@@ -18,6 +27,7 @@ use std::collections::{BTreeMap, HashSet};
 use std::io::{BufRead, BufReader, Read, Write};
 use std::net::{SocketAddr, TcpListener, TcpStream};
 use std::sync::{Arc, Mutex};
+use std::time::Duration;
 
 #[derive(Clone, Copy, Debug, PartialEq, Eq)]
 pub enum Login {
@@ -36,11 +46,13 @@ pub struct FakeMessage {
     pub bodystructure: Option<String>,
     /// Reported `RFC822.SIZE`, when it should differ from the bytes (to force the large path).
     pub size_override: Option<usize>,
+    /// CONDSTORE mod-sequence of the last change to this message; set by the folder.
+    pub modseq: u64,
 }
 
 impl FakeMessage {
     pub fn new(flags: &[&str], internaldate: &str, raw: impl Into<Vec<u8>>) -> Self {
-        Self { flags: flags.iter().map(|f| f.to_string()).collect(), internaldate: internaldate.into(), raw: raw.into(), bodystructure: None, size_override: None }
+        Self { flags: flags.iter().map(|f| f.to_string()).collect(), internaldate: internaldate.into(), raw: raw.into(), bodystructure: None, size_override: None, modseq: 0 }
     }
 
     pub fn has_flag(&self, flag: &str) -> bool {
@@ -61,18 +73,53 @@ pub struct FakeFolder {
     pub uidvalidity: u32,
     pub messages: BTreeMap<u32, FakeMessage>,
     pub next_uid: u32,
+    /// CONDSTORE: the highest mod-sequence handed out in this folder.
+    pub highest_modseq: u64,
+    /// QRESYNC: UIDs removed from the folder with the mod-sequence of their removal.
+    pub expunged: Vec<(u32, u64)>,
+    /// Bumped by every change, for `IDLE`.
+    pub generation: u64,
 }
 
 impl FakeFolder {
     pub fn new(path: &str, attributes: &[&str], uidvalidity: u32) -> Self {
-        Self { path: path.into(), attributes: attributes.iter().map(|a| a.to_string()).collect(), delimiter: "/".into(), uidvalidity, messages: BTreeMap::new(), next_uid: 1 }
+        Self { path: path.into(), attributes: attributes.iter().map(|a| a.to_string()).collect(), delimiter: "/".into(), uidvalidity, messages: BTreeMap::new(), next_uid: 1, highest_modseq: 1, expunged: Vec::new(), generation: 0 }
     }
 
-    pub fn add(&mut self, m: FakeMessage) -> u32 {
+    fn bump(&mut self) -> u64 {
+        self.highest_modseq += 1;
+        self.generation += 1;
+        self.highest_modseq
+    }
+
+    pub fn add(&mut self, mut m: FakeMessage) -> u32 {
         let uid = self.next_uid;
         self.next_uid += 1;
+        m.modseq = self.bump();
         self.messages.insert(uid, m);
         uid
+    }
+
+    /// Removes a message as an expunge would, recording it for `VANISHED`.
+    pub fn remove(&mut self, uid: u32) -> Option<FakeMessage> {
+        let removed = self.messages.remove(&uid)?;
+        let modseq = self.bump();
+        self.expunged.push((uid, modseq));
+        Some(removed)
+    }
+
+    /// Replaces a message's flags, as another client's `STORE` would.
+    pub fn set_flags(&mut self, uid: u32, flags: &[&str]) {
+        let modseq = self.bump();
+        if let Some(m) = self.messages.get_mut(&uid) {
+            m.flags = flags.iter().map(|f| f.to_string()).collect();
+            m.modseq = modseq;
+        }
+    }
+
+    /// The UID with the highest mod-sequence, for an `IDLE` `FETCH` line.
+    fn last_changed(&self) -> Option<(usize, u32)> {
+        self.messages.iter().enumerate().max_by_key(|(_, (_, m))| m.modseq).map(|(i, (uid, _))| (i + 1, *uid))
     }
 
     /// UIDs of messages whose named header equals `value`.
@@ -102,6 +149,8 @@ pub struct FakeState {
     /// Every command line received, with passwords blanked.
     pub log: Vec<String>,
     pub connections: usize,
+    /// Close the connection of the next `IDLE` in progress without a word (a dropped link).
+    pub kill_idle: bool,
 }
 
 impl Default for FakeState {
@@ -119,6 +168,7 @@ impl Default for FakeState {
             in_use: HashSet::new(),
             log: Vec::new(),
             connections: 0,
+            kill_idle: false,
         }
     }
 }
@@ -166,7 +216,7 @@ pub fn serve(state: FakeState) -> FakeServer {
             let Ok(stream) = stream else { break };
             let state = shared.clone();
             std::thread::spawn(move || {
-                let _ = Connection { state, stream: stream.try_clone().unwrap(), reader: BufReader::new(stream), selected: None, muted: false }.run();
+                let _ = Connection { state, stream: stream.try_clone().unwrap(), reader: BufReader::new(stream), selected: None, muted: false, watched: (0, 0) }.run();
             });
         }
     });
@@ -181,6 +231,10 @@ struct Connection {
     /// Swallow output: the command runs but the client hears nothing (then the connection
     /// closes).
     muted: bool,
+    /// `(EXISTS, generation)` of the selected folder as last reported to this client, so an
+    /// `IDLE` reports what changed since the previous `IDLE` or the `SELECT`, as a real
+    /// server does.
+    watched: (usize, u64),
 }
 
 impl Connection {
@@ -209,7 +263,18 @@ impl Connection {
             if self.reader.read_line(&mut line)? == 0 {
                 return Ok(());
             }
-            let text = line.trim_end_matches(['\r', '\n']).to_owned();
+            let mut text = line.trim_end_matches(['\r', '\n']).to_owned();
+            // Non-synchronising literals (`{n+}` at the end of the line, used by SEARCH for
+            // non-ASCII words): read the bytes and the rest of the line, then treat the
+            // literal as a quoted string.
+            while let Some(open) = text.strip_suffix("+}").and_then(|t| t.rfind('{')) {
+                let Ok(size) = text[open + 1..text.len() - 2].parse::<usize>() else { break };
+                let mut literal = vec![0u8; size];
+                self.reader.read_exact(&mut literal)?;
+                let mut rest = String::new();
+                self.reader.read_line(&mut rest)?;
+                text = format!("{}\"{}\"{}", &text[..open], String::from_utf8_lossy(&literal), rest.trim_end_matches(['\r', '\n']));
+            }
             let (tag, rest) = text.split_once(' ').unwrap_or((&text, ""));
             let (cmd, args) = rest.split_once(' ').unwrap_or((rest, ""));
             let cmd = cmd.to_ascii_uppercase();
@@ -258,6 +323,16 @@ impl Connection {
                     }
                 }
                 "NOOP" => self.say(&format!("{tag} OK NOOP completed."))?,
+                "ENABLE" => {
+                    let s = self.state.lock().unwrap();
+                    let enabled: Vec<String> = args.split_whitespace().filter(|c| s.has_capability(c)).map(|c| c.to_ascii_uppercase()).collect();
+                    drop(s);
+                    if !enabled.is_empty() {
+                        self.say(&format!("* ENABLED {}", enabled.join(" ")))?;
+                    }
+                    self.say(&format!("{tag} OK Enabled."))?;
+                }
+                "IDLE" => self.idle(tag)?,
                 "LIST" | "LSUB" => {
                     let s = self.state.lock().unwrap();
                     let mut lines = Vec::new();
@@ -286,7 +361,9 @@ impl Connection {
                         self.say(&format!("{tag} NO Mailbox doesn't exist: {path}"))?;
                         continue;
                     };
-                    let (exists, uidvalidity, next) = (f.messages.len(), f.uidvalidity, f.next_uid);
+                    let (exists, uidvalidity, next, modseq) = (f.messages.len(), f.uidvalidity, f.next_uid, f.highest_modseq);
+                    let condstore = s.has_capability("CONDSTORE") || s.has_capability("QRESYNC");
+                    self.watched = (exists, f.generation);
                     drop(s);
                     self.selected = Some(path);
                     let writable = cmd == "SELECT";
@@ -300,6 +377,9 @@ impl Connection {
                     self.say("* 0 RECENT")?;
                     self.say(&format!("* OK [UIDVALIDITY {uidvalidity}] UIDs valid"))?;
                     self.say(&format!("* OK [UIDNEXT {next}] Predicted next UID"))?;
+                    if condstore {
+                        self.say(&format!("* OK [HIGHESTMODSEQ {modseq}] Highest"))?;
+                    }
                     if writable {
                         self.say(&format!("{tag} OK [READ-WRITE] Select completed"))?;
                     } else {
@@ -325,7 +405,16 @@ impl Connection {
                         "SEARCH" => self.search(tag, sargs)?,
                         "FETCH" => {
                             let (set, items) = sargs.split_once(' ').unwrap_or((sargs, ""));
-                            self.fetch(tag, set, items.trim().trim_start_matches('(').trim_end_matches(')'))?;
+                            // `(items) (CHANGEDSINCE n [VANISHED])`
+                            let (items, modifier) = match items.trim().to_ascii_uppercase().find("(CHANGEDSINCE") {
+                                Some(at) => {
+                                    let (head, tail) = items.trim().split_at(at);
+                                    let words: Vec<&str> = tail.trim_matches(|c| c == '(' || c == ')').split_whitespace().collect();
+                                    (head.trim().to_owned(), Some((words.get(1).and_then(|n| n.parse::<u64>().ok()).unwrap_or(0), words.iter().any(|w| w.eq_ignore_ascii_case("VANISHED")))))
+                                }
+                                None => (items.trim().to_owned(), None),
+                            };
+                            self.fetch(tag, set, items.trim_start_matches('(').trim_end_matches(')'), modifier)?;
                         }
                         "STORE" => self.store(tag, sargs)?,
                         "COPY" => self.copy_or_move(tag, sargs, false)?,
@@ -356,19 +445,95 @@ impl Connection {
         s.folders.iter().find(|x| &x.path == path).map(f)
     }
 
+    /// `ALL`, `HEADER <name> <value>`, `[CHARSET x] TEXT <word> …` (every word must occur
+    /// somewhere in the raw message, case-insensitively).
     fn search(&mut self, tag: &str, criteria: &str) -> std::io::Result<()> {
-        let upper = criteria.trim().to_ascii_uppercase();
-        let uids: Vec<u32> = if upper == "ALL" {
-            self.selected_folder(|f| f.messages.keys().copied().collect()).unwrap_or_default()
-        } else if upper.starts_with("HEADER ") {
-            let mut parts = criteria.trim().splitn(3, ' ');
-            let (_, name, value) = (parts.next(), parts.next().unwrap_or(""), unquote(parts.next().unwrap_or("")));
-            self.selected_folder(|f| f.find_header(name, &value)).unwrap_or_default()
-        } else {
-            Vec::new()
-        };
+        let tokens = tokenize(criteria);
+        let mut uids: Option<Vec<u32>> = None;
+        let mut i = 0;
+        while i < tokens.len() {
+            let key = tokens[i].to_ascii_uppercase();
+            let narrow = |uids: &mut Option<Vec<u32>>, hits: Vec<u32>| {
+                *uids = Some(match uids.take() {
+                    Some(prev) => prev.into_iter().filter(|u| hits.contains(u)).collect(),
+                    None => hits,
+                });
+            };
+            match key.as_str() {
+                "ALL" => {
+                    narrow(&mut uids, self.selected_folder(|f| f.messages.keys().copied().collect()).unwrap_or_default());
+                    i += 1;
+                }
+                "CHARSET" => i += 2,
+                "HEADER" => {
+                    let (name, value) = (tokens.get(i + 1).cloned().unwrap_or_default(), tokens.get(i + 2).cloned().unwrap_or_default());
+                    narrow(&mut uids, self.selected_folder(|f| f.find_header(&name, &value)).unwrap_or_default());
+                    i += 3;
+                }
+                "TEXT" => {
+                    let word = tokens.get(i + 1).cloned().unwrap_or_default().to_lowercase();
+                    narrow(&mut uids, self.selected_folder(|f| f.messages.iter().filter(|(_, m)| searchable_text(&m.raw).contains(&word)).map(|(u, _)| *u).collect()).unwrap_or_default());
+                    i += 2;
+                }
+                _ => {
+                    return self.say(&format!("{tag} BAD Error in IMAP command UID SEARCH: Unknown argument {key}"));
+                }
+            }
+        }
+        let uids = uids.unwrap_or_default();
         self.say(&format!("* SEARCH{}", uids.iter().map(|u| format!(" {u}")).collect::<String>()))?;
         self.say(&format!("{tag} OK Search completed."))
+    }
+
+    /// `IDLE`: `+ idling`, then the selected folder's changes as untagged lines until the
+    /// client sends `DONE` (or the test sets `kill_idle`, which closes the connection).
+    fn idle(&mut self, tag: &str) -> std::io::Result<()> {
+        self.say("+ idling")?;
+        let snapshot = |this: &Self| this.selected_folder(|f| (f.messages.len(), f.generation)).unwrap_or((0, 0));
+        let (mut exists, mut generation) = self.watched;
+        self.stream.set_read_timeout(Some(Duration::from_millis(50)))?;
+        let mut line = String::new();
+        let result = loop {
+            line.clear();
+            match self.reader.read_line(&mut line) {
+                Ok(0) => break Ok(()),
+                Ok(_) => {
+                    if line.trim().eq_ignore_ascii_case("DONE") {
+                        self.say(&format!("{tag} OK Idle completed."))?;
+                    } else {
+                        self.say(&format!("{tag} BAD Expected DONE"))?;
+                    }
+                    break Ok(());
+                }
+                Err(e) if matches!(e.kind(), std::io::ErrorKind::WouldBlock | std::io::ErrorKind::TimedOut) => {}
+                Err(e) => break Err(e),
+            }
+            {
+                let mut s = self.state.lock().unwrap();
+                if s.kill_idle {
+                    s.kill_idle = false;
+                    drop(s);
+                    let _ = self.stream.shutdown(std::net::Shutdown::Both);
+                    return Ok(());
+                }
+            }
+            let (now_exists, now_generation) = snapshot(self);
+            if now_generation != generation {
+                if now_exists > exists {
+                    self.say(&format!("* {now_exists} EXISTS"))?;
+                    self.say("* 1 RECENT")?;
+                } else if now_exists < exists {
+                    self.say(&format!("* {} EXPUNGE", exists.min(now_exists + 1)))?;
+                } else if let Some((seq, uid, flags)) = self.selected_folder(|f| f.last_changed().map(|(seq, uid)| (seq, uid, f.messages[&uid].flags.join(" ")))).flatten() {
+                    self.say(&format!("* {seq} FETCH (UID {uid} FLAGS ({flags}))"))?;
+                }
+                exists = now_exists;
+                generation = now_generation;
+                self.watched = (exists, generation);
+            }
+        };
+        self.stream.set_read_timeout(None)?;
+        result
     }
 
     fn store(&mut self, tag: &str, args: &str) -> std::io::Result<()> {
@@ -385,10 +550,12 @@ impl Connection {
             let mut s = self.state.lock().unwrap();
             let folder = s.folder_mut(&path);
             let wanted = parse_set(set, folder.messages.keys().copied().collect());
+            let modseq = folder.bump();
             for (seq, (uid, m)) in folder.messages.iter_mut().enumerate() {
                 if !wanted.contains(uid) {
                     continue;
                 }
+                m.modseq = modseq;
                 if item.starts_with('+') {
                     for f in &flags {
                         if !m.has_flag(f) {
@@ -443,7 +610,7 @@ impl Connection {
             let folder = s.folder_mut(&path);
             let seqs: Vec<usize> = folder.messages.keys().enumerate().filter(|(_, u)| source_uids.contains(u)).map(|(i, _)| i + 1).collect();
             for uid in &source_uids {
-                folder.messages.remove(uid);
+                folder.remove(*uid);
             }
             expunged_seqs = seqs;
         }
@@ -474,7 +641,7 @@ impl Connection {
             let gone: Vec<u32> = folder.messages.iter().filter(|(u, m)| m.has_flag("\\Deleted") && wanted.as_ref().is_none_or(|w| w.contains(u))).map(|(u, _)| *u).collect();
             let seqs: Vec<usize> = folder.messages.keys().enumerate().filter(|(_, u)| gone.contains(u)).map(|(i, _)| i + 1).collect();
             for uid in gone {
-                folder.messages.remove(&uid);
+                folder.remove(uid);
             }
             seqs
         };
@@ -528,17 +695,33 @@ impl Connection {
         }
     }
 
-    fn fetch(&mut self, tag: &str, set: &str, items: &str) -> std::io::Result<()> {
+    fn fetch(&mut self, tag: &str, set: &str, items: &str, changed_since: Option<(u64, bool)>) -> std::io::Result<()> {
         let Some(folder) = self.selected_folder(|f| f.clone()) else {
             return self.say(&format!("{tag} BAD No mailbox selected"));
         };
-        let wanted = parse_set(set, folder.messages.keys().copied().collect());
+        let condstore = self.state.lock().unwrap().has_capability("CONDSTORE");
+        // `n:*` covers UIDs up to the highest ever assigned, as on a real server.
+        let mut universe: Vec<u32> = folder.messages.keys().copied().collect();
+        universe.extend(folder.expunged.iter().map(|(u, _)| *u));
+        let wanted = parse_set(set, universe);
+        if let Some((since, true)) = changed_since {
+            let vanished: Vec<u32> = folder.expunged.iter().filter(|(u, m)| *m > since && wanted.contains(u)).map(|(u, _)| *u).collect();
+            if !vanished.is_empty() {
+                self.say(&format!("* VANISHED (EARLIER) {}", encode_set(vanished)))?;
+            }
+        }
         let items: Vec<&str> = split_items(items);
         for (seq, (uid, m)) in folder.messages.iter().enumerate() {
             if !wanted.contains(uid) {
                 continue;
             }
+            if changed_since.is_some_and(|(since, _)| m.modseq <= since) {
+                continue;
+            }
             let mut out: Vec<u8> = format!("* {} FETCH (UID {uid}", seq + 1).into_bytes();
+            if condstore {
+                out.extend_from_slice(format!(" MODSEQ ({})", m.modseq).as_bytes());
+            }
             for item in &items {
                 let upper = item.to_ascii_uppercase();
                 if upper == "UID" {
@@ -572,6 +755,59 @@ impl Connection {
         }
         self.say(&format!("{tag} OK Fetch completed."))
     }
+}
+
+/// What `SEARCH TEXT` matches against: the decoded headers and text parts, lower-cased
+/// (a real server decodes encoded words before matching), with the raw bytes as fallback.
+fn searchable_text(raw: &[u8]) -> String {
+    let Some(parsed) = MessageParser::default().parse(raw) else { return String::from_utf8_lossy(raw).to_lowercase() };
+    let mut text = String::new();
+    for header in parsed.headers() {
+        text.push_str(&format!("{:?}\n", header.value()));
+    }
+    for part in &parsed.parts {
+        match &part.body {
+            PartType::Text(t) | PartType::Html(t) => {
+                text.push_str(t);
+                text.push('\n');
+            }
+            _ => {}
+        }
+    }
+    text.push_str(&String::from_utf8_lossy(raw));
+    text.to_lowercase()
+}
+
+/// Splits SEARCH criteria into words, keeping quoted strings (unquoted) together.
+fn tokenize(criteria: &str) -> Vec<String> {
+    let mut out = Vec::new();
+    let mut current = String::new();
+    let mut quoted = false;
+    let mut escaped = false;
+    for c in criteria.trim().chars() {
+        match (quoted, escaped, c) {
+            (true, true, c) => {
+                current.push(c);
+                escaped = false;
+            }
+            (true, false, '\\') => escaped = true,
+            (true, false, '"') => {
+                quoted = false;
+                out.push(std::mem::take(&mut current));
+            }
+            (false, _, '"') => quoted = true,
+            (false, _, ' ') => {
+                if !current.is_empty() {
+                    out.push(std::mem::take(&mut current));
+                }
+            }
+            (_, _, c) => current.push(c),
+        }
+    }
+    if !current.is_empty() {
+        out.push(current);
+    }
+    out
 }
 
 /// Splits a FETCH item list on spaces, keeping `BODY.PEEK[...]<0.N>` together.

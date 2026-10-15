@@ -61,6 +61,12 @@ and you can read, search, write, and file mail with no connection at all.
 - **Contacts.** A third module beside Mail and Calendar: your Google Contacts and the people you have written
   to, searchable, with a detail card, add, edit and delete that sync back to Google, and one click to write to
   someone or find everything they sent. Changes made offline wait in the same queue as mail.
+- **Any mailbox.** Gmail through its API, and IMAP or POP3 accounts for everything else: type your address
+  and password, Overlook looks the servers up (common providers are built in, then Thunderbird's database),
+  tests the connection, and keeps the password in the system keyring. IMAP folders become labels, new mail
+  arrives the moment the server announces it, changes sync back as moves and flags, and sending goes over
+  SMTP. POP3 downloads and keeps your mail here, with a backup button. Scripted servers only so far; see the
+  status below.
 - **Settings that do things.** Accounts and signatures, notifications, sync interval, mark-as-read timing,
   remote content, download size, working hours, reminders, automatic replies (out of office), and more. Every
   control takes effect immediately.
@@ -202,9 +208,10 @@ native subset; see [rendering policy and limits](docs/message-formatting.md).
 
 ## Status
 
-Early daily use by its author on Omarchy (Hyprland, Wayland). Gmail accounts work end to end; IMAP/SMTP and
-POP3 and a Flatpak build are planned next. GNOME, KDE,
-and screen-reader testing are still to be done. Open an issue with what you did, what you saw, and what you
+Early daily use by its author on Omarchy (Hyprland, Wayland). Gmail accounts work end to end. IMAP/SMTP and
+POP3 are built and tested against scripted servers and public servers' login exchanges, but no real account
+has been synced yet, so treat them as beta; Microsoft 365 needs OAuth, which is not there yet. A Flatpak build,
+GNOME, KDE, and screen-reader testing are still to be done. Open an issue with what you did, what you saw, and what you
 expected.
 
 ## Brand and credits
