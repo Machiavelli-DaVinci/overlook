@@ -4855,7 +4855,7 @@ dependencies = [
 
 [[package]]
 name = "overlook"
-version = "0.4.2"
+version = "1.5.0"
 dependencies = [
  "anyhow",
  "base64 0.22.1",
@@ -4881,7 +4881,7 @@ dependencies = [
 
 [[package]]
 name = "overlook-core"
-version = "0.4.2"
+version = "1.5.0"
 dependencies = [
  "ammonia",
  "cssparser",
@@ -4897,7 +4897,7 @@ dependencies = [
 
 [[package]]
 name = "overlook-provider"
-version = "0.4.2"
+version = "1.5.0"
 dependencies = [
  "base64 0.22.1",
  "imap",
@@ -4917,7 +4917,7 @@ dependencies = [
 
 [[package]]
 name = "overlook-store"
-version = "0.4.2"
+version = "1.5.0"
 dependencies = [
  "overlook-core",
  "rusqlite",
