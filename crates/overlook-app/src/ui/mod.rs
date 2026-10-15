@@ -1798,6 +1798,28 @@ impl MailWindow {
         }
     }
 
+    /// "Send again" on an uncertain or failed Outbox item: a fresh attempt, now.
+    pub(crate) fn resend_draft(&mut self, id: DraftId, window: &mut Window, cx: &mut Context<Self>) {
+        match self.store.resend(&id) {
+            Ok(draft) => {
+                self.reload(cx);
+                self.sync_account(draft.account_id, window, cx);
+            }
+            Err(e) => window.push_notification(Notification::warning(e.to_string()), cx),
+        }
+    }
+
+    /// "Discard" on an uncertain or failed Outbox item: the draft and its send are dropped.
+    pub(crate) fn discard_send(&mut self, id: DraftId, window: &mut Window, cx: &mut Context<Self>) {
+        match self.store.discard_send(&id) {
+            Ok(()) => {
+                self.outbox_selected = None;
+                self.reload(cx);
+            }
+            Err(e) => window.push_notification(Notification::warning(e.to_string()), cx),
+        }
+    }
+
     // ------------------------------------------------------------- settings
 
     fn set_appearance(&mut self, pref: AppearancePreference, window: &mut Window, cx: &mut Context<Self>) {

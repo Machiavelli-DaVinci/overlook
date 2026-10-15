@@ -170,17 +170,19 @@ fn after_data(e: SmtpError) -> ProviderError {
     by_status(&e).unwrap_or(ProviderError::Uncertain)
 }
 
-#[cfg(test)]
-mod tests {
-    use super::*;
+/// Scripted SMTP servers for tests: one-shot (`serve`) and persistent (`serve_many`).
+/// Plaintext, `AUTH PLAIN`, with faults armed through [`fake::Behaviour`].
+#[cfg(any(test, feature = "fake-servers"))]
+pub mod fake {
     use base64::Engine;
     use std::io::{BufRead, BufReader, Read, Write};
     use std::net::{Shutdown, SocketAddr, TcpListener, TcpStream};
-    use std::sync::mpsc;
+    use std::sync::{mpsc, Arc, Mutex};
+    use std::time::Duration;
 
     /// How the scripted server misbehaves, if at all.
-    #[derive(Clone, Copy, PartialEq, Eq)]
-    enum Behaviour {
+    #[derive(Clone, Copy, Debug, PartialEq, Eq)]
+    pub enum Behaviour {
         Normal,
         RejectAuth,
         TemporaryMail,
@@ -190,15 +192,16 @@ mod tests {
     }
 
     /// What the server saw.
-    #[derive(Default, Debug)]
-    struct Seen {
-        auth: Option<(String, String)>,
-        mail_from: Option<String>,
-        rcpt: Vec<String>,
-        data: Option<Vec<u8>>,
+    #[derive(Default, Debug, Clone)]
+    pub struct Seen {
+        pub auth: Option<(String, String)>,
+        pub mail_from: Option<String>,
+        pub rcpt: Vec<String>,
+        pub data: Option<Vec<u8>>,
     }
 
-    fn serve(behaviour: Behaviour) -> (SocketAddr, mpsc::Receiver<Seen>) {
+    /// Serves exactly one connection and hands back what it saw.
+    pub fn serve(behaviour: Behaviour) -> (SocketAddr, mpsc::Receiver<Seen>) {
         let listener = TcpListener::bind("127.0.0.1:0").unwrap();
         let addr = listener.local_addr().unwrap();
         let (tx, rx) = mpsc::channel();
@@ -209,6 +212,46 @@ mod tests {
             let _ = tx.send(seen);
         });
         (addr, rx)
+    }
+
+    /// A server that keeps accepting connections. `behaviour` is read at the start of each
+    /// connection, so a test can arm a fault for the next send; every finished connection
+    /// is appended to `seen`.
+    pub struct FakeSmtp {
+        pub addr: SocketAddr,
+        pub behaviour: Arc<Mutex<Behaviour>>,
+        pub seen: Arc<Mutex<Vec<Seen>>>,
+    }
+
+    impl FakeSmtp {
+        pub fn set(&self, behaviour: Behaviour) {
+            *self.behaviour.lock().unwrap() = behaviour;
+        }
+
+        pub fn messages(&self) -> Vec<Vec<u8>> {
+            self.seen.lock().unwrap().iter().filter_map(|s| s.data.clone()).collect()
+        }
+    }
+
+    pub fn serve_many(behaviour: Behaviour) -> FakeSmtp {
+        let listener = TcpListener::bind("127.0.0.1:0").unwrap();
+        let addr = listener.local_addr().unwrap();
+        let behaviour = Arc::new(Mutex::new(behaviour));
+        let seen: Arc<Mutex<Vec<Seen>>> = Arc::new(Mutex::new(Vec::new()));
+        let (b, s) = (behaviour.clone(), seen.clone());
+        std::thread::spawn(move || {
+            for stream in listener.incoming() {
+                let Ok(stream) = stream else { break };
+                let _ = stream.set_read_timeout(Some(Duration::from_secs(5)));
+                let behaviour = *b.lock().unwrap();
+                let s = s.clone();
+                std::thread::spawn(move || {
+                    let result = script(stream, behaviour);
+                    s.lock().unwrap().push(result);
+                });
+            }
+        });
+        FakeSmtp { addr, behaviour, seen }
     }
 
     fn script(mut stream: TcpStream, behaviour: Behaviour) -> Seen {
@@ -288,6 +331,14 @@ mod tests {
         }
         seen
     }
+
+}
+
+#[cfg(test)]
+mod tests {
+    use super::fake::*;
+    use super::*;
+    use std::net::{SocketAddr, TcpListener};
 
     fn transport(addr: SocketAddr) -> Transport {
         Transport::new(ServerEndpoint::new("127.0.0.1", addr.port(), Security::None, "jason@example.com"), "hunter2").with_timeout(Duration::from_secs(5))

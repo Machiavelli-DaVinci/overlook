@@ -1,4 +1,5 @@
-//! `MailProvider` for IMAP accounts (plan milestone M2: the read path).
+//! `MailProvider` for IMAP accounts (plan milestones M2, the read path, and M3, the write
+//! path and sending).
 //!
 //! - `connection`: TLS / STARTTLS / plaintext-to-localhost sessions and the error mapping.
 //! - `folders`: `LIST` results as [`Label`] rows.
@@ -16,25 +17,42 @@
 //! (the sync engine adopts the stored id for a provider id already on disk); `provider_id`
 //! is `<folder>\u{1f}<uidvalidity>\u{1f}<uid>`.
 //!
-//! Mailbox writes (`apply`), sending and send reconciliation are milestone M3 and return
-//! `Rejected` here.
+//! Mailbox writes, from the plan's "IMAP operations" table: flags go through
+//! `UID STORE ±FLAGS.SILENT` grouped by folder; Archive, Trash, Untrash, AddLabel and
+//! RemoveLabel are moves (`UID MOVE` when advertised, else `UID COPY` + `\Deleted` +
+//! `UID EXPUNGE`), whose `COPYUID` gives the new provider ids back through
+//! [`AppliedChanges`]. A message that is already gone from its folder is a no-op (the next
+//! change cycle removes the local row); a target folder that vanished is `Rejected`; the
+//! Archive (and Trash) folder is created on demand. Every write is safe to replay: a
+//! message moved by an interrupted attempt is found again in the target folder by its
+//! Message-ID.
+//!
+//! Sending goes over SMTP ([`crate::smtp::Transport`]) with the shared [`crate::build_raw`]
+//! and the deterministic [`crate::draft_message_id`]; the same bytes are then `APPEND`ed to
+//! the Sent folder with `\Seen`, and `APPENDUID` names the Sent copy. When the `APPEND`
+//! fails after SMTP accepted the message, the receipt still says Sent and the Sent copy is
+//! built locally with a placeholder provider id ([`is_local_placeholder`]) that the sync
+//! engine swaps for the server copy when one turns up. `reconcile_send` searches Sent for
+//! the Message-ID; not finding it is not proof of non-delivery, so the outcome is
+//! `NotDelivered` only when this process saw the failure happen before `DATA`, and
+//! [`SendOutcome::Unknown`] otherwise.
 
 pub mod connection;
 pub mod folders;
 pub mod structure;
 pub mod uidset;
 
-#[cfg(test)]
-mod fake;
+#[cfg(any(test, feature = "fake-servers"))]
+pub mod fake;
 #[cfg(test)]
 mod tests;
 
 use crate::mime::{headers_from_rfc822, message_from_rfc822, MessageFlags};
-use crate::{AppliedChanges, BoxFuture, MailProvider, MailboxSnapshot, ProviderError, RemoteChanges, SendContext, SendOutcome, SentReceipt};
+use crate::{build_raw, draft_message_id, smtp, AppliedChanges, BoxFuture, MailProvider, MailboxSnapshot, ProviderError, RemoteChanges, SendContext, SendOutcome, SentReceipt};
 use connection::{map_error, Session};
 use folders::FolderInfo;
 use imap::types::Flag;
-use imap_proto::types::{MessageSection, SectionPath};
+use imap_proto::types::{MessageSection, Response, ResponseCode, SectionPath, UidSetMember};
 use overlook_core::time::now;
 use overlook_core::*;
 use serde::{Deserialize, Serialize};
@@ -56,6 +74,16 @@ const FLAG_REFRESH_EVERY: u64 = 10;
 const FETCH_CHUNK: usize = 400;
 
 const SEP: char = '\u{1f}';
+
+/// Prefix of the provider id given to a Sent copy that exists only locally (the `APPEND`
+/// failed after SMTP accepted the message). The sync engine adopts such a row for the
+/// server copy with the same Message-ID when one appears.
+const LOCAL_PLACEHOLDER: &str = "local\u{1f}";
+
+/// Whether a provider id names a locally built Sent copy rather than a server message.
+pub fn is_local_placeholder(id: &ProviderId) -> bool {
+    id.0.starts_with(LOCAL_PLACEHOLDER)
+}
 
 // ------------------------------------------------------------------ checkpoint
 
@@ -169,11 +197,24 @@ pub struct Capabilities {
     pub idle: bool,
 }
 
+/// The folder a connection has open.
+#[derive(Debug, Clone, PartialEq, Eq)]
+struct Selected {
+    path: String,
+    uidvalidity: u32,
+    /// `SELECT` rather than `EXAMINE`.
+    writable: bool,
+}
+
 struct Conn {
     session: Option<Session>,
-    /// The folder currently examined, with its UIDVALIDITY.
-    selected: Option<(String, u32)>,
+    selected: Option<Selected>,
     caps: Capabilities,
+    /// A write created a folder; the next change cycle must re-list so the checkpoint
+    /// tracks it. Survives reconnects.
+    relist_pending: bool,
+    /// The Sent folder path from the last listing, for `APPEND` and `reconcile_send`.
+    sent_path: Option<String>,
 }
 
 impl Conn {
@@ -181,26 +222,72 @@ impl Conn {
         self.session.as_mut().expect("with_session connects before use")
     }
 
-    /// `EXAMINE`s the folder (read-only) and returns its state. Always issued, since the
-    /// callers want a fresh `UIDVALIDITY`.
-    fn examine(&mut self, path: &str) -> Result<imap::types::Mailbox, ProviderError> {
+    fn open(&mut self, path: &str, writable: bool) -> Result<imap::types::Mailbox, ProviderError> {
         self.selected = None;
-        let mailbox = self.session().examine(path).map_err(|e| map_error(&e))?;
-        self.selected = Some((path.to_owned(), mailbox.uid_validity.unwrap_or(0)));
+        let mailbox = if writable { self.session().select(path) } else { self.session().examine(path) }.map_err(|e| map_error(&e))?;
+        self.selected = Some(Selected { path: path.to_owned(), uidvalidity: mailbox.uid_validity.unwrap_or(0), writable });
         Ok(mailbox)
     }
 
-    /// Makes `path` the examined folder, skipping the round trip when it already is.
-    /// Returns `false` when its `UIDVALIDITY` is not `uidvalidity` any more.
+    /// `EXAMINE`s the folder (read-only) and returns its state. Always issued, since the
+    /// callers want a fresh `UIDVALIDITY`.
+    fn examine(&mut self, path: &str) -> Result<imap::types::Mailbox, ProviderError> {
+        self.open(path, false)
+    }
+
+    /// `SELECT`s the folder read-write and returns its state.
+    fn select(&mut self, path: &str) -> Result<imap::types::Mailbox, ProviderError> {
+        self.open(path, true)
+    }
+
+    /// Makes `path` the open folder (read-only is enough), skipping the round trip when it
+    /// already is. Returns `false` when its `UIDVALIDITY` is not `uidvalidity` any more or
+    /// the folder is gone.
     fn examine_for(&mut self, path: &str, uidvalidity: u32) -> Result<bool, ProviderError> {
-        if self.selected.as_ref().is_some_and(|(p, v)| p == path && *v == uidvalidity) {
+        self.open_for(path, uidvalidity, false)
+    }
+
+    /// Like [`Conn::examine_for`] but read-write, for `STORE`, `MOVE` and `EXPUNGE`.
+    fn select_for(&mut self, path: &str, uidvalidity: u32) -> Result<bool, ProviderError> {
+        self.open_for(path, uidvalidity, true)
+    }
+
+    fn open_for(&mut self, path: &str, uidvalidity: u32, writable: bool) -> Result<bool, ProviderError> {
+        if self.selected.as_ref().is_some_and(|s| s.path == path && s.uidvalidity == uidvalidity && (s.writable || !writable)) {
             return Ok(true);
         }
-        match self.examine(path) {
-            Ok(_) => Ok(self.selected.as_ref().is_some_and(|(_, v)| *v == uidvalidity)),
+        match self.open(path, writable) {
+            Ok(_) => Ok(self.selected.as_ref().is_some_and(|s| s.uidvalidity == uidvalidity)),
             // The folder is gone: its messages are stale; the next change cycle cleans up.
             Err(ProviderError::Rejected(_)) => Ok(false),
             Err(e) => Err(e),
+        }
+    }
+
+    /// `UID SEARCH HEADER Message-ID` in the open folder; the lowest matching UID.
+    fn find_by_message_id(&mut self, rfc_id: &str) -> Result<Option<u32>, ProviderError> {
+        let clean: String = rfc_id.chars().filter(|c| !matches!(c, '"' | '\\' | '\r' | '\n')).collect();
+        let hits = self.session().uid_search(format!("HEADER Message-ID \"{clean}\"")).map_err(|e| map_error(&e))?;
+        Ok(hits.into_iter().min())
+    }
+
+    /// Runs a command that may answer with `COPYUID` (`UID MOVE`, `UID COPY`) and returns
+    /// the `(uidvalidity, source uids, destination uids)` it reported, if any.
+    fn run_copyuid(&mut self, command: &str) -> Result<Option<(u32, Vec<u32>, Vec<u32>)>, imap::Error> {
+        let (lines, _) = self.session().run(command)?;
+        Ok(parse_copyuid(&lines))
+    }
+
+    /// `CREATE`s a folder; an existing folder is not an error.
+    fn create_folder(&mut self, path: &str) -> Result<(), ProviderError> {
+        match self.session().create(path) {
+            Ok(()) => {
+                info!("imap: created folder {path}");
+                self.relist_pending = true;
+                Ok(())
+            }
+            Err(imap::Error::No(no)) if no.information.to_ascii_uppercase().contains("ALREADYEXISTS") => Ok(()),
+            Err(e) => Err(map_error(&e)),
         }
     }
 
@@ -241,12 +328,26 @@ impl Conn {
     }
 }
 
+/// How far the last send attempt of a draft got in this process, for `reconcile_send`.
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+enum SendPhase {
+    /// SMTP failed before `DATA` was accepted: nothing left this machine.
+    BeforeData,
+    /// The body was written and the connection dropped: the server may have queued it.
+    AfterData,
+    /// SMTP accepted the message.
+    Accepted,
+}
+
 pub struct ImapProvider {
     servers: MailServers,
     password: String,
+    /// SMTP password when it differs from the incoming one.
+    outgoing_password: Option<String>,
     inbox_limit: usize,
     timeout: Duration,
     conn: Mutex<Conn>,
+    send_phases: Mutex<HashMap<String, SendPhase>>,
 }
 
 impl std::fmt::Debug for ImapProvider {
@@ -258,7 +359,25 @@ impl std::fmt::Debug for ImapProvider {
 
 impl ImapProvider {
     pub fn new(servers: MailServers, password: impl Into<String>) -> Self {
-        Self { servers, password: password.into(), inbox_limit: 100, timeout: DEFAULT_TIMEOUT, conn: Mutex::new(Conn { session: None, selected: None, caps: Capabilities::default() }) }
+        Self {
+            servers,
+            password: password.into(),
+            outgoing_password: None,
+            inbox_limit: 100,
+            timeout: DEFAULT_TIMEOUT,
+            conn: Mutex::new(Conn { session: None, selected: None, caps: Capabilities::default(), relist_pending: false, sent_path: None }),
+            send_phases: Mutex::new(HashMap::new()),
+        }
+    }
+
+    /// The SMTP password, when "use the same password" was not chosen at setup.
+    pub fn with_outgoing_password(mut self, password: Option<String>) -> Self {
+        self.outgoing_password = password.filter(|p| !p.is_empty());
+        self
+    }
+
+    fn outgoing_password(&self) -> &str {
+        self.outgoing_password.as_deref().unwrap_or(&self.password)
     }
 
     /// Newest Inbox messages to list on first download; other folders scale with it, with
@@ -311,6 +430,11 @@ impl ImapProvider {
         conn.session = Some(session);
         conn.selected = None;
         Ok(())
+    }
+
+    /// Whether the next change cycle should re-list folders (a write created one).
+    pub fn relist_pending(&self) -> bool {
+        self.conn.lock().map(|c| c.relist_pending).unwrap_or(false)
     }
 
     /// Runs `f` on the account's connection, opening it when needed. A connection that was
@@ -499,6 +623,8 @@ impl ImapProvider {
         }
         cp.folders = next;
         cp.listed_at = now();
+        conn.sent_path = classified.iter().find(|(_, k)| *k == LabelKind::Sent).map(|(f, _)| f.path.clone());
+        conn.relist_pending = false;
         Ok((labels, deleted))
     }
 
@@ -548,7 +674,7 @@ impl ImapProvider {
             let mut cp = base.clone();
             cp.cycle += 1;
             let mut changes = RemoteChanges::default();
-            if cp.folders.is_empty() || now() - cp.listed_at > LIST_INTERVAL_MS {
+            if cp.folders.is_empty() || conn.relist_pending || now() - cp.listed_at > LIST_INTERVAL_MS {
                 let (labels, deleted) = self.relist(conn, account, &mut cp)?;
                 changes.labels = Some(labels);
                 changes.deleted_provider_ids.extend(deleted);
@@ -674,6 +800,346 @@ impl ImapProvider {
         })
     }
 
+
+    // ------------------------------------------------------------------ writes
+
+    /// `messages` grouped by folder and UIDVALIDITY, in first-seen order. Messages without
+    /// a server copy (no parseable provider id) are skipped.
+    fn groups(messages: &[Message]) -> Vec<((String, u32), Vec<Item>)> {
+        let mut groups: Vec<((String, u32), Vec<Item>)> = Vec::new();
+        for m in messages {
+            let Some(r) = m.provider_id.as_ref().and_then(MessageRef::parse) else { continue };
+            let item = Item { id: m.id.clone(), uid: r.uid, rfc_message_id: m.rfc_message_id.clone() };
+            let key = (r.folder, r.uidvalidity);
+            match groups.iter_mut().find(|(k, _)| *k == key) {
+                Some((_, items)) => items.push(item),
+                None => groups.push((key, vec![item])),
+            }
+        }
+        groups
+    }
+
+    fn apply_op(&self, account: &Account, op: &PendingOperation, messages: &[Message], labels: &[Label]) -> Result<AppliedChanges, ProviderError> {
+        if op.kind.is_calendar() {
+            return Err(ProviderError::Rejected("this account has no calendar".into()));
+        }
+        if op.kind.is_contact() {
+            return Err(ProviderError::Rejected("this account cannot store contacts".into()));
+        }
+        match &op.kind {
+            OperationKind::SetRead { read, .. } => self.store_flag(messages, "\\Seen", *read),
+            OperationKind::SetStarred { starred, .. } => self.store_flag(messages, "\\Flagged", *starred),
+            OperationKind::Archive { .. } => self.move_messages(account, messages, labels, Target::Archive),
+            OperationKind::Trash { .. } => self.move_messages(account, messages, labels, Target::Trash),
+            OperationKind::Untrash { .. } => self.move_messages(account, messages, labels, Target::Inbox),
+            OperationKind::AddLabel { label_id, .. } => self.move_messages(account, messages, labels, Target::Label(label_id.clone())),
+            OperationKind::RemoveLabel { label_id, .. } => self.move_messages(account, messages, labels, Target::RemoveLabel(label_id.clone())),
+            OperationKind::SendDraft { .. } => Err(ProviderError::Rejected("drafts are sent through the Outbox".into())),
+            _ => Err(ProviderError::Rejected("this account cannot apply that change".into())),
+        }
+    }
+
+    /// `UID STORE ±FLAGS.SILENT (<flag>)` per folder. A folder that is gone or whose
+    /// UIDVALIDITY changed is skipped: those rows are stale and the next cycle replaces them.
+    fn store_flag(&self, messages: &[Message], flag: &str, on: bool) -> Result<AppliedChanges, ProviderError> {
+        let groups = Self::groups(messages);
+        self.with_session(|conn| {
+            for ((path, uidvalidity), items) in &groups {
+                if !conn.select_for(path, *uidvalidity)? {
+                    info!("imap: {path} changed under us; {} flag changes skipped", items.len());
+                    continue;
+                }
+                let uids: BTreeSet<u32> = items.iter().map(|i| i.uid).collect();
+                for chunk in uidset::chunks(&uids, FETCH_CHUNK) {
+                    conn.session().uid_store(&chunk, format!("{}FLAGS.SILENT ({flag})", if on { '+' } else { '-' })).map_err(|e| map_error(&e))?;
+                }
+            }
+            Ok(AppliedChanges::default())
+        })
+    }
+
+    /// The path a label maps to, from the labels the sync engine passed in.
+    fn label_path<'a>(labels: &'a [Label], id: &LabelId) -> Option<&'a str> {
+        labels.iter().find(|l| &l.id == id).and_then(|l| l.provider_id.as_ref()).map(|p| p.0.as_str())
+    }
+
+    fn kind_path<'a>(labels: &'a [Label], kind: LabelKind) -> Option<&'a str> {
+        labels.iter().find(|l| l.kind == kind).and_then(|l| l.provider_id.as_ref()).map(|p| p.0.as_str())
+    }
+
+    /// `INBOX<delimiter>` when every folder lives under the Inbox (Courier, some Dovecot
+    /// layouts), so a folder created on demand lands beside the others.
+    fn namespace_prefix(labels: &[Label]) -> String {
+        let paths: Vec<&str> = labels.iter().filter(|l| l.kind != LabelKind::Inbox).filter_map(|l| l.provider_id.as_ref()).map(|p| p.0.as_str()).collect();
+        for prefix in ["INBOX.", "INBOX/"] {
+            if !paths.is_empty() && paths.iter().all(|p| p.len() > prefix.len() && p[..prefix.len()].eq_ignore_ascii_case(prefix)) {
+                return prefix.to_owned();
+            }
+        }
+        String::new()
+    }
+
+    /// Where a move goes. `created` is the label to report when the folder has to be made.
+    fn resolve_target(&self, account: &Account, target: &Target, labels: &[Label]) -> Result<(Destination, Option<Label>), ProviderError> {
+        let policy = self.servers.imap.as_ref();
+        let make = |path: String, kind: LabelKind, name: &str| {
+            let label = Label { id: folders::label_id(&account.id, &path), account_id: account.id.clone(), kind, name: name.into(), provider_id: Some(ProviderId(path.clone())), color: None, sort_order: labels.len() as i32 };
+            (Destination::Path(path), Some(label))
+        };
+        let known = |path: &str| labels.iter().any(|l| l.provider_id.as_ref().is_some_and(|p| p.0 == path));
+        Ok(match target {
+            Target::Inbox => (Destination::Path(Self::kind_path(labels, LabelKind::Inbox).unwrap_or("INBOX").to_owned()), None),
+            Target::Archive => match policy.and_then(|p| p.archive_folder.clone()).filter(|p| !p.trim().is_empty()) {
+                Some(path) if known(&path) => (Destination::Path(path), None),
+                Some(path) => make(path, LabelKind::Archive, "Archive"),
+                None => match Self::kind_path(labels, LabelKind::Archive) {
+                    Some(path) => (Destination::Path(path.to_owned()), None),
+                    None => make(format!("{}Archive", Self::namespace_prefix(labels)), LabelKind::Archive, "Archive"),
+                },
+            },
+            Target::Trash => match policy.and_then(|p| p.trash_folder.clone()).filter(|p| !p.trim().is_empty()) {
+                Some(path) if known(&path) => (Destination::Path(path), None),
+                Some(path) => make(path, LabelKind::Trash, "Trash"),
+                None => match Self::kind_path(labels, LabelKind::Trash) {
+                    Some(path) => (Destination::Path(path.to_owned()), None),
+                    None if policy.is_some_and(|p| p.expunge_on_trash) => (Destination::Expunge, None),
+                    None => make(format!("{}Trash", Self::namespace_prefix(labels)), LabelKind::Trash, "Trash"),
+                },
+            },
+            Target::Label(id) | Target::RemoveLabel(id) => match Self::label_path(labels, id) {
+                Some(path) => (Destination::Path(path.to_owned()), None),
+                None => return Err(ProviderError::Rejected("that label has no folder on the server".into())),
+            },
+        })
+    }
+
+    fn move_messages(&self, account: &Account, messages: &[Message], labels: &[Label], target: Target) -> Result<AppliedChanges, ProviderError> {
+        let (destination, created) = self.resolve_target(account, &target, labels)?;
+        let inbox = Self::kind_path(labels, LabelKind::Inbox).unwrap_or("INBOX").to_owned();
+        let mut groups = Self::groups(messages);
+        // Each group moves to one folder: RemoveLabel sends a message in that folder back to
+        // the Inbox (or, for the Inbox itself, to the Archive) and leaves the others alone.
+        let mut plan: Vec<((String, u32), Vec<Item>, Destination)> = Vec::new();
+        for ((path, uidvalidity), items) in groups.drain(..) {
+            let dest = match (&target, &destination) {
+                (Target::RemoveLabel(_), Destination::Path(removed)) if &path == removed && path.eq_ignore_ascii_case(&inbox) => {
+                    let (archive, _) = self.resolve_target(account, &Target::Archive, labels)?;
+                    archive
+                }
+                (Target::RemoveLabel(_), Destination::Path(removed)) if &path == removed => Destination::Path(inbox.clone()),
+                (Target::RemoveLabel(_), _) => continue,
+                (_, Destination::Path(dest)) if &path == dest => continue,
+                (_, dest) => dest.clone(),
+            };
+            plan.push(((path, uidvalidity), items, dest));
+        }
+        let created_for_archive = matches!(target, Target::RemoveLabel(_)).then(|| self.resolve_target(account, &Target::Archive, labels).ok().and_then(|(_, l)| l)).flatten();
+        let new_label = created.or(created_for_archive);
+        if plan.is_empty() {
+            return Ok(AppliedChanges::default());
+        }
+        let label_for = |path: &str| labels.iter().find(|l| l.provider_id.as_ref().is_some_and(|p| p.0 == path)).map(|l| l.id.clone()).unwrap_or_else(|| folders::label_id(&account.id, path));
+        self.with_session(|conn| {
+            let mut changes = AppliedChanges::default();
+            for ((path, uidvalidity), items, dest) in &plan {
+                if !conn.select_for(path, *uidvalidity)? {
+                    info!("imap: {path} changed under us; {} messages not moved (the next sync resolves them)", items.len());
+                    continue;
+                }
+                match dest {
+                    Destination::Expunge => {
+                        let uids: BTreeSet<u32> = items.iter().map(|i| i.uid).collect();
+                        Self::delete_and_expunge(conn, &uids)?;
+                    }
+                    Destination::Path(dest) => {
+                        let may_create = new_label.as_ref().is_some_and(|l| l.provider_id.as_ref().is_some_and(|p| p.0 == *dest));
+                        let moved = self.move_group(conn, path, items, dest, may_create)?;
+                        let label = label_for(dest);
+                        changes.provider_ids.extend(moved.into_iter().map(|(id, pid)| (id, pid, label.clone())));
+                    }
+                }
+            }
+            if let Some(label) = &new_label {
+                if changes.provider_ids.iter().any(|(_, _, l)| l == &label.id) {
+                    changes.labels.push(label.clone());
+                }
+            }
+            Ok(changes)
+        })
+    }
+
+    /// `\Deleted` + `UID EXPUNGE` (plain `EXPUNGE` without UIDPLUS).
+    fn delete_and_expunge(conn: &mut Conn, uids: &BTreeSet<u32>) -> Result<(), ProviderError> {
+        let uidplus = conn.caps.uidplus;
+        for chunk in uidset::chunks(uids, FETCH_CHUNK) {
+            conn.session().uid_store(&chunk, "+FLAGS.SILENT (\\Deleted)").map_err(|e| map_error(&e))?;
+            if uidplus {
+                conn.session().uid_expunge(&chunk).map_err(|e| map_error(&e))?;
+            }
+        }
+        if !uidplus {
+            conn.session().expunge().map_err(|e| map_error(&e))?;
+        }
+        Ok(())
+    }
+
+    /// Moves `items` from the open folder `source` to `dest` and returns the new provider
+    /// id of every message it could account for. A target the server says to create is
+    /// created when `may_create` (the Archive or Trash folder made on demand) and
+    /// `Rejected` otherwise. A message the server no longer has in `source` (moved by an
+    /// interrupted attempt) or that came back without `COPYUID` is looked up in `dest` by
+    /// its Message-ID.
+    fn move_group(&self, conn: &mut Conn, source: &str, items: &[Item], dest: &str, may_create: bool) -> Result<Vec<(MessageId, ProviderId)>, ProviderError> {
+        let uids: BTreeSet<u32> = items.iter().map(|i| i.uid).collect();
+        let quoted = quote_mailbox(dest);
+        let mut mapping: HashMap<u32, (u32, u32)> = HashMap::new();
+        for chunk in uidset::chunks(&uids, FETCH_CHUNK) {
+            let command = if conn.caps.move_ { format!("UID MOVE {chunk} {quoted}") } else { format!("UID COPY {chunk} {quoted}") };
+            let copyuid = match conn.run_copyuid(&command) {
+                Ok(c) => c,
+                Err(imap::Error::No(no)) if may_create && no.code == Some(ResponseCode::TryCreate) => {
+                    conn.create_folder(dest)?;
+                    conn.run_copyuid(&command).map_err(|e| map_error(&e))?
+                }
+                Err(e) => return Err(map_error(&e)),
+            };
+            if !conn.caps.move_ {
+                let set: BTreeSet<u32> = uidset::decode(&chunk);
+                Self::delete_and_expunge(conn, &set)?;
+            }
+            if let Some((validity, from, to)) = copyuid {
+                for (f, t) in from.into_iter().zip(to) {
+                    mapping.insert(f, (validity, t));
+                }
+            }
+        }
+        let mut out: Vec<(MessageId, ProviderId)> = Vec::new();
+        let mut unresolved: Vec<&Item> = Vec::new();
+        for item in items {
+            match mapping.get(&item.uid) {
+                Some((validity, uid)) => out.push((item.id.clone(), MessageRef::provider_id(dest, *validity, *uid))),
+                None => unresolved.push(item),
+            }
+        }
+        if unresolved.iter().any(|i| i.rfc_message_id.is_some()) {
+            let validity = conn.select(dest)?.uid_validity.unwrap_or(0);
+            for item in unresolved {
+                let Some(rfc) = &item.rfc_message_id else { continue };
+                if let Some(uid) = conn.find_by_message_id(rfc)? {
+                    out.push((item.id.clone(), MessageRef::provider_id(dest, validity, uid)));
+                }
+            }
+        }
+        info!("imap: moved {} of {} messages from {source} to {dest}", out.len(), items.len());
+        Ok(out)
+    }
+
+    // ----------------------------------------------------------------- sending
+
+    fn set_phase(&self, draft: &Draft, phase: SendPhase) {
+        if let Ok(mut phases) = self.send_phases.lock() {
+            phases.insert(draft.id.0.clone(), phase);
+        }
+    }
+
+    /// The Sent folder: the policy override, then the last listing, then a fresh `LIST`.
+    fn sent_folder(&self, conn: &mut Conn) -> Result<Option<String>, ProviderError> {
+        if let Some(path) = self.servers.imap.as_ref().and_then(|p| p.sent_folder.clone()).filter(|p| !p.trim().is_empty()) {
+            return Ok(Some(path));
+        }
+        if conn.sent_path.is_none() {
+            let listed = conn.list_folders()?;
+            let classified = folders::classify(&listed, self.servers.imap.as_ref());
+            conn.sent_path = classified.iter().find(|(_, k)| *k == LabelKind::Sent).map(|(f, _)| f.path.clone());
+        }
+        Ok(conn.sent_path.clone())
+    }
+
+    fn send_draft(&self, account: &Account, draft: &Draft, context: SendContext) -> Result<SentReceipt, ProviderError> {
+        let rfc_id = draft_message_id(draft);
+        let raw = build_raw(account, draft, context.in_reply_to.as_ref(), &rfc_id).map_err(ProviderError::Rejected)?;
+        let recipients: Vec<String> = draft.to.iter().chain(&draft.cc).chain(&draft.bcc).map(|a| a.email.trim().to_owned()).filter(|e| !e.is_empty()).collect();
+        let transport = smtp::Transport::new(self.servers.outgoing.clone(), self.outgoing_password()).with_timeout(self.timeout);
+        self.set_phase(draft, SendPhase::BeforeData);
+        match transport.send(&account.email, &recipients, &raw) {
+            Ok(reply) => info!("smtp: {} accepted {:?}: {reply}", self.servers.outgoing.host, draft.display_subject()),
+            Err(ProviderError::Uncertain) => {
+                self.set_phase(draft, SendPhase::AfterData);
+                return Err(ProviderError::Uncertain);
+            }
+            Err(e) => return Err(e),
+        }
+        self.set_phase(draft, SendPhase::Accepted);
+
+        // The Sent copy: APPEND the same bytes; APPENDUID names the server copy.
+        let from_labels = Self::kind_path(&context.labels, LabelKind::Sent).map(str::to_owned);
+        let appended = self.with_session(|conn| {
+            let path = match from_labels.clone() {
+                Some(p) => Some(p),
+                None => self.sent_folder(conn)?,
+            };
+            let Some(path) = path else { return Ok(None) };
+            // This closure may run twice (a dropped connection is reopened once): an APPEND
+            // whose reply was lost must not be repeated.
+            let validity = conn.select(&path)?.uid_validity.unwrap_or(0);
+            if let Some(uid) = conn.find_by_message_id(&rfc_id)? {
+                return Ok(Some(MessageRef::provider_id(&path, validity, uid)));
+            }
+            let result = conn.session().append(&path, &raw).flag(Flag::Seen).finish();
+            match result {
+                Ok(appended) => {
+                    let uid = appended.uids.as_ref().and_then(|u| u.first()).map(|m| match m {
+                        UidSetMember::Uid(u) => *u,
+                        UidSetMember::UidRange(r) => *r.start(),
+                    });
+                    match (appended.uid_validity, uid) {
+                        (Some(validity), Some(uid)) => Ok(Some(MessageRef::provider_id(&path, validity, uid))),
+                        // No UIDPLUS: look the copy up by its Message-ID.
+                        _ => Ok(conn.find_by_message_id(&rfc_id)?.map(|uid| MessageRef::provider_id(&path, validity, uid))),
+                    }
+                }
+                Err(e) => Err(map_error(&e)),
+            }
+        });
+        let provider_id = match appended {
+            Ok(Some(pid)) => pid,
+            Ok(None) => {
+                warn!("imap: no Sent folder; keeping a local copy of {:?}", draft.display_subject());
+                ProviderId(format!("{LOCAL_PLACEHOLDER}{rfc_id}"))
+            }
+            Err(e) => {
+                warn!("imap: the message was sent but could not be copied to Sent ({e}); keeping a local copy");
+                ProviderId(format!("{LOCAL_PLACEHOLDER}{rfc_id}"))
+            }
+        };
+        let sent_label = context.sent_label.clone().or_else(|| from_labels.as_ref().map(|p| folders::label_id(&account.id, p)));
+        let mut message = crate::sample::sent_message(account, draft, context.in_reply_to.as_ref(), &provider_id, &rfc_id, sent_label.as_ref(), now());
+        message.id = Self::local_id(account);
+        if let Some(source) = &context.in_reply_to {
+            message.in_reply_to = source.rfc_message_id.clone();
+            message.references = source.references.iter().cloned().chain(source.rfc_message_id.clone()).collect();
+        }
+        Ok(SentReceipt { provider_id, rfc_message_id: Some(rfc_id), message })
+    }
+
+    fn reconcile(&self, draft: &Draft) -> Result<SendOutcome, ProviderError> {
+        let rfc_id = draft_message_id(draft);
+        let found = self.with_session(|conn| {
+            let Some(path) = self.sent_folder(conn)? else { return Ok(None) };
+            let validity = conn.select(&path)?.uid_validity.unwrap_or(0);
+            Ok(conn.find_by_message_id(&rfc_id)?.map(|uid| MessageRef::provider_id(&path, validity, uid)))
+        })?;
+        if let Some(pid) = found {
+            return Ok(SendOutcome::Delivered(pid));
+        }
+        let phase = self.send_phases.lock().ok().and_then(|p| p.get(&draft.id.0).copied());
+        Ok(match phase {
+            Some(SendPhase::BeforeData) => SendOutcome::NotDelivered,
+            // After DATA, or a previous run of the app: the server may have queued it.
+            _ => SendOutcome::Unknown,
+        })
+    }
+
     fn raw(&self, message: &Message) -> Result<Vec<u8>, ProviderError> {
         let r = message.provider_id.as_ref().and_then(MessageRef::parse).ok_or_else(|| ProviderError::Rejected("this message has no server copy".into()))?;
         self.with_session(|conn| {
@@ -684,6 +1150,66 @@ impl ImapProvider {
             fetches.iter().find(|f| f.uid == Some(r.uid)).and_then(|f| f.body().map(<[u8]>::to_vec)).ok_or_else(|| ProviderError::Rejected("the message is no longer on the server".into()))
         })
     }
+}
+
+
+/// One message of a write operation, inside its folder group.
+#[derive(Debug, Clone)]
+struct Item {
+    id: MessageId,
+    uid: u32,
+    rfc_message_id: Option<String>,
+}
+
+/// What a move operation asks for, before folder resolution.
+#[derive(Debug, Clone, PartialEq, Eq)]
+enum Target {
+    Inbox,
+    Archive,
+    Trash,
+    Label(LabelId),
+    RemoveLabel(LabelId),
+}
+
+#[derive(Debug, Clone, PartialEq, Eq)]
+enum Destination {
+    Path(String),
+    /// No Trash folder and the policy says expunge: `\Deleted` + `UID EXPUNGE`.
+    Expunge,
+}
+
+/// A mailbox name as a quoted string (RFC 3501 `quoted`), for commands the `imap` crate
+/// passes through unquoted.
+fn quote_mailbox(name: &str) -> String {
+    format!("\"{}\"", name.replace('\\', "\\\\").replace('"', "\\\""))
+}
+
+fn expand_uid_set(set: &[UidSetMember]) -> Vec<u32> {
+    let mut out = Vec::new();
+    for m in set {
+        match m {
+            UidSetMember::Uid(u) => out.push(*u),
+            UidSetMember::UidRange(r) => out.extend(r.clone()),
+        }
+    }
+    out
+}
+
+/// The `COPYUID` code in a command's response lines (untagged `OK` for `MOVE`, the tagged
+/// `OK` for `COPY`): `(uidvalidity, source uids, destination uids)`.
+pub fn parse_copyuid(mut lines: &[u8]) -> Option<(u32, Vec<u32>, Vec<u32>)> {
+    while !lines.is_empty() {
+        let Ok((rest, response)) = imap_proto::parser::parse_response(lines) else { return None };
+        let code = match response {
+            Response::Done { code, .. } | Response::Data { code, .. } => code,
+            _ => None,
+        };
+        if let Some(ResponseCode::CopyUid(validity, from, to)) = code {
+            return Some((validity, expand_uid_set(&from), expand_uid_set(&to)));
+        }
+        lines = rest;
+    }
+    None
 }
 
 /// Decodes a fetched body part using its MIME headers (transfer encoding, charset) through
@@ -703,8 +1229,6 @@ pub fn decode_part(mime_headers: &[u8], body: &[u8]) -> Vec<u8> {
         _ => body.to_vec(),
     }
 }
-
-const WRITE_PATH_PENDING: &str = "Changes to IMAP mailboxes are not sent to the server yet; this arrives in the next release.";
 
 impl MailProvider for ImapProvider {
     fn kind(&self) -> ProviderKind {
@@ -732,14 +1256,12 @@ impl MailProvider for ImapProvider {
         Box::pin(async move { self.messages(&account, &ids) })
     }
 
-    fn apply(&self, _account: &Account, op: &PendingOperation, _messages: &[Message], _labels: &[Label]) -> BoxFuture<'_, Result<AppliedChanges, ProviderError>> {
-        let calendar = op.kind.is_calendar();
-        Box::pin(async move {
-            if calendar {
-                return Err(ProviderError::Rejected("this account has no calendar".into()));
-            }
-            Err(ProviderError::Rejected(WRITE_PATH_PENDING.into()))
-        })
+    fn apply(&self, account: &Account, op: &PendingOperation, messages: &[Message], labels: &[Label]) -> BoxFuture<'_, Result<AppliedChanges, ProviderError>> {
+        let account = account.clone();
+        let op = op.clone();
+        let messages = messages.to_vec();
+        let labels = labels.to_vec();
+        Box::pin(async move { self.apply_op(&account, &op, &messages, &labels) })
     }
 
     fn fetch_raw(&self, _account: &Account, message: &Message) -> BoxFuture<'_, Result<Vec<u8>, ProviderError>> {
@@ -759,12 +1281,15 @@ impl MailProvider for ImapProvider {
         Box::pin(async move { self.attachment(&message, &attachment) })
     }
 
-    fn send(&self, _account: &Account, _draft: &Draft, _context: SendContext) -> BoxFuture<'_, Result<SentReceipt, ProviderError>> {
-        Box::pin(async { Err(ProviderError::Rejected("Sending from IMAP accounts arrives in the next release.".into())) })
+    fn send(&self, account: &Account, draft: &Draft, context: SendContext) -> BoxFuture<'_, Result<SentReceipt, ProviderError>> {
+        let account = account.clone();
+        let draft = draft.clone();
+        Box::pin(async move { self.send_draft(&account, &draft, context) })
     }
 
-    fn reconcile_send(&self, _account: &Account, _draft: &Draft) -> BoxFuture<'_, Result<SendOutcome, ProviderError>> {
-        Box::pin(async { Ok(SendOutcome::NotDelivered) })
+    fn reconcile_send(&self, _account: &Account, draft: &Draft) -> BoxFuture<'_, Result<SendOutcome, ProviderError>> {
+        let draft = draft.clone();
+        Box::pin(async move { self.reconcile(&draft) })
     }
 }
 

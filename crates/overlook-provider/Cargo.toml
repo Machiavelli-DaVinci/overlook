@@ -6,6 +6,11 @@ license.workspace = true
 authors.workspace = true
 description = "Mail provider adapters for Overlook: the provider trait, the sample provider, and the Gmail API provider."
 
+[features]
+# Exposes the scripted fake IMAP and SMTP servers (`imap::fake`, `smtp::fake`) so other
+# crates' tests can drive the real providers against them.
+fake-servers = []
+
 [dependencies]
 overlook-core = { workspace = true }
 serde = { workspace = true }

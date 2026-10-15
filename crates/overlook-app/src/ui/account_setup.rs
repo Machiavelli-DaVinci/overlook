@@ -439,7 +439,7 @@ impl MailWindow {
             window.push_notification(Notification::warning(format!("The outgoing password could not be saved: {e}")), cx);
         }
         // A fresh provider drops any connection made with the old settings.
-        self.providers.insert(account.id.clone(), providers::imap_providers(servers, password));
+        self.providers.insert(account.id.clone(), providers::imap_providers(servers, password, out_password.clone()));
         self.provider_issues.remove(&account.id);
         let _ = self.store.set_sync_state(&account.id, &SyncState::Syncing, None);
         self.accounts = self.store.accounts().unwrap_or_default();

@@ -128,6 +128,12 @@ impl OperationKind {
         }
     }
 
+    /// Whether the operation moves messages between folders at the provider, so a message
+    /// vanishing from its folder is expected rather than a deletion made elsewhere.
+    pub fn is_move(&self) -> bool {
+        matches!(self, OperationKind::AddLabel { .. } | OperationKind::RemoveLabel { .. } | OperationKind::Archive { .. } | OperationKind::Trash { .. } | OperationKind::Untrash { .. })
+    }
+
     /// Whether replaying the operation twice is harmless at the provider. Sends are not.
     pub fn is_idempotent(&self) -> bool {
         !matches!(self, OperationKind::SendDraft { .. })

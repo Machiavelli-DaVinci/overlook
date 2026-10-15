@@ -324,9 +324,419 @@ fn server_failures_map_to_provider_errors() {
     // A Gmail history id or anything else that is not our checkpoint asks for a resync.
     assert_eq!(block(p.fetch_changes(&acct, "1234567")).err(), Some(ProviderError::CheckpointExpired));
 
-    // Writes and sends are the next milestone.
-    let op = PendingOperation { id: OperationId::from("op"), account_id: acct.id.clone(), seq: 1, kind: OperationKind::SetRead { message_ids: vec![], read: true }, state: OperationState::Pending, attempts: 0, last_error: None, created_at: 0, updated_at: 0 };
-    assert!(matches!(block(p.apply(&acct, &op, &[], &[])), Err(ProviderError::Rejected(_))));
+    // Calendar and contact operations have nowhere to go.
+    let calendar = op(&acct, OperationKind::CreateEvent { event_id: EventId::from("e") });
+    assert_eq!(block(p.apply(&acct, &calendar, &[], &[])), Err(ProviderError::Rejected("this account has no calendar".into())));
+    let contact = op(&acct, OperationKind::CreateContact { contact_id: "c".into() });
+    assert_eq!(block(p.apply(&acct, &contact, &[], &[])), Err(ProviderError::Rejected("this account cannot store contacts".into())));
+}
+
+// ------------------------------------------------------------------ writes
+
+fn op(acct: &Account, kind: OperationKind) -> PendingOperation {
+    PendingOperation { id: OperationId::from("op"), account_id: acct.id.clone(), seq: 1, kind, state: OperationState::Pending, attempts: 0, last_error: None, created_at: 0, updated_at: 0 }
+}
+
+/// Snapshot, then every message as the store would hold it (bodies downloaded).
+fn synced(server: &FakeServer, p: &ImapProvider) -> (Vec<Label>, Vec<Message>, String) {
+    let acct = account();
+    let snap = block(p.fetch_snapshot(&acct)).unwrap();
+    let messages = block(p.fetch_messages(&acct, &snap.message_ids, &snap.labels)).unwrap();
+    assert_eq!(messages.len(), snap.message_ids.len(), "{:?}", server.lock().log);
+    (snap.labels, messages, snap.checkpoint.unwrap())
+}
+
+fn by_pid<'a>(messages: &'a [Message], folder: &str, uid: u32) -> &'a Message {
+    let uidvalidity = match folder {
+        "INBOX" => 1760400000,
+        "Sent" => 1760400001,
+        "Work/Clients" => 1760400002,
+        _ => panic!("{folder}"),
+    };
+    messages.iter().find(|m| m.provider_id == Some(pid(folder, uidvalidity, uid))).unwrap_or_else(|| panic!("no message {folder}/{uid}"))
+}
+
+fn ids(messages: &[&Message]) -> Vec<MessageId> {
+    messages.iter().map(|m| m.id.clone()).collect()
+}
+
+#[test]
+fn flags_are_stored_per_folder_and_stale_rows_are_skipped() {
+    let server = serve(mailbox());
+    let p = provider(&server);
+    let acct = account();
+    let (labels, messages, _) = synced(&server, &p);
+    let inbox2 = by_pid(&messages, "INBOX", 2);
+    let inbox3 = by_pid(&messages, "INBOX", 3);
+    let work1 = by_pid(&messages, "Work/Clients", 1);
+    let mut stale = work1.clone();
+    stale.provider_id = Some(pid("Work/Clients", 7, 1));
+    let mut local_only = work1.clone();
+    local_only.id = MessageId::from("imap:jason@example.com:local");
+    local_only.provider_id = Some(ProviderId("local\u{1f}<x@y>".into()));
+
+    let read = op(&acct, OperationKind::SetRead { message_ids: ids(&[inbox2, work1, &stale, &local_only]), read: true });
+    let applied = block(p.apply(&acct, &read, &[inbox2.clone(), work1.clone(), stale, local_only], &labels)).unwrap();
+    assert_eq!(applied, AppliedChanges::default());
+    {
+        let s = server.lock();
+        assert!(s.folder("INBOX").messages[&2].has_flag("\\Seen"));
+        assert!(s.folder("Work/Clients").messages[&1].has_flag("\\Seen"));
+        assert_eq!(s.commands("UID STORE"), 2, "one STORE per folder: {:?}", s.log);
+        assert!(s.log.iter().any(|l| l.contains("SELECT \"INBOX\"")), "writes open the folder read-write: {:?}", s.log);
+        assert!(s.log.iter().any(|l| l.contains("UID STORE 2 +FLAGS.SILENT (\\Seen)")), "{:?}", s.log);
+    }
+    let unstar = op(&acct, OperationKind::SetStarred { message_ids: ids(&[inbox3]), starred: false });
+    block(p.apply(&acct, &unstar, &[inbox3.clone()], &labels)).unwrap();
+    assert!(!server.lock().folder("INBOX").messages[&3].has_flag("\\Flagged"));
+    assert!(server.lock().log.iter().any(|l| l.contains("UID STORE 3 -FLAGS.SILENT (\\Flagged)")));
+    assert_eq!(server.lock().connections, 1);
+}
+
+#[test]
+fn archive_creates_the_folder_moves_with_uid_move_and_reports_copyuid() {
+    let server = serve(mailbox());
+    let p = provider(&server);
+    let acct = account();
+    let (labels, messages, cp) = synced(&server, &p);
+    assert!(!labels.iter().any(|l| l.kind == LabelKind::Archive));
+    let (a, b) = (by_pid(&messages, "INBOX", 1), by_pid(&messages, "INBOX", 2));
+    let archive = op(&acct, OperationKind::Archive { message_ids: ids(&[a, b]) });
+    let applied = block(p.apply(&acct, &archive, &[a.clone(), b.clone()], &labels)).unwrap();
+
+    let s = server.lock();
+    assert!(s.has_folder("Archive"), "created on demand: {:?}", s.log);
+    let archived = s.folder("Archive");
+    assert_eq!(archived.messages.len(), 2);
+    assert!(!s.folder("INBOX").messages.contains_key(&1) && !s.folder("INBOX").messages.contains_key(&2));
+    assert!(s.log.iter().any(|l| l.contains("UID MOVE 1:2 \"Archive\"")), "{:?}", s.log);
+    assert_eq!(s.commands("UID COPY"), 0);
+    let uv = archived.uidvalidity;
+    drop(s);
+    let archive_label = LabelId::from("imap:jason@example.com:Archive");
+    assert_eq!(applied.provider_ids, vec![(a.id.clone(), pid("Archive", uv, 1), archive_label.clone()), (b.id.clone(), pid("Archive", uv, 2), archive_label.clone())]);
+    assert_eq!(applied.labels.len(), 1);
+    assert_eq!((applied.labels[0].id.clone(), applied.labels[0].kind, applied.labels[0].name.as_str()), (archive_label, LabelKind::Archive, "Archive"));
+    assert!(p.relist_pending());
+
+    // The next change cycle re-lists at once, drops the moved UIDs from the Inbox and starts
+    // tracking the new folder.
+    let changes = block(p.fetch_changes(&acct, &cp)).unwrap();
+    assert!(!p.relist_pending());
+    let names: Vec<&str> = changes.labels.as_ref().unwrap().iter().map(|l| l.name.as_str()).collect();
+    assert_eq!(names, vec!["Inbox", "Sent", "Archive", "Trash", "Work", "Work / Clients"]);
+    assert_eq!(changes.deleted_provider_ids, vec![pid("INBOX", 1760400000, 1), pid("INBOX", 1760400000, 2)]);
+    assert!(changes.message_ids.contains(&pid("Archive", uv, 1)) && changes.message_ids.contains(&pid("Archive", uv, 2)), "{:?}", changes.message_ids);
+    assert_eq!(Checkpoint::parse(changes.checkpoint.as_deref().unwrap()).unwrap().folders["Archive"].known, "1:2");
+
+    // Archiving again is a no-op at the server and still succeeds.
+    let moved: Vec<Message> = [a, b].iter().map(|m| { let mut c = (*m).clone(); c.provider_id = Some(pid("Archive", uv, if m.id == a.id { 1 } else { 2 })); c }).collect();
+    let labels: Vec<Label> = changes.labels.unwrap();
+    let again = block(p.apply(&acct, &archive, &moved, &labels)).unwrap();
+    assert!(again.provider_ids.is_empty() && again.labels.is_empty());
+}
+
+#[test]
+fn moves_fall_back_to_copy_and_expunge_without_move() {
+    // UIDPLUS without MOVE: COPY answers COPYUID, then \Deleted + UID EXPUNGE.
+    let server = serve(FakeState { capabilities: "IMAP4rev1 UIDPLUS SPECIAL-USE".into(), ..mailbox() });
+    let p = provider(&server);
+    let acct = account();
+    let (labels, messages, _) = synced(&server, &p);
+    let (a, b) = (by_pid(&messages, "INBOX", 4), by_pid(&messages, "INBOX", 5));
+    let trash = op(&acct, OperationKind::Trash { message_ids: ids(&[a, b]) });
+    let applied = block(p.apply(&acct, &trash, &[a.clone(), b.clone()], &labels)).unwrap();
+    let trash_label = LabelId::from("imap:jason@example.com:Trash");
+    assert_eq!(applied.provider_ids, vec![(a.id.clone(), pid("Trash", 1760400003, 1), trash_label.clone()), (b.id.clone(), pid("Trash", 1760400003, 2), trash_label)]);
+    {
+        let s = server.lock();
+        assert_eq!(s.folder("Trash").messages.len(), 2);
+        assert_eq!(s.folder("INBOX").messages.len(), 3);
+        assert!(s.log.iter().any(|l| l.contains("UID COPY 4:5 \"Trash\"")) && s.log.iter().any(|l| l.contains("UID STORE 4:5 +FLAGS.SILENT (\\Deleted)")) && s.log.iter().any(|l| l.contains("UID EXPUNGE 4:5")), "{:?}", s.log);
+        assert_eq!(s.commands("UID SEARCH HEADER"), 0, "COPYUID answered every message");
+    }
+
+    // Neither MOVE nor UIDPLUS: plain EXPUNGE, and the copies are found by Message-ID.
+    let server = serve(FakeState { capabilities: "IMAP4rev1 SPECIAL-USE".into(), ..mailbox() });
+    let p = provider(&server);
+    let (labels, messages, _) = synced(&server, &p);
+    let a = by_pid(&messages, "Work/Clients", 2);
+    let untrash = op(&acct, OperationKind::Untrash { message_ids: ids(&[a]) });
+    let applied = block(p.apply(&acct, &untrash, &[a.clone()], &labels)).unwrap();
+    assert_eq!(applied.provider_ids, vec![(a.id.clone(), pid("INBOX", 1760400000, 6), LabelId::from("imap:jason@example.com:INBOX"))]);
+    let s = server.lock();
+    assert!(s.log.iter().any(|l| l == "a UID COPY 2 \"INBOX\"" || l.contains("UID COPY 2 \"INBOX\"")));
+    assert!(s.log.iter().any(|l| l.ends_with(" EXPUNGE")), "{:?}", s.log);
+    assert!(s.log.iter().any(|l| l.contains("UID SEARCH HEADER Message-ID \"<work-2@example.com>\"")), "{:?}", s.log);
+    assert_eq!(s.folder("INBOX").messages[&6].header("Message-ID").as_deref(), Some("<work-2@example.com>"));
+}
+
+#[test]
+fn trash_without_a_trash_folder_follows_the_policy() {
+    let mut state = mailbox();
+    state.folders.retain(|f| f.path != "Trash");
+    let server = serve(state);
+    let mut servers = provider(&server).servers().clone();
+    servers.imap = Some(ImapPolicy { expunge_on_trash: true, ..Default::default() });
+    let p = ImapProvider::new(servers, "hunter2").with_timeout(Duration::from_secs(5));
+    let acct = account();
+    let (labels, messages, _) = synced(&server, &p);
+    let a = by_pid(&messages, "INBOX", 5);
+    let applied = block(p.apply(&acct, &op(&acct, OperationKind::Trash { message_ids: ids(&[a]) }), &[a.clone()], &labels)).unwrap();
+    assert_eq!(applied, AppliedChanges::default(), "an expunged message has no new identity");
+    {
+        let s = server.lock();
+        assert!(!s.folder("INBOX").messages.contains_key(&5));
+        assert!(!s.has_folder("Trash"));
+        assert!(s.log.iter().any(|l| l.contains("UID STORE 5 +FLAGS.SILENT (\\Deleted)")) && s.log.iter().any(|l| l.contains("UID EXPUNGE 5")), "{:?}", s.log);
+    }
+
+    // Without the expunge policy the Trash folder is created on demand (the policy's
+    // override name wins when set).
+    let mut state = mailbox();
+    state.folders.retain(|f| f.path != "Trash");
+    let server = serve(state);
+    let mut servers = provider(&server).servers().clone();
+    servers.imap = Some(ImapPolicy { trash_folder: Some("Deleted Items".into()), ..Default::default() });
+    let p = ImapProvider::new(servers, "hunter2").with_timeout(Duration::from_secs(5));
+    let (labels, messages, _) = synced(&server, &p);
+    let a = by_pid(&messages, "INBOX", 5);
+    let applied = block(p.apply(&acct, &op(&acct, OperationKind::Trash { message_ids: ids(&[a]) }), &[a.clone()], &labels)).unwrap();
+    let s = server.lock();
+    assert!(s.has_folder("Deleted Items"), "{:?}", s.log);
+    assert_eq!(applied.labels.iter().map(|l| (l.kind, l.name.as_str())).collect::<Vec<_>>(), vec![(LabelKind::Trash, "Trash")]);
+    assert_eq!(applied.provider_ids[0].2, LabelId::from("imap:jason@example.com:Deleted Items"));
+    assert!(s.log.iter().any(|l| l.contains("CREATE \"Deleted Items\"")), "{:?}", s.log);
+}
+
+#[test]
+fn labels_are_folders_to_move_between() {
+    let server = serve(mailbox());
+    let p = provider(&server);
+    let acct = account();
+    let (labels, messages, _) = synced(&server, &p);
+    let work = labels.iter().find(|l| l.name == "Work / Clients").unwrap();
+    let a = by_pid(&messages, "INBOX", 3);
+    let add = op(&acct, OperationKind::AddLabel { message_ids: ids(&[a]), label_id: work.id.clone() });
+    let applied = block(p.apply(&acct, &add, &[a.clone()], &labels)).unwrap();
+    assert_eq!(applied.provider_ids, vec![(a.id.clone(), pid("Work/Clients", 1760400002, 3), work.id.clone())]);
+    assert!(server.lock().log.iter().any(|l| l.contains("UID MOVE 3 \"Work/Clients\"")));
+
+    // Removing the folder label puts the message back in the Inbox; removing a label the
+    // message does not carry does nothing.
+    let mut moved = a.clone();
+    moved.provider_id = Some(pid("Work/Clients", 1760400002, 3));
+    let remove = op(&acct, OperationKind::RemoveLabel { message_ids: ids(&[&moved]), label_id: work.id.clone() });
+    let applied = block(p.apply(&acct, &remove, &[moved.clone()], &labels)).unwrap();
+    assert_eq!(applied.provider_ids, vec![(a.id.clone(), pid("INBOX", 1760400000, 6), LabelId::from("imap:jason@example.com:INBOX"))]);
+    let b = by_pid(&messages, "INBOX", 4);
+    let remove_other = op(&acct, OperationKind::RemoveLabel { message_ids: ids(&[b]), label_id: work.id.clone() });
+    assert_eq!(block(p.apply(&acct, &remove_other, &[b.clone()], &labels)).unwrap(), AppliedChanges::default());
+
+    // A label without a server folder cannot be applied.
+    let local = Label { id: LabelId::from("imap:jason@example.com:nowhere"), account_id: acct.id.clone(), kind: LabelKind::User, name: "Nowhere".into(), provider_id: None, color: None, sort_order: 9 };
+    let mut with_local = labels.clone();
+    with_local.push(local.clone());
+    let add = op(&acct, OperationKind::AddLabel { message_ids: ids(&[b]), label_id: local.id.clone() });
+    assert!(matches!(block(p.apply(&acct, &add, &[b.clone()], &with_local)), Err(ProviderError::Rejected(_))));
+}
+
+#[test]
+fn write_failures_map_to_provider_errors() {
+    let server = serve(mailbox());
+    let p = provider(&server);
+    let acct = account();
+    let (labels, messages, _) = synced(&server, &p);
+    let a = by_pid(&messages, "INBOX", 1);
+    let work = labels.iter().find(|l| l.name == "Work / Clients").unwrap();
+
+    // The target folder vanished (and is not one we create on demand): Rejected.
+    server.lock().folders.retain(|f| f.path != "Work/Clients");
+    let add = op(&acct, OperationKind::AddLabel { message_ids: ids(&[a]), label_id: work.id.clone() });
+    assert_eq!(block(p.apply(&acct, &add, &[a.clone()], &labels)), Err(ProviderError::Rejected("that folder no longer exists".into())));
+    assert!(!server.lock().has_folder("Work/Clients"), "not created");
+
+    // The source folder vanished: nothing to do, the next cycle removes the rows.
+    let w = by_pid(&messages, "Work/Clients", 1);
+    let star = op(&acct, OperationKind::SetStarred { message_ids: ids(&[w]), starred: true });
+    assert_eq!(block(p.apply(&acct, &star, &[w.clone()], &labels)), Ok(AppliedChanges::default()));
+    let archive = op(&acct, OperationKind::Archive { message_ids: ids(&[w]) });
+    assert_eq!(block(p.apply(&acct, &archive, &[w.clone()], &labels)), Ok(AppliedChanges::default()));
+
+    // Server-side trouble is temporary; a dropped connection is Offline (after one retry).
+    let archive = op(&acct, OperationKind::Archive { message_ids: ids(&[a]) });
+    server.lock().in_use.insert("INBOX".into());
+    assert_eq!(block(p.apply(&acct, &archive, &[a.clone()], &labels)), Err(ProviderError::Temporary("Mailbox is in use by another process".into())));
+    server.lock().in_use.clear();
+    server.lock().fail_next = Some(("UID MOVE".into(), "NO [UNAVAILABLE] Mailbox is being rebuilt".into()));
+    assert_eq!(block(p.apply(&acct, &archive, &[a.clone()], &labels)), Err(ProviderError::Temporary("Mailbox is being rebuilt".into())));
+    server.lock().fail_next = Some(("UID MOVE".into(), "NO [LIMIT] Too many moves".into()));
+    assert!(matches!(block(p.apply(&acct, &archive, &[a.clone()], &labels)), Err(ProviderError::Temporary(_))));
+    {
+        let mut s = server.lock();
+        s.drop_next_command = true;
+        s.login = Login::Bye;
+    }
+    assert_eq!(block(p.apply(&acct, &archive, &[a.clone()], &labels)), Err(ProviderError::Offline));
+    server.lock().login = Login::AuthFailed;
+    assert_eq!(block(p.apply(&acct, &archive, &[a.clone()], &labels)), Err(ProviderError::SignInRequired));
+    assert!(server.lock().folder("INBOX").messages.contains_key(&1), "nothing moved");
+}
+
+#[test]
+fn an_interrupted_move_is_completed_on_the_retry() {
+    let server = serve(mailbox());
+    let p = provider(&server);
+    let acct = account();
+    let (labels, messages, _) = synced(&server, &p);
+    let (a, b) = (by_pid(&messages, "INBOX", 1), by_pid(&messages, "INBOX", 2));
+    // The server performs the MOVE and the connection dies before the reply.
+    server.lock().drop_after_next = Some("UID MOVE".into());
+    let trash = op(&acct, OperationKind::Trash { message_ids: ids(&[a, b]) });
+    let applied = block(p.apply(&acct, &trash, &[a.clone(), b.clone()], &labels)).unwrap();
+    let trash_label = LabelId::from("imap:jason@example.com:Trash");
+    assert_eq!(applied.provider_ids, vec![(a.id.clone(), pid("Trash", 1760400003, 1), trash_label.clone()), (b.id.clone(), pid("Trash", 1760400003, 2), trash_label)], "found again by Message-ID");
+    let s = server.lock();
+    assert_eq!(s.connections, 2, "reconnected once");
+    assert_eq!(s.commands("UID MOVE"), 2);
+    assert_eq!(s.folder("Trash").messages.len(), 2, "no duplicates");
+    assert_eq!(s.commands("UID SEARCH HEADER"), 2);
+}
+
+// ----------------------------------------------------------------- sending
+
+fn draft(acct: &Account, subject: &str) -> Draft {
+    let mut d = Draft::new(acct.id.clone(), DraftKind::New, 0);
+    d.to = vec![Address::named("Maya Chen", "maya@northstar.example")];
+    d.cc = vec![Address::named("Alex", "alex@studio.example")];
+    d.subject = subject.into();
+    d.body_text = "A few things to cover.".into();
+    d
+}
+
+fn sending_provider(server: &FakeServer, smtp: &crate::smtp::fake::FakeSmtp) -> ImapProvider {
+    let mut servers = provider(server).servers().clone();
+    servers.outgoing = ServerEndpoint::new("127.0.0.1", smtp.addr.port(), Security::None, "jason@example.com");
+    ImapProvider::new(servers, "hunter2").with_timeout(Duration::from_secs(5)).with_outgoing_password(Some("smtp-secret".into()))
+}
+
+#[test]
+fn send_submits_over_smtp_appends_to_sent_and_reconciles() {
+    use crate::smtp::fake::{serve_many, Behaviour};
+    let smtp = serve_many(Behaviour::Normal);
+    let server = serve(mailbox());
+    let p = sending_provider(&server, &smtp);
+    let acct = account();
+    let (labels, _, cp) = synced(&server, &p);
+    let sent_label = labels.iter().find(|l| l.kind == LabelKind::Sent).unwrap().id.clone();
+    let d = draft(&acct, "Agenda");
+    let context = SendContext { sent_label: Some(sent_label.clone()), in_reply_to: None, labels: labels.clone() };
+    let receipt = block(p.send(&acct, &d, context)).unwrap();
+
+    let rfc_id = crate::draft_message_id(&d);
+    assert_eq!(receipt.rfc_message_id.as_deref(), Some(rfc_id.as_str()));
+    assert_eq!(receipt.provider_id, pid("Sent", 1760400001, 2), "APPENDUID names the Sent copy");
+    let m = &receipt.message;
+    assert!(m.id.as_str().starts_with("imap:jason@example.com:"));
+    assert!(m.is_outgoing && m.is_read);
+    assert_eq!(m.label_ids.iter().collect::<Vec<_>>(), vec![&sent_label]);
+    assert_eq!(m.subject, "Agenda");
+    {
+        let seen = smtp.seen.lock().unwrap();
+        assert_eq!(seen.len(), 1);
+        assert_eq!(seen[0].auth, Some(("jason@example.com".into(), "smtp-secret".into())), "the outgoing password is used");
+        assert_eq!(seen[0].rcpt, vec!["RCPT TO:<maya@northstar.example>", "RCPT TO:<alex@studio.example>"]);
+        let data = seen[0].data.clone().unwrap();
+        assert!(String::from_utf8_lossy(&data).contains(&format!("Message-ID: {rfc_id}")));
+        let s = server.lock();
+        let copy = &s.folder("Sent").messages[&2];
+        assert!(copy.has_flag("\\Seen"));
+        assert_eq!(copy.header("Message-ID").as_deref(), Some(rfc_id.as_str()));
+        assert!(data.starts_with(&copy.raw), "the same bytes went to SMTP and to Sent");
+    }
+    assert_eq!(block(p.reconcile_send(&acct, &d)).unwrap(), SendOutcome::Delivered(pid("Sent", 1760400001, 2)));
+
+    // The next cycle sees the Sent copy as a header-only row with the receipt's provider id,
+    // which the sync engine adopts for the stored message.
+    let changes = block(p.fetch_changes(&acct, &cp)).unwrap();
+    assert_eq!(changes.upserts.iter().map(|m| m.provider_id.clone()).collect::<Vec<_>>(), vec![Some(pid("Sent", 1760400001, 2))]);
+    assert_eq!(changes.upserts[0].rfc_message_id.as_deref(), Some(rfc_id.as_str()));
+}
+
+#[test]
+fn a_dropped_send_is_uncertain_until_the_sent_folder_or_the_user_decides() {
+    use crate::smtp::fake::{serve_many, Behaviour};
+    let smtp = serve_many(Behaviour::DropAfterData);
+    let server = serve(mailbox());
+    let p = sending_provider(&server, &smtp);
+    let acct = account();
+    let (labels, _, _) = synced(&server, &p);
+    let d = draft(&acct, "Dropped");
+    let context = || SendContext { sent_label: None, in_reply_to: None, labels: labels.clone() };
+    assert_eq!(block(p.send(&acct, &d, context())).err(), Some(ProviderError::Uncertain));
+    assert_eq!(server.lock().folder("Sent").messages.len(), 1, "no Sent copy was appended");
+    assert_eq!(block(p.reconcile_send(&acct, &d)).unwrap(), SendOutcome::Unknown, "the bytes left this machine; not finding a copy proves nothing");
+
+    // A failure before DATA is a plain Offline; a reconcile after it says not delivered.
+    smtp.set(Behaviour::DropDuringGreeting);
+    assert_eq!(block(p.send(&acct, &d, context())).err(), Some(ProviderError::Offline));
+    assert_eq!(block(p.reconcile_send(&acct, &d)).unwrap(), SendOutcome::NotDelivered);
+
+    // Another process (no phase on record) stays Unknown; a copy in Sent is Delivered.
+    let fresh = sending_provider(&server, &smtp);
+    assert_eq!(block(fresh.reconcile_send(&acct, &d)).unwrap(), SendOutcome::Unknown);
+    smtp.set(Behaviour::Normal);
+    let receipt = block(fresh.send(&acct, &d, context())).unwrap();
+    assert_eq!(block(p.reconcile_send(&acct, &d)).unwrap(), SendOutcome::Delivered(receipt.provider_id.clone()));
+    assert_eq!(receipt.message.label_ids.iter().map(|l| l.as_str()).collect::<Vec<_>>(), vec!["imap:jason@example.com:Sent"], "the Sent label comes from the folder list when the context has none");
+
+    // Rejections and sign-in problems come from the SMTP transport unchanged.
+    smtp.set(Behaviour::RejectRecipient);
+    assert!(matches!(block(p.send(&acct, &draft(&acct, "Bad"), context())), Err(ProviderError::Rejected(_))));
+    smtp.set(Behaviour::RejectAuth);
+    assert_eq!(block(p.send(&acct, &draft(&acct, "Auth"), context())).err(), Some(ProviderError::SignInRequired));
+}
+
+#[test]
+fn a_failed_sent_copy_still_counts_as_sent() {
+    use crate::smtp::fake::{serve_many, Behaviour};
+    let smtp = serve_many(Behaviour::Normal);
+    let server = serve(mailbox());
+    let p = sending_provider(&server, &smtp);
+    let acct = account();
+    let (labels, _, _) = synced(&server, &p);
+    let context = || SendContext { sent_label: None, in_reply_to: None, labels: labels.clone() };
+
+    // The server refuses the APPEND: the message left, the copy is local.
+    server.lock().fail_next = Some(("APPEND".into(), "NO [OVERQUOTA] Quota exceeded".into()));
+    let d = draft(&acct, "Over quota");
+    let receipt = block(p.send(&acct, &d, context())).unwrap();
+    assert!(is_local_placeholder(&receipt.provider_id), "{:?}", receipt.provider_id);
+    assert!(MessageRef::parse(&receipt.provider_id).is_none(), "never mistaken for a server message");
+    assert_eq!(receipt.message.label_ids.iter().map(|l| l.as_str()).collect::<Vec<_>>(), vec!["imap:jason@example.com:Sent"]);
+    assert_eq!(smtp.seen.lock().unwrap().len(), 1);
+
+    // The APPEND reply is lost: the retry finds the copy instead of appending twice.
+    server.lock().drop_after_next = Some("APPEND".into());
+    let d = draft(&acct, "Lost reply");
+    let receipt = block(p.send(&acct, &d, context())).unwrap();
+    assert_eq!(receipt.provider_id, pid("Sent", 1760400001, 2));
+    let s = server.lock();
+    assert_eq!(s.folder("Sent").messages.len(), 2, "one copy");
+    assert_eq!(s.commands("APPEND"), 2);
+    assert_eq!(smtp.seen.lock().unwrap().len(), 2, "SMTP is never retried on its own");
+
+    // No Sent folder at all: local copy with the context's label.
+    drop(s);
+    let mut state = mailbox();
+    state.folders.retain(|f| f.path != "Sent");
+    let server = serve(state);
+    let p = sending_provider(&server, &smtp);
+    let (labels, _, _) = synced(&server, &p);
+    let receipt = block(p.send(&acct, &draft(&acct, "No folder"), SendContext { sent_label: Some(LabelId::from("imap:jason@example.com:sent-local")), in_reply_to: None, labels })).unwrap();
+    assert!(is_local_placeholder(&receipt.provider_id));
+    assert_eq!(receipt.message.label_ids.iter().map(|l| l.as_str()).collect::<Vec<_>>(), vec!["imap:jason@example.com:sent-local"]);
+    assert_eq!(block(p.reconcile_send(&acct, &draft(&acct, "x"))).unwrap(), SendOutcome::Unknown, "nothing to search");
 }
 
 #[test]

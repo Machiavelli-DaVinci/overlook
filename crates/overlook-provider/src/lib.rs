@@ -91,6 +91,9 @@ pub struct AppliedChanges {
     /// move gives a message a new UID in another folder; the store rewrites its identity so
     /// the next sync recognises it.
     pub provider_ids: Vec<(MessageId, ProviderId, LabelId)>,
+    /// Labels the operation created at the provider (an IMAP Archive folder made on demand).
+    /// The sync engine stores them before `provider_ids`, which may reference them.
+    pub labels: Vec<Label>,
 }
 
 /// Everything a provider needs to submit a draft besides the draft itself.
@@ -119,6 +122,9 @@ pub enum SendOutcome {
     Delivered(ProviderId),
     /// The provider never received it; safe to resend.
     NotDelivered,
+    /// The provider cannot tell (SMTP accepted the bytes but no copy can be found). The
+    /// operation stays uncertain and the user decides between sending again and discarding.
+    Unknown,
 }
 
 pub trait MailProvider: Send + Sync {

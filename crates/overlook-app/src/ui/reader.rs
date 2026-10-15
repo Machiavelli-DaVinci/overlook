@@ -964,6 +964,8 @@ impl MailWindow {
         let state = overlook_core::status::draft_state_label(&d.state);
         let id = d.id.clone();
         let cancellable = matches!(d.state, DraftState::Queued | DraftState::Failed(_));
+        let undecided = matches!(d.state, DraftState::Uncertain | DraftState::Failed(_));
+        let (resend_id, discard_id) = (d.id.clone(), d.id.clone());
         v_flex()
             .size_full()
             .px(px(28.))
@@ -990,6 +992,20 @@ impl MailWindow {
                     .child(icon("clock").size(px(15.)).text_color(p.accent))
                     .child(state)
                     .child(div().flex_1())
+                    .when(undecided, |row| {
+                        row.child(
+                            Button::new("outbox-resend")
+                                .small()
+                                .label("Send again")
+                                .on_click(cx.listener(move |this, _, window, cx| this.resend_draft(resend_id.clone(), window, cx))),
+                        )
+                        .child(
+                            Button::new("outbox-discard")
+                                .small()
+                                .label("Discard")
+                                .on_click(cx.listener(move |this, _, window, cx| this.discard_send(discard_id.clone(), window, cx))),
+                        )
+                    })
                     .when(cancellable, |row| {
                         row.child(
                             Button::new("outbox-edit")

@@ -45,10 +45,11 @@ pub fn gmail_providers(account: &Account, tokens: OAuthTokens) -> Result<Account
     })
 }
 
-/// An IMAP account: one connection for mail, no calendar.
-pub fn imap_providers(servers: MailServers, password: String) -> AccountProviders {
+/// An IMAP account: one connection for mail, SMTP for sending, no calendar. The outgoing
+/// password is the incoming one unless a separate one was stored at setup.
+pub fn imap_providers(servers: MailServers, password: String, outgoing_password: Option<String>) -> AccountProviders {
     let inbox_limit = crate::store_prefs_inbox_limit();
-    AccountProviders { mail: Arc::new(ImapProvider::new(servers, password).with_inbox_limit(inbox_limit)), calendar: None }
+    AccountProviders { mail: Arc::new(ImapProvider::new(servers, password).with_outgoing_password(outgoing_password).with_inbox_limit(inbox_limit)), calendar: None }
 }
 
 /// Builds the providers for `account`, reading stored tokens or passwords where needed.
@@ -67,7 +68,16 @@ pub fn providers_for(account: &Account, sample: &SampleProvider, store: &Store) 
                 Err(e) => return Err(ProviderIssue::SignInRequired(e.to_string())),
             };
             match credentials::load_password(&account.id, credentials::KIND_PASSWORD_INCOMING) {
-                Ok(Some(password)) => Ok(imap_providers(servers, password)),
+                Ok(Some(password)) => {
+                    let outgoing = match credentials::load_password(&account.id, credentials::KIND_PASSWORD_OUTGOING) {
+                        Ok(found) => found,
+                        Err(e) => {
+                            warn!("could not read the outgoing password for {}: {e}; using the incoming one", account.email);
+                            None
+                        }
+                    };
+                    Ok(imap_providers(servers, password, outgoing))
+                }
                 Ok(None) => Err(ProviderIssue::SignInRequired(PASSWORD_NEEDED_WORDING.into())),
                 Err(e) => Err(ProviderIssue::SignInRequired(e.to_string())),
             }

@@ -28,6 +28,9 @@ pub struct SyncOutcome {
     pub stopped_offline: bool,
 }
 
+/// Recorded on a send operation the provider could neither confirm nor rule out.
+pub const UNCERTAIN_SEND_WORDING: &str = "The server accepted the message but no copy was found. Send it again or discard it.";
+
 pub const CALENDAR_SIGNIN_WORDING: &str = "Sign in again to connect your calendar. Mail keeps working meanwhile.";
 
 pub fn calendar_status_key(account: &AccountId) -> String {
@@ -215,6 +218,12 @@ fn reconcile_incoming(store: &Store, account: &AccountId, messages: &mut [Messag
                     deleted.retain(|d| d != &moved.id);
                     rename_message(m, moved.id.clone());
                     existing = Some(moved.clone());
+                } else if let Some(local) = store.messages_by_rfc_id(account, rfc).ok().into_iter().flatten().find(|l| l.provider_id.as_ref().is_some_and(overlook_provider::imap::is_local_placeholder)) {
+                    // A Sent copy kept locally because its APPEND failed: the server copy
+                    // that turned up is the same message.
+                    info!("server copy of {} found; replacing the local Sent copy {}", rfc, local.id);
+                    rename_message(m, local.id.clone());
+                    existing = Some(local);
                 }
             }
         }
@@ -304,9 +313,20 @@ fn mirror_imap_folders(store: &Store, provider: &dyn MailProvider, account: &Acc
 }
 
 /// Downloads remote state. Returns the number of messages written.
-fn download(store: &Store, provider: &dyn MailProvider, account: &Account, outcome: &mut SyncOutcome) -> Result<usize, ProviderError> {
+/// Messages a queued move still has to send to the provider. Their vanishing from a folder
+/// is the move's own doing (or an earlier attempt's, interrupted before the store heard),
+/// so the download must not delete them: the replay re-identifies them.
+fn pending_moves(store: &Store, account: &AccountId) -> std::collections::BTreeSet<MessageId> {
+    store.pending_operations(account).unwrap_or_default().iter().filter(|op| op.kind.is_move()).flat_map(|op| op.kind.message_ids().iter().cloned()).collect()
+}
+
+/// `deferred` collects messages whose remote deletion was held back for a pending move,
+/// with the provider id that vanished; `run_sync` deletes them after the replay when the
+/// move could not find them either.
+fn download(store: &Store, provider: &dyn MailProvider, account: &Account, outcome: &mut SyncOutcome, deferred: &mut Vec<(MessageId, ProviderId)>) -> Result<usize, ProviderError> {
     let acct = &account.id;
     let protected = store.pending_message_ids(acct).unwrap_or_default();
+    let moving = pending_moves(store, acct);
     let checkpoint = store.checkpoint(acct).ok().flatten();
     let have_messages = store.message_count(acct).unwrap_or(0) > 0 || !backlog(store, acct).is_empty();
 
@@ -352,7 +372,9 @@ fn download(store: &Store, provider: &dyn MailProvider, account: &Account, outco
                 // Providers that mint local ids on first sight report deletions by provider id.
                 for pid in std::mem::take(&mut changes.deleted_provider_ids) {
                     if let Ok(Some(id)) = store.message_id_for_provider_id(acct, &pid) {
-                        if !changes.deleted.contains(&id) {
+                        if moving.contains(&id) {
+                            deferred.push((id, pid));
+                        } else if !changes.deleted.contains(&id) {
                             changes.deleted.push(id);
                         }
                     }
@@ -421,7 +443,8 @@ pub async fn run_sync(store: Arc<Store>, provider: Arc<dyn MailProvider>, calend
     }
     let _ = store.set_sync_state(&acct, &SyncState::Syncing, None);
 
-    if let Err(err) = download(&store, provider.as_ref(), &account, &mut outcome) {
+    let mut deferred: Vec<(MessageId, ProviderId)> = Vec::new();
+    if let Err(err) = download(&store, provider.as_ref(), &account, &mut outcome, &mut deferred) {
         warn!("download paused for {}: {err}", account.email);
         outcome.rate_limited = matches!(err, ProviderError::RateLimited(_));
         let state = state_for(&err);
@@ -480,6 +503,13 @@ pub async fn run_sync(store: Arc<Store>, provider: Arc<dyn MailProvider>, calend
                             })
                         }
                         Ok(SendOutcome::NotDelivered) => provider.send(&account, &draft, context).await,
+                        Ok(SendOutcome::Unknown) => {
+                            // The provider cannot tell; the Outbox offers "Send again" and
+                            // "Discard". Later operations are not held up.
+                            let _ = store.set_operation_state(&op.id, OperationState::Uncertain, Some(UNCERTAIN_SEND_WORDING));
+                            let _ = store.set_draft_state(&draft.id, &DraftState::Uncertain);
+                            continue;
+                        }
                         Err(e) => Err(e),
                     }
                 } else {
@@ -607,6 +637,11 @@ pub async fn run_sync(store: Arc<Store>, provider: Arc<dyn MailProvider>, calend
                 let messages: Vec<Message> = kind.message_ids().iter().filter_map(|id| store.message(id).ok().flatten()).collect();
                 match provider.apply(&account, &op, &messages, &labels).await {
                     Ok(applied) => {
+                        for label in &applied.labels {
+                            if let Err(e) = store.upsert_label(label) {
+                                warn!("could not record label {}: {e}", label.name);
+                            }
+                        }
                         if let Err(e) = store.apply_provider_id_changes(&applied.provider_ids) {
                             warn!("could not record provider id changes: {e}");
                         }
@@ -629,6 +664,14 @@ pub async fn run_sync(store: Arc<Store>, provider: Arc<dyn MailProvider>, calend
                 }
             }
         }
+    }
+
+    // Held-back deletions: a move that found its message gave it a new provider id; one
+    // that did not means the message really is gone.
+    let gone: Vec<MessageId> = deferred.into_iter().filter(|(id, pid)| store.message(id).ok().flatten().is_some_and(|m| m.provider_id.as_ref() == Some(pid))).map(|(id, _)| id).collect();
+    if !gone.is_empty() {
+        info!("{} messages with a pending move are gone from the server", gone.len());
+        let _ = store.delete_messages(&gone);
     }
 
     let success_at = if final_state == SyncState::UpToDate { Some(now()) } else { None };
@@ -1050,12 +1093,494 @@ mod tests {
         block_on(run_sync(store.clone(), provider.clone(), None, account.clone()));
         let m = by_rfc(&store, "<z@x>");
         store.apply_change(&account.id, overlook_store::LocalChange::Archive { message_ids: vec![m.id.clone()] }).unwrap();
-        *provider.applied.lock().unwrap() = AppliedChanges { provider_ids: vec![(m.id.clone(), ProviderId("Archive\u{1f}1\u{1f}3".into()), LabelId::from("imap:j:Archive"))] };
+        *provider.applied.lock().unwrap() = AppliedChanges { provider_ids: vec![(m.id.clone(), ProviderId("Archive\u{1f}1\u{1f}3".into()), LabelId::from("imap:j:Archive"))], labels: Vec::new() };
         let outcome = block_on(run_sync(store.clone(), provider.clone(), None, account.clone()));
         assert_eq!(outcome.applied, 1);
         let moved = store.message(&m.id).unwrap().unwrap();
         assert_eq!(moved.provider_id.as_ref().unwrap().as_str(), "Archive\u{1f}1\u{1f}3");
         assert_eq!(moved.label_ids.iter().map(|l| l.as_str()).collect::<BTreeSet<_>>(), ["imap:j:Archive"].into_iter().collect());
         assert_eq!(store.pending_count(&account.id).unwrap(), 0);
+    }
+
+    // ------------------------------------------ the real IMAP provider, fake servers
+
+    use overlook_provider::imap::fake::{serve, FakeFolder, FakeMessage, FakeServer, FakeState};
+    use overlook_provider::imap::{is_local_placeholder, ImapProvider, MessageRef};
+    use overlook_provider::smtp::fake::{serve_many, Behaviour, FakeSmtp};
+
+    struct ImapEnv {
+        dir: std::path::PathBuf,
+        path: std::path::PathBuf,
+        imap: FakeServer,
+        smtp: FakeSmtp,
+        servers: MailServers,
+        account: Account,
+    }
+
+    impl Drop for ImapEnv {
+        fn drop(&mut self) {
+            let _ = std::fs::remove_dir_all(&self.dir);
+        }
+    }
+
+    fn raw(from: &str, subject: &str, rfc: &str, date: &str) -> Vec<u8> {
+        format!("From: {from}\r\nTo: jason@example.com\r\nSubject: {subject}\r\nMessage-ID: {rfc}\r\nDate: {date}\r\n\r\nBody of {subject}.\r\n").into_bytes()
+    }
+
+    fn imap_env(name: &str) -> ImapEnv {
+        let mut state = FakeState::default();
+        let mut inbox = FakeFolder::new("INBOX", &["\\HasNoChildren"], 100);
+        inbox.add(FakeMessage::new(&[], "10-Oct-2026 09:00:00 +0000", raw("ada@example.com", "First", "<first@example.com>", "Sat, 10 Oct 2026 09:00:00 +0000")));
+        inbox.add(FakeMessage::new(&["\\Seen"], "11-Oct-2026 09:00:00 +0000", raw("bob@example.com", "Second", "<second@example.com>", "Sun, 11 Oct 2026 09:00:00 +0000")));
+        inbox.add(FakeMessage::new(&[], "12-Oct-2026 09:00:00 +0000", raw("cat@example.com", "Third", "<third@example.com>", "Mon, 12 Oct 2026 09:00:00 +0000")));
+        state.folders = vec![inbox, FakeFolder::new("Sent", &["\\Sent"], 200), FakeFolder::new("Trash", &["\\Trash"], 300)];
+        state.subscribed = ["INBOX", "Sent", "Trash"].into_iter().map(str::to_owned).collect();
+        let imap = serve(state);
+        let smtp = serve_many(Behaviour::Normal);
+        let servers = MailServers {
+            incoming: ServerEndpoint::new("127.0.0.1", imap.addr.port(), Security::None, "jason@example.com"),
+            outgoing: ServerEndpoint::new("127.0.0.1", smtp.addr.port(), Security::None, "jason@example.com"),
+            pop3: None,
+            imap: None,
+        };
+        let account = Account { id: AccountId::from("imap:jason@example.com"), provider: ProviderKind::Imap, display_name: "Jason".into(), email: "jason@example.com".into(), created_at: 0 };
+        let dir = std::env::temp_dir().join(format!("overlook-{name}-{}", std::process::id()));
+        let _ = std::fs::remove_dir_all(&dir);
+        std::fs::create_dir_all(&dir).unwrap();
+        let path = dir.join("overlook.sqlite");
+        ImapEnv { dir, path, imap, smtp, servers, account }
+    }
+
+    fn imap_provider(env: &ImapEnv) -> Arc<ImapProvider> {
+        Arc::new(ImapProvider::new(env.servers.clone(), "hunter2").with_timeout(Duration::from_secs(5)).with_inbox_limit(20))
+    }
+
+    /// A provider whose server cannot be reached: the account is offline.
+    fn offline_provider(env: &ImapEnv) -> Arc<ImapProvider> {
+        let dead = std::net::TcpListener::bind("127.0.0.1:0").unwrap().local_addr().unwrap();
+        let mut servers = env.servers.clone();
+        servers.incoming = ServerEndpoint::new("127.0.0.1", dead.port(), Security::None, "jason@example.com");
+        Arc::new(ImapProvider::new(servers, "hunter2").with_timeout(Duration::from_secs(2)))
+    }
+
+    fn open_store(env: &ImapEnv) -> Arc<Store> {
+        let store = Arc::new(Store::open(&env.path).unwrap());
+        store.upsert_account(&env.account).unwrap();
+        store
+    }
+
+    fn imap_message(store: &Store, env: &ImapEnv, subject: &str) -> Message {
+        store.messages_for_account(&env.account.id).unwrap().into_iter().find(|m| m.subject == subject).unwrap_or_else(|| panic!("no message {subject}"))
+    }
+
+    fn label_of(m: &Message) -> String {
+        m.label_ids.iter().map(|l| l.as_str().rsplit(':').next().unwrap().to_owned()).collect::<Vec<_>>().join(",")
+    }
+
+    fn log_index(env: &ImapEnv, needle: &str) -> usize {
+        let s = env.imap.lock();
+        s.log.iter().position(|l| l.contains(needle)).unwrap_or_else(|| panic!("no {needle:?} in {:?}", s.log))
+    }
+
+    #[test]
+    fn imap_offline_queue_survives_a_restart_and_replays_in_order() {
+        let env = imap_env("replay");
+        let live = imap_provider(&env);
+        let store = open_store(&env);
+        let outcome = block_on(run_sync(store.clone(), live.clone(), None, env.account.clone()));
+        assert_eq!(outcome.state, Some(SyncState::UpToDate), "{outcome:?}");
+        assert!(backlog(&store, &env.account.id).is_empty());
+        assert_eq!(store.message_count(&env.account.id).unwrap(), 3);
+
+        // Offline: star and archive one message, trash another, write a reply. Everything
+        // stays queued.
+        let first = imap_message(&store, &env, "First");
+        let second = imap_message(&store, &env, "Second");
+        store.apply_change(&env.account.id, overlook_store::LocalChange::SetStarred { message_ids: vec![first.id.clone()], starred: true }).unwrap();
+        store.apply_change(&env.account.id, overlook_store::LocalChange::Archive { message_ids: vec![first.id.clone()] }).unwrap();
+        store.apply_change(&env.account.id, overlook_store::LocalChange::Trash { message_ids: vec![second.id.clone()] }).unwrap();
+        let mut draft = Draft::new(env.account.id.clone(), DraftKind::Reply, now());
+        draft.to = vec![Address::named("Ada", "ada@example.com")];
+        draft.subject = "Re: First".into();
+        draft.body_text = "Replying while offline.".into();
+        draft.in_reply_to = Some(first.id.clone());
+        draft.conversation_id = Some(first.conversation_id.clone());
+        store.save_draft(&draft).unwrap();
+        store.queue_send(&draft).unwrap();
+        let outcome = block_on(run_sync(store.clone(), offline_provider(&env), None, env.account.clone()));
+        assert_eq!(outcome.state, Some(SyncState::Offline));
+        assert_eq!(store.pending_count(&env.account.id).unwrap(), 4);
+        assert!(env.imap.lock().commands("UID STORE") == 0 && env.smtp.seen.lock().unwrap().is_empty(), "nothing reached the servers");
+        drop(store);
+
+        // Restart while offline: the queue is read back from disk, then the server is back.
+        let store = open_store(&env);
+        assert_eq!(store.pending_count(&env.account.id).unwrap(), 4);
+        let outcome = block_on(run_sync(store.clone(), live.clone(), None, env.account.clone()));
+        assert_eq!(outcome.state, Some(SyncState::UpToDate), "{outcome:?}");
+        assert_eq!((outcome.applied, outcome.sent.clone(), outcome.failed.clone()), (4, vec!["Re: First".to_owned()], vec![]));
+        assert_eq!(store.pending_count(&env.account.id).unwrap(), 0);
+        let (star, archive, trash, append) = (log_index(&env, "UID STORE 1 +FLAGS.SILENT (\\Flagged)"), log_index(&env, "UID MOVE 1 \"Archive\""), log_index(&env, "UID MOVE 2 \"Trash\""), log_index(&env, "APPEND \"Sent\""));
+        assert!(star < archive && archive < trash && trash < append, "replayed in the order they were made");
+        assert_eq!(env.smtp.seen.lock().unwrap().len(), 1);
+        {
+            let s = env.imap.lock();
+            assert!(s.has_folder("Archive"), "created on demand");
+            assert!(s.folder("Archive").messages[&1].has_flag("\\Flagged"));
+            assert_eq!(s.folder("INBOX").messages.keys().copied().collect::<Vec<_>>(), vec![3]);
+            assert_eq!(s.folder("Trash").messages.len(), 1);
+            assert_eq!(s.folder("Sent").messages.len(), 1);
+        }
+        let first = store.message(&first.id).unwrap().unwrap();
+        let archive_validity = env.imap.lock().folder("Archive").uidvalidity;
+        assert_eq!(first.provider_id, Some(MessageRef::provider_id("Archive", archive_validity, 1)), "COPYUID updated the identity at once");
+        assert_eq!(label_of(&first), "Archive");
+        assert!(store.labels(&env.account.id).unwrap().iter().any(|l| l.kind == LabelKind::Archive), "the created folder is a label straight away");
+        let second = store.message(&second.id).unwrap().unwrap();
+        assert_eq!((second.provider_id.clone(), label_of(&second)), (Some(MessageRef::provider_id("Trash", 300, 1)), "Trash".to_owned()));
+        let sent = imap_message(&store, &env, "Re: First");
+        assert!(sent.is_outgoing && sent.provider_id == Some(MessageRef::provider_id("Sent", 200, 1)));
+        assert_eq!(label_of(&sent), "Sent");
+        assert_eq!(sent.conversation_id, first.conversation_id, "the reply threads with its parent");
+        assert!(store.draft(&draft.id).unwrap().is_none());
+
+        // The next cycle sees the server's view of the same moves and changes nothing.
+        let before = store.message_count(&env.account.id).unwrap();
+        let outcome = block_on(run_sync(store.clone(), live.clone(), None, env.account.clone()));
+        assert_eq!(outcome.state, Some(SyncState::UpToDate), "{outcome:?}");
+        assert_eq!(store.message_count(&env.account.id).unwrap(), before, "no duplicates after the moves and the Sent copy");
+        let sent = imap_message(&store, &env, "Re: First");
+        assert!(sent.body.is_cached(), "the Sent copy kept its body");
+        assert_eq!(label_of(&imap_message(&store, &env, "First")), "Archive");
+        let rows = store.imap_folders(&env.account.id).unwrap();
+        assert!(rows.iter().any(|r| r.path == "Archive"), "the checkpoint tracks the new folder: {rows:?}");
+    }
+
+    #[test]
+    fn imap_replay_after_a_crash_between_server_success_and_local_commit() {
+        let env = imap_env("crash");
+        let live = imap_provider(&env);
+        let store = open_store(&env);
+        block_on(run_sync(store.clone(), live.clone(), None, env.account.clone()));
+        let third = imap_message(&store, &env, "Third");
+        store.apply_change(&env.account.id, overlook_store::LocalChange::Archive { message_ids: vec![third.id.clone()] }).unwrap();
+        let labels = store.labels(&env.account.id).unwrap();
+        let op = store.pending_operations(&env.account.id).unwrap().remove(0);
+        // The server applied the move, then the process died before the store heard.
+        let applied = pollster_block(live.apply(&env.account, &op, &[third.clone()], &labels)).unwrap();
+        assert_eq!(applied.provider_ids.len(), 1);
+        assert_eq!(store.message(&third.id).unwrap().unwrap().provider_id, third.provider_id, "nothing committed locally");
+        drop(store);
+
+        let store = open_store(&env);
+        let fresh = imap_provider(&env);
+        let outcome = block_on(run_sync(store.clone(), fresh.clone(), None, env.account.clone()));
+        assert_eq!(outcome.state, Some(SyncState::UpToDate), "{outcome:?}");
+        assert_eq!(outcome.applied, 1);
+        let s = env.imap.lock();
+        assert_eq!(s.folder("Archive").messages.len(), 1, "one copy, found again by Message-ID");
+        assert_eq!(s.commands("UID MOVE"), 3, "the first attempt's TRYCREATE retry, then the replay: {:?}", s.log);
+        let validity = s.folder("Archive").uidvalidity;
+        drop(s);
+        let third = store.message(&third.id).unwrap().unwrap();
+        assert_eq!((third.provider_id.clone(), label_of(&third)), (Some(MessageRef::provider_id("Archive", validity, 1)), "Archive".to_owned()));
+        assert_eq!(store.pending_count(&env.account.id).unwrap(), 0);
+        assert_eq!(store.message_count(&env.account.id).unwrap(), 3);
+    }
+
+    #[test]
+    fn imap_uncertain_send_waits_for_the_user_without_blocking_other_changes() {
+        let env = imap_env("uncertain");
+        let live = imap_provider(&env);
+        let store = open_store(&env);
+        block_on(run_sync(store.clone(), live.clone(), None, env.account.clone()));
+        let draft = queued_draft(&store, &env.account);
+        env.smtp.set(Behaviour::DropAfterData);
+        let outcome = block_on(run_sync(store.clone(), live.clone(), None, env.account.clone()));
+        assert_eq!(outcome.uncertain, vec!["Agenda".to_owned()]);
+        assert_eq!(store.draft(&draft.id).unwrap().unwrap().state, DraftState::Uncertain);
+
+        // The next cycle cannot find a copy in Sent: the send stays uncertain, is not
+        // repeated, and a change queued behind it still goes through.
+        env.smtp.set(Behaviour::Normal);
+        let first = imap_message(&store, &env, "First");
+        store.apply_change(&env.account.id, overlook_store::LocalChange::SetRead { message_ids: vec![first.id.clone()], read: true }).unwrap();
+        let outcome = block_on(run_sync(store.clone(), live.clone(), None, env.account.clone()));
+        assert_eq!(outcome.state, Some(SyncState::UpToDate), "{outcome:?}");
+        assert_eq!((outcome.applied, outcome.sent.len(), outcome.uncertain.len()), (1, 0, 0));
+        assert_eq!(env.smtp.seen.lock().unwrap().len(), 1, "not sent again on its own");
+        assert!(env.imap.lock().folder("INBOX").messages[&1].has_flag("\\Seen"));
+        let ops = store.pending_operations(&env.account.id).unwrap();
+        assert_eq!(ops.len(), 1);
+        assert_eq!((ops[0].state, ops[0].last_error.as_deref()), (OperationState::Uncertain, Some(UNCERTAIN_SEND_WORDING)));
+        assert_eq!(store.draft(&draft.id).unwrap().unwrap().state, DraftState::Uncertain);
+
+        // "Send again": a fresh attempt that succeeds and lands in Sent.
+        store.resend(&draft.id).unwrap();
+        assert_eq!(store.draft(&draft.id).unwrap().unwrap().state, DraftState::Queued);
+        let outcome = block_on(run_sync(store.clone(), live.clone(), None, env.account.clone()));
+        assert_eq!(outcome.sent, vec!["Agenda".to_owned()]);
+        assert_eq!(env.smtp.seen.lock().unwrap().len(), 2);
+        assert_eq!(env.imap.lock().folder("Sent").messages.len(), 1);
+        assert!(store.draft(&draft.id).unwrap().is_none());
+        assert_eq!(store.messages_for_account(&env.account.id).unwrap().iter().filter(|m| m.is_outgoing).count(), 1);
+
+        // "Discard": the draft and its send are gone.
+        let draft = queued_draft(&store, &env.account);
+        env.smtp.set(Behaviour::DropAfterData);
+        block_on(run_sync(store.clone(), live.clone(), None, env.account.clone()));
+        assert_eq!(store.draft(&draft.id).unwrap().unwrap().state, DraftState::Uncertain);
+        store.discard_send(&draft.id).unwrap();
+        assert!(store.draft(&draft.id).unwrap().is_none());
+        assert_eq!(store.pending_count(&env.account.id).unwrap(), 0);
+        env.smtp.set(Behaviour::Normal);
+        let outcome = block_on(run_sync(store.clone(), live.clone(), None, env.account.clone()));
+        assert_eq!((outcome.state, outcome.sent.len()), (Some(SyncState::UpToDate), 0));
+        assert_eq!(env.smtp.seen.lock().unwrap().len(), 3, "the discarded message was never sent again");
+    }
+
+    #[test]
+    fn imap_local_sent_copy_is_replaced_by_the_server_copy() {
+        let env = imap_env("sentcopy");
+        let live = imap_provider(&env);
+        let store = open_store(&env);
+        block_on(run_sync(store.clone(), live.clone(), None, env.account.clone()));
+        let draft = queued_draft(&store, &env.account);
+        env.imap.lock().fail_next = Some(("APPEND".into(), "NO [OVERQUOTA] Quota exceeded".into()));
+        let outcome = block_on(run_sync(store.clone(), live.clone(), None, env.account.clone()));
+        assert_eq!(outcome.sent, vec!["Agenda".to_owned()]);
+        let local = imap_message(&store, &env, "Agenda");
+        assert!(local.provider_id.as_ref().is_some_and(is_local_placeholder));
+        assert_eq!(label_of(&local), "Sent");
+
+        // The server copy shows up later (a retried APPEND elsewhere, or another client):
+        // it is the same message, not a second one.
+        let rfc = local.rfc_message_id.clone().unwrap();
+        let data = env.smtp.messages().remove(0);
+        env.imap.lock().folder_mut("Sent").add(FakeMessage::new(&["\\Seen"], "14-Oct-2026 12:00:00 +0000", data));
+        let outcome = block_on(run_sync(store.clone(), live.clone(), None, env.account.clone()));
+        assert_eq!(outcome.state, Some(SyncState::UpToDate), "{outcome:?}");
+        let sent: Vec<Message> = store.messages_for_account(&env.account.id).unwrap().into_iter().filter(|m| m.subject == "Agenda").collect();
+        assert_eq!(sent.len(), 1, "de-duplicated by Message-ID");
+        assert_eq!((sent[0].id.clone(), sent[0].provider_id.clone(), sent[0].rfc_message_id.clone()), (local.id, Some(MessageRef::provider_id("Sent", 200, 1)), Some(rfc)));
+        assert!(sent[0].body.is_cached() && sent[0].is_outgoing);
+        let _ = draft;
+    }
+
+    // ------------------------------------------- the spike servers (manual, ignored)
+
+    /// A raw IMAP or SMTP client for the spike script: another mail client, or its fault
+    /// injection (`XDROPAFTER`, `XFAILNEXT`, `XDROPAFTERDATA`).
+    struct Raw {
+        reader: std::io::BufReader<std::net::TcpStream>,
+        writer: std::net::TcpStream,
+        tag: u32,
+    }
+
+    impl Raw {
+        fn connect(port: u16) -> Self {
+            let stream = std::net::TcpStream::connect(("127.0.0.1", port)).expect("spike server running");
+            stream.set_read_timeout(Some(Duration::from_secs(5))).unwrap();
+            let mut raw = Self { reader: std::io::BufReader::new(stream.try_clone().unwrap()), writer: stream, tag: 0 };
+            raw.line();
+            raw
+        }
+
+        fn line(&mut self) -> String {
+            use std::io::BufRead;
+            let mut line = String::new();
+            self.reader.read_line(&mut line).unwrap();
+            line.trim_end().to_owned()
+        }
+
+        /// Sends an IMAP command and returns the untagged lines before its OK.
+        fn imap(&mut self, command: &str) -> Vec<String> {
+            use std::io::Write;
+            self.tag += 1;
+            let tag = format!("x{}", self.tag);
+            self.writer.write_all(format!("{tag} {command}\r\n").as_bytes()).unwrap();
+            let mut lines = Vec::new();
+            loop {
+                let l = self.line();
+                if let Some(rest) = l.strip_prefix(&format!("{tag} ")) {
+                    assert!(rest.starts_with("OK"), "{command}: {l}");
+                    return lines;
+                }
+                lines.push(l);
+            }
+        }
+
+        fn imap_login(port: u16) -> Self {
+            let mut raw = Self::connect(port);
+            raw.imap("LOGIN spike secret");
+            raw
+        }
+
+        /// UIDs in `folder` carrying this Message-ID.
+        fn search(&mut self, folder: &str, rfc: &str) -> Vec<u32> {
+            self.imap(&format!("SELECT \"{folder}\""));
+            let lines = self.imap(&format!("UID SEARCH HEADER Message-ID \"{rfc}\""));
+            lines.iter().find_map(|l| l.strip_prefix("* SEARCH")).map(|rest| rest.split_whitespace().filter_map(|u| u.parse().ok()).collect()).unwrap_or_default()
+        }
+
+        fn smtp(&mut self, command: &str) -> String {
+            use std::io::Write;
+            self.writer.write_all(format!("{command}\r\n").as_bytes()).unwrap();
+            self.line()
+        }
+    }
+
+    /// The plan's M3 exit criterion against `scripts/spike-mail-servers.py` (start it first;
+    /// it keeps state between runs, so use a fresh process per run). Run with
+    /// `cargo test -p overlook imap_exit_criteria -- --ignored --nocapture`; optional
+    /// `OVERLOOK_SPIKE_IMAP_PORT` / `OVERLOOK_SPIKE_SMTP_PORT` (1143 / 2525).
+    #[test]
+    #[ignore]
+    fn imap_exit_criteria_against_the_spike_servers() {
+        let port = |name: &str, default: u16| std::env::var(name).ok().and_then(|p| p.parse().ok()).unwrap_or(default);
+        let (imap_port, smtp_port) = (port("OVERLOOK_SPIKE_IMAP_PORT", 1143), port("OVERLOOK_SPIKE_SMTP_PORT", 2525));
+        let servers = MailServers {
+            incoming: ServerEndpoint::new("127.0.0.1", imap_port, Security::None, "spike"),
+            outgoing: ServerEndpoint::new("127.0.0.1", smtp_port, Security::None, "spike"),
+            pop3: None,
+            imap: None,
+        };
+        let account = Account { id: AccountId::from("imap:spike@example.com"), provider: ProviderKind::Imap, display_name: "Spike".into(), email: "spike@example.com".into(), created_at: 0 };
+        let dir = std::env::temp_dir().join(format!("overlook-spike-m3-{}", std::process::id()));
+        let _ = std::fs::remove_dir_all(&dir);
+        std::fs::create_dir_all(&dir).unwrap();
+        let path = dir.join("overlook.sqlite");
+        let live = Arc::new(ImapProvider::new(servers.clone(), "secret").with_timeout(Duration::from_secs(5)).with_inbox_limit(20));
+        let open = || {
+            let store = Arc::new(Store::open(&path).unwrap());
+            store.upsert_account(&account).unwrap();
+            store.set_servers(&account.id, &servers).unwrap();
+            store
+        };
+        let find = |store: &Store, rfc: &str| store.message_by_rfc_id(&account.id, rfc).unwrap().unwrap_or_else(|| panic!("no message {rfc}"));
+        let folder_of = |m: &Message| MessageRef::parse(m.provider_id.as_ref().unwrap()).unwrap().folder;
+        let pid = std::process::id();
+
+        let store = open();
+        let outcome = block_on(run_sync(store.clone(), live.clone(), None, account.clone()));
+        assert_eq!(outcome.state, Some(SyncState::UpToDate), "{outcome:?}");
+        let baseline = store.message_count(&account.id).unwrap();
+        eprintln!("initial sync: {baseline} messages");
+
+        // 1. Disconnect during a download: new mail arrives, both attempts to fetch it die.
+        let new_rfc = format!("<new-{pid}@example.com>");
+        let new_raw = format!("From: late@example.com\r\nTo: spike@example.com\r\nSubject: Arrived late {pid}\r\nMessage-ID: {new_rfc}\r\nDate: Wed, 14 Oct 2026 12:00:00 +0000\r\n\r\nLate body.\r\n");
+        {
+            use std::io::Write;
+            let mut other = Raw::imap_login(imap_port);
+            other.tag += 1;
+            other.writer.write_all(format!("x{} APPEND \"INBOX\" () {{{}}}\r\n", other.tag, new_raw.len()).as_bytes()).unwrap();
+            assert!(other.line().starts_with('+'));
+            other.writer.write_all(new_raw.as_bytes()).unwrap();
+            other.writer.write_all(b"\r\n").unwrap();
+            assert!(other.line().contains("APPENDUID"));
+        }
+        Raw::connect(imap_port).imap("XDROPAFTER UID FETCH 2");
+        let outcome = block_on(run_sync(store.clone(), live.clone(), None, account.clone()));
+        assert_eq!(outcome.state, Some(SyncState::Offline), "both fetch attempts were cut: {outcome:?}");
+        let outcome = block_on(run_sync(store.clone(), live.clone(), None, account.clone()));
+        assert_eq!(outcome.state, Some(SyncState::UpToDate), "{outcome:?}");
+        let late = find(&store, &new_rfc);
+        assert!(late.body.is_cached(), "resumed where it left off");
+        assert_eq!(store.message_count(&account.id).unwrap(), baseline + 1);
+        eprintln!("1. disconnect during download: recovered on the next sync");
+
+        // 2. Disconnect during a move: the server moves, the reply is lost, the retry finds
+        // the message in the (newly created) Archive folder.
+        let plain = find(&store, "<plain-1@example.com>");
+        store.apply_change(&account.id, overlook_store::LocalChange::SetStarred { message_ids: vec![plain.id.clone()], starred: true }).unwrap();
+        store.apply_change(&account.id, overlook_store::LocalChange::Archive { message_ids: vec![plain.id.clone()] }).unwrap();
+        Raw::connect(imap_port).imap("XDROPAFTER UID MOVE");
+        let outcome = block_on(run_sync(store.clone(), live.clone(), None, account.clone()));
+        assert_eq!((outcome.state.clone(), outcome.applied), (Some(SyncState::UpToDate), 2), "{outcome:?}");
+        let plain = store.message(&plain.id).unwrap().unwrap();
+        assert_eq!(folder_of(&plain), "Archive");
+        assert!(plain.label_ids.iter().any(|l| l.as_str().ends_with(":Archive")));
+        assert_eq!(Raw::imap_login(imap_port).search("Archive", "<plain-1@example.com>").len(), 1, "one copy on the server");
+        assert!(Raw::imap_login(imap_port).search("INBOX", "<plain-1@example.com>").is_empty());
+        let outcome = block_on(run_sync(store.clone(), live.clone(), None, account.clone()));
+        assert_eq!(outcome.state, Some(SyncState::UpToDate), "{outcome:?}");
+        assert_eq!(store.message_count(&account.id).unwrap(), baseline + 1, "the move did not duplicate or lose anything");
+        assert!(store.labels(&account.id).unwrap().iter().any(|l| l.kind == LabelKind::Archive));
+        eprintln!("2. disconnect during a move: converged, Archive created on demand");
+
+        // 3. Disconnect during a send: uncertain until the user sends again.
+        let mut draft = Draft::new(account.id.clone(), DraftKind::New, now());
+        draft.to = vec![Address::named("Maya", "maya@northstar.example")];
+        draft.subject = format!("Spike send {pid}");
+        draft.body_text = "Sent through the spike servers.".into();
+        store.save_draft(&draft).unwrap();
+        store.queue_send(&draft).unwrap();
+        let rfc = overlook_provider::draft_message_id(&draft);
+        assert!(Raw::connect(smtp_port).smtp("XDROPAFTERDATA").starts_with("250"));
+        let outcome = block_on(run_sync(store.clone(), live.clone(), None, account.clone()));
+        assert_eq!(outcome.uncertain, vec![draft.subject.clone()], "{outcome:?}");
+        let outcome = block_on(run_sync(store.clone(), live.clone(), None, account.clone()));
+        assert_eq!((outcome.state.clone(), outcome.sent.len()), (Some(SyncState::UpToDate), 0), "{outcome:?}");
+        assert_eq!(store.draft(&draft.id).unwrap().unwrap().state, DraftState::Uncertain);
+        assert!(Raw::imap_login(imap_port).search("Sent", &rfc).is_empty(), "nothing in Sent yet");
+        store.resend(&draft.id).unwrap();
+        let outcome = block_on(run_sync(store.clone(), live.clone(), None, account.clone()));
+        assert_eq!(outcome.sent, vec![draft.subject.clone()], "{outcome:?}");
+        let on_server = Raw::imap_login(imap_port).search("Sent", &rfc);
+        assert_eq!(on_server.len(), 1);
+        let sent = find(&store, &rfc);
+        assert_eq!(folder_of(&sent), "Sent");
+        assert!(sent.label_ids.iter().any(|l| l.as_str().ends_with(":Sent")) && sent.is_outgoing);
+        let outcome = block_on(run_sync(store.clone(), live.clone(), None, account.clone()));
+        assert_eq!(outcome.state, Some(SyncState::UpToDate), "{outcome:?}");
+        let again = find(&store, &rfc);
+        assert_eq!((again.id.clone(), again.body.is_cached(), again.label_ids.len()), (sent.id.clone(), true, 1), "the Sent copy is one message after the next sync");
+        eprintln!("3. disconnect during a send: uncertain, then sent again and in Sent with the Sent label");
+
+        // 4. Restart while offline: queued changes survive the restart and replay in order.
+        let contract = find(&store, "<work-1@example.com>");
+        let invite = find(&store, "<invite-3@example.com>");
+        store.apply_change(&account.id, overlook_store::LocalChange::SetRead { message_ids: vec![invite.id.clone()], read: true }).unwrap();
+        store.apply_change(&account.id, overlook_store::LocalChange::Trash { message_ids: vec![contract.id.clone()] }).unwrap();
+        let dead = std::net::TcpListener::bind("127.0.0.1:0").unwrap().local_addr().unwrap();
+        let mut unreachable = servers.clone();
+        unreachable.incoming = ServerEndpoint::new("127.0.0.1", dead.port(), Security::None, "spike");
+        let offline = Arc::new(ImapProvider::new(unreachable, "secret").with_timeout(Duration::from_secs(2)));
+        let outcome = block_on(run_sync(store.clone(), offline, None, account.clone()));
+        assert_eq!(outcome.state, Some(SyncState::Offline));
+        assert_eq!(store.pending_count(&account.id).unwrap(), 2);
+        drop(store);
+        let store = open();
+        assert_eq!(store.pending_count(&account.id).unwrap(), 2);
+        let outcome = block_on(run_sync(store.clone(), live.clone(), None, account.clone()));
+        assert_eq!((outcome.state.clone(), outcome.applied), (Some(SyncState::UpToDate), 2), "{outcome:?}");
+        assert_eq!(folder_of(&store.message(&contract.id).unwrap().unwrap()), "Trash");
+        assert_eq!(Raw::imap_login(imap_port).search("Trash", "<work-1@example.com>").len(), 1);
+        eprintln!("4. restart while offline: the queue replayed after the restart");
+
+        // 5. The same folder changed from another client: a flag and a move made elsewhere
+        // show up locally without duplicates.
+        let multi = find(&store, "<multi-2@example.com>");
+        let late = find(&store, &new_rfc);
+        let (multi_uid, late_uid) = (MessageRef::parse(multi.provider_id.as_ref().unwrap()).unwrap().uid, MessageRef::parse(late.provider_id.as_ref().unwrap()).unwrap().uid);
+        {
+            let mut other = Raw::imap_login(imap_port);
+            other.imap("SELECT \"INBOX\"");
+            other.imap(&format!("UID STORE {late_uid} +FLAGS (\\Seen)"));
+            other.imap(&format!("UID MOVE {multi_uid} \"Work/Clients\""));
+        }
+        let before = store.message_count(&account.id).unwrap();
+        let outcome = block_on(run_sync(store.clone(), live.clone(), None, account.clone()));
+        assert_eq!(outcome.state, Some(SyncState::UpToDate), "{outcome:?}");
+        assert!(store.message(&late.id).unwrap().unwrap().is_read, "the flag set elsewhere arrived");
+        let moved = store.message(&multi.id).unwrap().unwrap();
+        assert_eq!(folder_of(&moved), "Work/Clients", "the move made elsewhere kept the local id");
+        assert_eq!(moved.conversation_id, multi.conversation_id);
+        assert_eq!(store.message_count(&account.id).unwrap(), before);
+        eprintln!("5. folder changed from another client: flag and move reflected, no duplicates");
+
+        live.disconnect();
+        let _ = std::fs::remove_dir_all(&dir);
     }
 }

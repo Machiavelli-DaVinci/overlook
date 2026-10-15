@@ -843,6 +843,47 @@ impl Store {
         })
     }
 
+    /// Queues an uncertain or failed send again: the draft returns to `Queued` and its
+    /// operation to `Pending`, so the next sync submits it (a fresh attempt, no reconcile).
+    pub fn resend(&self, id: &DraftId) -> Result<Draft> {
+        self.with_tx(|tx| {
+            let mut found = load_drafts(tx, "WHERE d.id=?1", params![id.0])?;
+            let mut draft = found.pop().ok_or_else(|| StoreError::NotFound(id.0.clone()))?;
+            if !matches!(draft.state, DraftState::Uncertain | DraftState::Failed(_)) {
+                return Err(StoreError::Invalid("This message is not waiting on a decision.".into()));
+            }
+            draft.state = DraftState::Queued;
+            draft.updated_at = now();
+            save_draft_tx(tx, &draft)?;
+            let n = tx.execute(
+                "UPDATE pending_operations SET state='pending', last_error=NULL, updated_at=?2 WHERE state IN ('uncertain','failed') AND kind_json LIKE ?1",
+                params![format!("%\"draft_id\":\"{}\"%", id.0), now()],
+            )?;
+            if n == 0 {
+                insert_operation_tx(tx, &draft.account_id, OperationKind::SendDraft { draft_id: draft.id.clone() }, now())?;
+            }
+            Ok(draft)
+        })
+    }
+
+    /// Drops an uncertain or failed send together with its draft. The message may or may
+    /// not have left the server; the user has decided not to send it again.
+    pub fn discard_send(&self, id: &DraftId) -> Result<()> {
+        self.with_tx(|tx| {
+            let mut found = load_drafts(tx, "WHERE d.id=?1", params![id.0])?;
+            let draft = found.pop().ok_or_else(|| StoreError::NotFound(id.0.clone()))?;
+            if !matches!(draft.state, DraftState::Uncertain | DraftState::Failed(_) | DraftState::Queued) {
+                return Err(StoreError::Invalid("This message is already being sent.".into()));
+            }
+            tx.execute("DELETE FROM drafts WHERE id=?1", [&id.0])?;
+            tx.execute(
+                "DELETE FROM pending_operations WHERE state IN ('pending','uncertain','failed') AND kind_json LIKE ?1",
+                [format!("%\"draft_id\":\"{}\"%", id.0)],
+            )?;
+            Ok(())
+        })
+    }
+
     pub fn set_draft_state(&self, id: &DraftId, state: &DraftState) -> Result<()> {
         self.with_conn(|c| {
             c.execute(

@@ -1,45 +1,84 @@
 #!/usr/bin/env python3
-"""Scripted plaintext IMAP (port 1143) and SMTP (port 2525) servers for the Overlook M0 spike.
+"""Scripted plaintext IMAP (port 1143) and SMTP (port 2525) servers for the Overlook IMAP work.
 
-Not a real server: it answers the handful of commands the spike issues with Dovecot-shaped
-responses. User: spike / password: secret.
+Not a real server: it answers the commands the provider issues with Dovecot-shaped responses
+from an in-memory mailbox. User: spike / password: secret.
+
+Read path (M0-M2): CAPABILITY, LOGIN, LIST, SELECT/EXAMINE, UID SEARCH ALL, UID FETCH with
+FLAGS / INTERNALDATE / RFC822.SIZE / ENVELOPE / BODYSTRUCTURE-less sections (BODY[],
+BODY[HEADER], BODY[TEXT], BODY[n.m], BODY[n.m.MIME], partial fetches).
+
+Write path (M3): CREATE, UID STORE (±FLAGS[.SILENT]), UID COPY and UID MOVE with COPYUID,
+UID EXPUNGE / EXPUNGE, APPEND with APPENDUID, UID SEARCH HEADER <name> <value>, all against
+every folder.
+
+Fault injection, for the exit-criterion run (any connection, no login needed):
+  XDROPAFTER <word> [n]      the next n (default 1) commands whose line contains <word>
+                             (case-insensitive, e.g. "UID MOVE", "APPEND", "UID FETCH") are
+                             executed, then that connection closes without answering
+  XFAILNEXT <word> <reply>   the next command containing <word> is answered with
+                             "<tag> <reply>" instead of being executed
+  XSTATE                     prints the folders and their UIDs (for eyeballing)
+SMTP:
+  XDROPAFTERDATA             the next DATA body is read, then the connection closes
+                             without the 250 reply (an uncertain send)
 """
-import base64, email, email.policy, re, socket, socketserver, threading, time, sys
+import base64, email, email.policy, re, socketserver, threading, time
 
 IMAP_PORT, SMTP_PORT = 1143, 2525
 USER, PASSWORD = "spike", "secret"
+CAPS = "IMAP4rev1 UIDPLUS MOVE IDLE SPECIAL-USE LITERAL+ ENABLE"
 
 def msg(headers, body):
     return ("\r\n".join(headers) + "\r\n\r\n" + body).encode()
 
-MESSAGES = {  # uid -> (flags, internaldate, bytes)
-    1: ("\\Seen", "10-Oct-2026 09:12:00 +0000", msg([
-        "From: Ada Lovelace <ada@example.com>", "To: spike@example.com", "Subject: Plain hello",
-        "Date: Sat, 10 Oct 2026 09:12:00 +0000", "Message-ID: <plain-1@example.com>",
-        "Content-Type: text/plain; charset=utf-8"], "Hello from a plain message.\r\n")),
-    2: ("", "12-Oct-2026 14:30:00 +0000", msg([
-        "From: =?UTF-8?Q?Gr=C3=A9goire?= <greg@example.com>", "To: spike@example.com", "Cc: Ada Lovelace <ada@example.com>",
-        "Subject: =?UTF-8?B?UmU6IFBsYWluIGhlbGxv?=", "Date: Mon, 12 Oct 2026 14:30:00 +0000",
-        "Message-ID: <multi-2@example.com>", "In-Reply-To: <plain-1@example.com>", "References: <plain-1@example.com>",
-        "MIME-Version: 1.0", 'Content-Type: multipart/mixed; boundary="outer"'],
-        '--outer\r\nContent-Type: multipart/alternative; boundary="inner"\r\n\r\n'
-        '--inner\r\nContent-Type: text/plain; charset=utf-8\r\n\r\nText part.\r\n'
-        '--inner\r\nContent-Type: text/html; charset=utf-8\r\n\r\n<p>HTML part with <img src="cid:logo"></p>\r\n'
-        '--inner--\r\n'
-        '--outer\r\nContent-Type: image/png; name="logo.png"\r\nContent-ID: <logo>\r\nContent-Disposition: inline; filename="logo.png"\r\nContent-Transfer-Encoding: base64\r\n\r\niVBORw0KGgo=\r\n'
-        '--outer\r\nContent-Type: application/pdf; name="report.pdf"\r\nContent-Disposition: attachment; filename="report.pdf"\r\nContent-Transfer-Encoding: base64\r\n\r\nJVBERi0xLjQK\r\n'
-        '--outer--\r\n')),
-    3: ("\\Flagged", "13-Oct-2026 08:00:00 +0000", msg([
-        "From: Calendar <cal@example.com>", "To: spike@example.com", "Subject: Invitation: Standup",
-        "Date: Tue, 13 Oct 2026 08:00:00 +0000", "Message-ID: <invite-3@example.com>", "MIME-Version: 1.0",
-        'Content-Type: multipart/alternative; boundary="b"'],
-        '--b\r\nContent-Type: text/plain\r\n\r\nYou are invited.\r\n'
-        '--b\r\nContent-Type: text/calendar; method=REQUEST\r\n\r\nBEGIN:VCALENDAR\r\nBEGIN:VEVENT\r\nUID:ev1\r\nSUMMARY:Standup\r\nDTSTART:20261014T090000Z\r\nDTEND:20261014T091500Z\r\nEND:VEVENT\r\nEND:VCALENDAR\r\n'
-        '--b--\r\n')),
+class Folder:
+    def __init__(self, attrs, uidvalidity):
+        self.attrs, self.uidvalidity = attrs, uidvalidity
+        self.messages = {}  # uid -> [flags(list), internaldate, bytes]
+        self.next_uid = 1
+    def add(self, flags, idate, raw):
+        uid = self.next_uid; self.next_uid += 1
+        self.messages[uid] = [list(flags), idate, raw]
+        return uid
+
+FOLDERS = {
+    "INBOX": Folder(["\\HasNoChildren"], 1760400000),
+    "Sent": Folder(["\\HasNoChildren", "\\Sent"], 1760400001),
+    "Trash": Folder(["\\HasNoChildren", "\\Trash"], 1760400002),
+    "Junk": Folder(["\\HasNoChildren", "\\Junk"], 1760400003),
+    "Work": Folder(["\\HasChildren"], 1760400004),
+    "Work/Clients": Folder(["\\HasNoChildren"], 1760400005),
 }
-SENT = {}  # uid -> bytes
-SENT_NEXT = [1]
+FOLDERS["INBOX"].add(["\\Seen"], "10-Oct-2026 09:12:00 +0000", msg([
+    "From: Ada Lovelace <ada@example.com>", "To: spike@example.com", "Subject: Plain hello",
+    "Date: Sat, 10 Oct 2026 09:12:00 +0000", "Message-ID: <plain-1@example.com>",
+    "Content-Type: text/plain; charset=utf-8"], "Hello from a plain message.\r\n"))
+FOLDERS["INBOX"].add([], "12-Oct-2026 14:30:00 +0000", msg([
+    "From: =?UTF-8?Q?Gr=C3=A9goire?= <greg@example.com>", "To: spike@example.com", "Cc: Ada Lovelace <ada@example.com>",
+    "Subject: =?UTF-8?B?UmU6IFBsYWluIGhlbGxv?=", "Date: Mon, 12 Oct 2026 14:30:00 +0000",
+    "Message-ID: <multi-2@example.com>", "In-Reply-To: <plain-1@example.com>", "References: <plain-1@example.com>",
+    "MIME-Version: 1.0", 'Content-Type: multipart/mixed; boundary="outer"'],
+    '--outer\r\nContent-Type: multipart/alternative; boundary="inner"\r\n\r\n'
+    '--inner\r\nContent-Type: text/plain; charset=utf-8\r\n\r\nText part.\r\n'
+    '--inner\r\nContent-Type: text/html; charset=utf-8\r\n\r\n<p>HTML part with <img src="cid:logo"></p>\r\n'
+    '--inner--\r\n'
+    '--outer\r\nContent-Type: image/png; name="logo.png"\r\nContent-ID: <logo>\r\nContent-Disposition: inline; filename="logo.png"\r\nContent-Transfer-Encoding: base64\r\n\r\niVBORw0KGgo=\r\n'
+    '--outer\r\nContent-Type: application/pdf; name="report.pdf"\r\nContent-Disposition: attachment; filename="report.pdf"\r\nContent-Transfer-Encoding: base64\r\n\r\nJVBERi0xLjQK\r\n'
+    '--outer--\r\n'))
+FOLDERS["INBOX"].add(["\\Flagged"], "13-Oct-2026 08:00:00 +0000", msg([
+    "From: Calendar <cal@example.com>", "To: spike@example.com", "Subject: Invitation: Standup",
+    "Date: Tue, 13 Oct 2026 08:00:00 +0000", "Message-ID: <invite-3@example.com>", "MIME-Version: 1.0",
+    'Content-Type: multipart/alternative; boundary="b"'],
+    '--b\r\nContent-Type: text/plain\r\n\r\nYou are invited.\r\n'
+    '--b\r\nContent-Type: text/calendar; method=REQUEST\r\n\r\nBEGIN:VCALENDAR\r\nBEGIN:VEVENT\r\nUID:ev1\r\nSUMMARY:Standup\r\nDTSTART:20261014T090000Z\r\nDTEND:20261014T091500Z\r\nEND:VEVENT\r\nEND:VCALENDAR\r\n'
+    '--b--\r\n'))
+FOLDERS["Work/Clients"].add([], "09-Oct-2026 09:00:00 +0000", msg([
+    "From: client@example.com", "To: spike@example.com", "Subject: Contract", "Message-ID: <work-1@example.com>",
+    "Date: Fri, 09 Oct 2026 09:00:00 +0000"], "Please sign.\r\n"))
+
 LOCK = threading.Lock()
+FAULTS = {"drop_after": None, "drop_count": 0, "fail_next": None, "smtp_drop_after_data": False}
 
 def header(raw, name):
     for line in raw.split(b"\r\n\r\n", 1)[0].split(b"\r\n"):
@@ -49,6 +88,10 @@ def header(raw, name):
 
 def quoted(s):
     return "NIL" if s is None else '"' + s.replace('\\', '\\\\').replace('"', '\\"') + '"'
+
+def unquote(s):
+    s = s.strip()
+    return s[1:-1].replace('\\"', '"').replace('\\\\', '\\') if len(s) >= 2 and s[0] == s[-1] == '"' else s
 
 def addr(h):
     if not h: return "NIL"
@@ -76,10 +119,10 @@ def section_bytes(raw, spec):
     if spec == "": return raw
     if spec.upper() == "HEADER": return head + b"\r\n\r\n"
     if spec.upper() == "TEXT": return body
-    msg = email.message_from_bytes(raw, policy=email.policy.compat32)
+    m = email.message_from_bytes(raw, policy=email.policy.compat32)
     want_mime = spec.upper().endswith(".MIME")
     numbers = [int(n) for n in (spec[:-5] if want_mime else spec).split(".")]
-    part = msg
+    part = m
     for n in numbers:
         if part.is_multipart(): part = part.get_payload()[n - 1]
         elif n != 1: return b""
@@ -91,20 +134,46 @@ def section_bytes(raw, spec):
     return phead + b"\r\n" if want_mime else pbody
 
 def parse_set(s, uids):
+    uids = list(uids)
     out = set()
     for piece in s.split(","):
         if ":" in piece:
-            a, b = piece.split(":"); a = int(a); b = max(uids) if b == "*" else int(b)
-            out.update(u for u in uids if min(a,b) <= u <= max(a,b))
+            a, b = piece.split(":"); a = int(a); b = (max(uids) if uids else 0) if b == "*" else int(b)
+            out.update(u for u in uids if min(a, b) <= u <= max(a, b))
         else:
             out.add(int(piece))
     return sorted(u for u in out if u in uids)
 
+def encode_set(uids):
+    uids = sorted(set(uids)); out = []; i = 0
+    while i < len(uids):
+        start = end = uids[i]
+        while i + 1 < len(uids) and uids[i + 1] == end + 1: i += 1; end = uids[i]
+        out.append(str(start) if start == end else f"{start}:{end}"); i += 1
+    return ",".join(out)
+
+def fault_check(text):
+    """Returns ("drop", None), ("fail", reply) or (None, None) for a command line."""
+    upper = text.upper()
+    with LOCK:
+        if FAULTS["fail_next"] and FAULTS["fail_next"][0] in upper:
+            reply = FAULTS["fail_next"][1]; FAULTS["fail_next"] = None
+            return "fail", reply
+        if FAULTS["drop_after"] and FAULTS["drop_after"] in upper:
+            FAULTS["drop_count"] -= 1
+            if FAULTS["drop_count"] <= 0: FAULTS["drop_after"] = None
+            return "drop", None
+    return None, None
+
 class Imap(socketserver.StreamRequestHandler):
+    muted = False
     def send(self, s):
+        if self.muted: return
         self.wfile.write(s.encode() if isinstance(s, str) else s); self.wfile.write(b"\r\n")
+    def write(self, b):
+        if not self.muted: self.wfile.write(b)
     def handle(self):
-        self.send("* OK [CAPABILITY IMAP4rev1 UIDPLUS MOVE IDLE SPECIAL-USE LITERAL+ ENABLE] Spike IMAP ready.")
+        self.send(f"* OK [CAPABILITY {CAPS}] Spike IMAP ready.")
         box = None
         while True:
             line = self.rfile.readline()
@@ -114,83 +183,185 @@ class Imap(socketserver.StreamRequestHandler):
             tag, _, rest = text.partition(" ")
             cmd, _, args = rest.partition(" ")
             cmd = cmd.upper()
+            if cmd.startswith("X"):
+                self.control(tag, cmd, args); continue
+            kind, reply = fault_check(text)
+            if kind == "fail":
+                print(f"IMAP fault: answering {tag} {reply}", flush=True)
+                self.send(f"{tag} {reply}"); continue
+            if kind == "drop":
+                print("IMAP fault: executing, then dropping the connection without a reply", flush=True)
+                self.muted = True
             if cmd == "CAPABILITY":
-                self.send("* CAPABILITY IMAP4rev1 UIDPLUS MOVE IDLE SPECIAL-USE LITERAL+ ENABLE"); self.send(f"{tag} OK Capability completed.")
+                self.send(f"* CAPABILITY {CAPS}"); self.send(f"{tag} OK Capability completed.")
             elif cmd == "LOGIN":
-                u, p = [a.strip('"') for a in args.split(" ", 1)]
-                if (u, p) == (USER, PASSWORD): self.send(f"{tag} OK [CAPABILITY IMAP4rev1 UIDPLUS MOVE IDLE SPECIAL-USE] Logged in")
+                u, p = [unquote(a) for a in args.split(" ", 1)]
+                if (u, p) == (USER, PASSWORD): self.send(f"{tag} OK [CAPABILITY {CAPS}] Logged in")
                 else: self.send(f"{tag} NO [AUTHENTICATIONFAILED] Authentication failed.")
             elif cmd == "STARTTLS":
                 self.send(f"{tag} NO STARTTLS is not offered by the fake server")
-            elif cmd == "LIST":
-                self.send('* LIST (\\HasNoChildren) "/" INBOX')
-                self.send('* LIST (\\HasNoChildren \\Sent) "/" Sent')
-                self.send('* LIST (\\HasNoChildren \\Trash) "/" Trash')
-                self.send('* LIST (\\HasNoChildren \\Junk) "/" Junk')
-                self.send('* LIST (\\HasChildren) "/" Work')
-                self.send('* LIST (\\HasNoChildren) "/" Work/Clients')
-                self.send(f"{tag} OK List completed.")
+            elif cmd in ("LIST", "LSUB"):
+                with LOCK: items = [(p, f.attrs) for p, f in FOLDERS.items()]
+                for path, attrs in items:
+                    self.send(f'* {cmd} ({" ".join(attrs)}) "/" {quoted(path)}')
+                self.send(f"{tag} OK {cmd.title()} completed.")
             elif cmd in ("SELECT", "EXAMINE"):
-                box = args.strip('"')
-                store = MESSAGES if box == "INBOX" else SENT if box == "Sent" else {}
-                with LOCK: n = len(store); nxt = (max(store) + 1) if store else 1
+                path = unquote(args)
+                with LOCK: f = FOLDERS.get(path)
+                if f is None:
+                    self.send(f"{tag} NO Mailbox doesn't exist: {path}"); continue
+                box = path
+                with LOCK: n, nxt, uv = len(f.messages), f.next_uid, f.uidvalidity
                 self.send("* FLAGS (\\Answered \\Flagged \\Deleted \\Seen \\Draft)")
                 self.send("* OK [PERMANENTFLAGS (\\Answered \\Flagged \\Deleted \\Seen \\Draft \\*)] Flags permitted.")
                 self.send(f"* {n} EXISTS"); self.send("* 0 RECENT")
-                self.send("* OK [UIDVALIDITY 1760400000] UIDs valid"); self.send(f"* OK [UIDNEXT {nxt}] Predicted next UID")
-                self.send(f"{tag} OK [READ-WRITE] {cmd.title()} completed")
+                self.send(f"* OK [UIDVALIDITY {uv}] UIDs valid"); self.send(f"* OK [UIDNEXT {nxt}] Predicted next UID")
+                self.send(f"{tag} OK [{'READ-WRITE' if cmd == 'SELECT' else 'READ-ONLY'}] {cmd.title()} completed")
+            elif cmd == "CREATE":
+                path = unquote(args)
+                with LOCK:
+                    exists = path in FOLDERS
+                    if not exists: FOLDERS[path] = Folder(["\\HasNoChildren"], 1760500000 + len(FOLDERS))
+                self.send(f"{tag} NO [ALREADYEXISTS] Mailbox already exists" if exists else f"{tag} OK Create completed.")
             elif cmd == "UID":
                 sub, _, sargs = args.partition(" ")
-                store = MESSAGES if box == "INBOX" else SENT
-                if sub.upper() == "SEARCH":
-                    crit = sargs.upper()
+                sub = sub.upper()
+                with LOCK: f = FOLDERS.get(box)
+                if f is None:
+                    self.send(f"{tag} BAD No mailbox selected"); continue
+                if sub == "SEARCH":
+                    crit = sargs.strip()
                     with LOCK:
-                        if crit == "ALL": hits = sorted(store)
-                        elif crit.startswith("HEADER MESSAGE-ID"):
-                            want = sargs.split(None, 2)[2].strip('"')
-                            hits = [u for u, v in store.items() if header(v if isinstance(v, bytes) else v[2], "Message-ID") == want]
+                        if crit.upper() == "ALL": hits = sorted(f.messages)
+                        elif crit.upper().startswith("HEADER "):
+                            _, name, value = crit.split(None, 2); value = unquote(value)
+                            hits = [u for u, v in f.messages.items() if header(v[2], name) == value]
                         else: hits = []
                     self.send("* SEARCH" + "".join(f" {u}" for u in hits)); self.send(f"{tag} OK Search completed.")
-                elif sub.upper() == "FETCH":
-                    sset, _, items = sargs.partition(" ")
-                    items = items.strip("()").upper()
-                    with LOCK: uids = parse_set(sset, store.keys())
-                    for i, u in enumerate(sorted(store)):
-                        if u not in uids: continue
-                        flags, idate, raw = store[u] if isinstance(store[u], tuple) else ("\\Seen", "14-Oct-2026 00:00:00 +0000", store[u])
-                        parts = [f"UID {u}"]
-                        if "FLAGS" in items: parts.append(f"FLAGS ({flags})")
-                        if "INTERNALDATE" in items: parts.append(f'INTERNALDATE "{idate}"')
-                        if "RFC822.SIZE" in items: parts.append(f"RFC822.SIZE {len(raw)}")
-                        if "ENVELOPE" in items: parts.append("ENVELOPE " + envelope(raw))
-                        head = f"* {i+1} FETCH (" + " ".join(parts)
-                        sections = re.findall(r"BODY(?:\.PEEK)?\[([^\]]*)\](<0\.(\d+)>)?", items)
-                        if sections:
-                            self.wfile.write(head.encode())
-                            for spec, partial, limit in sections:
-                                data = section_bytes(raw, spec)
-                                if partial: data = data[:int(limit)]
-                                self.wfile.write(f" BODY[{spec}]{'<0>' if partial else ''} {{{len(data)}}}\r\n".encode()); self.wfile.write(data)
-                            self.send(")")
-                        else:
-                            self.send(head + ")")
-                    self.send(f"{tag} OK Fetch completed.")
+                elif sub == "FETCH":
+                    self.fetch(tag, f, sargs)
+                elif sub == "STORE":
+                    sset, _, rest = sargs.partition(" ")
+                    item, _, flags = rest.partition(" ")
+                    flags = flags.strip().strip("()").split()
+                    lines = []
+                    with LOCK:
+                        for i, u in enumerate(sorted(f.messages)):
+                            if u not in parse_set(sset, f.messages): continue
+                            cur = f.messages[u][0]
+                            if item.startswith("+"): cur += [x for x in flags if x not in cur]
+                            elif item.startswith("-"): cur = [x for x in cur if x not in flags]
+                            else: cur = list(flags)
+                            f.messages[u][0] = cur
+                            if not item.upper().endswith(".SILENT"): lines.append(f"* {i+1} FETCH (UID {u} FLAGS ({' '.join(cur)}))")
+                    for l in lines: self.send(l)
+                    self.send(f"{tag} OK Store completed.")
+                elif sub in ("COPY", "MOVE"):
+                    sset, _, target = sargs.partition(" "); target = unquote(target)
+                    with LOCK:
+                        t = FOLDERS.get(target)
+                        if t is None:
+                            self.send(f"{tag} NO [TRYCREATE] Mailbox doesn't exist: {target}"); continue
+                        uids = parse_set(sset, f.messages)
+                        pairs = [(u, t.add(*f.messages[u])) for u in uids]
+                        seqs = []
+                        if sub == "MOVE":
+                            seqs = [i + 1 for i, u in enumerate(sorted(f.messages)) if u in uids]
+                            for u in uids: del f.messages[u]
+                        tv = t.uidvalidity
+                    code = f"[COPYUID {tv} {encode_set(p[0] for p in pairs)} {encode_set(p[1] for p in pairs)}] " if pairs else ""
+                    if sub == "MOVE":
+                        if code: self.send(f"* OK {code}Moved UIDs.")
+                        for s in reversed(seqs): self.send(f"* {s} EXPUNGE")
+                        self.send(f"{tag} OK Move completed.")
+                    else:
+                        self.send(f"{tag} OK {code}Copy completed.")
+                elif sub == "EXPUNGE":
+                    self.expunge(tag, f, sargs.strip())
                 else:
                     self.send(f"{tag} BAD Unknown UID command")
+            elif cmd == "EXPUNGE":
+                with LOCK: f = FOLDERS.get(box)
+                if f is None: self.send(f"{tag} BAD No mailbox selected")
+                else: self.expunge(tag, f, None)
             elif cmd == "APPEND":
-                # a APPEND "Sent" (\Seen) {N}  or with LITERAL+ {N+}
+                # a APPEND "Sent" (\Seen) ["date"] {N}  or with LITERAL+ {N+}
                 size = int(args[args.rindex("{")+1:].rstrip("}+ "))
-                if not args.rstrip().endswith("+}"): self.send("+ OK")
+                head = args[:args.rindex("{")].strip()
+                m = re.match(r'("(?:[^"\\]|\\.)*"|\S+)\s*(?:\(([^)]*)\))?', head)
+                mailbox, flags = unquote(m.group(1)), (m.group(2) or "").split()
+                with LOCK: t = FOLDERS.get(mailbox)
+                if t is None:
+                    self.send(f"{tag} NO [TRYCREATE] Mailbox doesn't exist: {mailbox}"); continue
+                if not args.rstrip().endswith("+}"):
+                    muted, self.muted = self.muted, False
+                    self.send("+ OK"); self.muted = muted
                 raw = self.rfile.read(size); self.rfile.readline()
-                with LOCK:
-                    uid = SENT_NEXT[0]; SENT_NEXT[0] += 1; SENT[uid] = raw
-                self.send(f"{tag} OK [APPENDUID 1760400000 {uid}] Append completed.")
+                with LOCK: uid = t.add(flags, "14-Oct-2026 12:00:00 +0000", raw); tv = t.uidvalidity
+                print(f"IMAP appended {len(raw)} bytes to {mailbox!r} as UID {uid}, subject={header(raw, 'Subject')!r}", flush=True)
+                self.send(f"{tag} OK [APPENDUID {tv} {uid}] Append completed.")
             elif cmd == "NOOP":
                 self.send(f"{tag} OK NOOP completed.")
             elif cmd == "LOGOUT":
                 self.send("* BYE Logging out"); self.send(f"{tag} OK Logout completed."); return
             else:
                 self.send(f"{tag} BAD Unknown command {cmd}")
+            if self.muted:
+                return
+
+    def control(self, tag, cmd, args):
+        with LOCK:
+            if cmd == "XDROPAFTER":
+                parts = args.rsplit(" ", 1)
+                if len(parts) == 2 and parts[1].isdigit(): word, count = parts[0], int(parts[1])
+                else: word, count = args, 1
+                FAULTS["drop_after"], FAULTS["drop_count"] = word.strip().upper(), count
+            elif cmd == "XFAILNEXT":
+                word, _, reply = args.partition(" ")
+                FAULTS["fail_next"] = (word.upper(), reply)
+            elif cmd == "XDROPAFTERDATA":
+                FAULTS["smtp_drop_after_data"] = True
+            elif cmd == "XSTATE":
+                for path, f in FOLDERS.items():
+                    self.send(f"* XSTATE {quoted(path)} uidvalidity={f.uidvalidity} uids={encode_set(f.messages) or '-'} flags={[(u, v[0]) for u, v in f.messages.items()]}")
+            else:
+                self.send(f"{tag} BAD Unknown control command"); return
+        print(f"IMAP control: {cmd} {args}", flush=True)
+        self.send(f"{tag} OK {cmd} armed")
+
+    def expunge(self, tag, f, sset):
+        with LOCK:
+            wanted = parse_set(sset, f.messages) if sset else list(f.messages)
+            gone = [u for u in sorted(f.messages) if u in wanted and "\\Deleted" in f.messages[u][0]]
+            seqs = [i + 1 for i, u in enumerate(sorted(f.messages)) if u in gone]
+            for u in gone: del f.messages[u]
+        for s in reversed(seqs): self.send(f"* {s} EXPUNGE")
+        self.send(f"{tag} OK Expunge completed.")
+
+    def fetch(self, tag, f, sargs):
+        sset, _, items = sargs.partition(" ")
+        items = items.strip("()").upper()
+        with LOCK:
+            uids = parse_set(sset, f.messages)
+            rows = [(i, u, list(f.messages[u])) for i, u in enumerate(sorted(f.messages)) if u in uids]
+        for i, u, (flags, idate, raw) in rows:
+            parts = [f"UID {u}"]
+            if "FLAGS" in items: parts.append(f"FLAGS ({' '.join(flags)})")
+            if "INTERNALDATE" in items: parts.append(f'INTERNALDATE "{idate}"')
+            if "RFC822.SIZE" in items: parts.append(f"RFC822.SIZE {len(raw)}")
+            if "ENVELOPE" in items: parts.append("ENVELOPE " + envelope(raw))
+            head = f"* {i+1} FETCH (" + " ".join(parts)
+            sections = re.findall(r"BODY(?:\.PEEK)?\[([^\]]*)\](<0\.(\d+)>)?", items)
+            if sections:
+                self.write(head.encode())
+                for spec, partial, limit in sections:
+                    data = section_bytes(raw, spec)
+                    if partial: data = data[:int(limit)]
+                    self.write(f" BODY[{spec}]{'<0>' if partial else ''} {{{len(data)}}}\r\n".encode()); self.write(data)
+                self.send(")")
+            else:
+                self.send(head + ")")
+        self.send(f"{tag} OK Fetch completed.")
 
 class Smtp(socketserver.StreamRequestHandler):
     def send(self, s): self.wfile.write((s + "\r\n").encode())
@@ -226,7 +397,16 @@ class Smtp(socketserver.StreamRequestHandler):
                     if not chunk: return
                     data += chunk
                 print(f"SMTP received {len(data)} bytes, subject={header(data, 'Subject')!r}", flush=True)
+                with LOCK:
+                    drop = FAULTS["smtp_drop_after_data"]; FAULTS["smtp_drop_after_data"] = False
+                if drop:
+                    print("SMTP fault: dropping the connection without the 250 reply", flush=True)
+                    return
                 self.send("250 2.0.0 OK: queued as spike-1")
+            elif cmd == "XDROPAFTERDATA":
+                with LOCK: FAULTS["smtp_drop_after_data"] = True
+                print("SMTP control: XDROPAFTERDATA armed", flush=True)
+                self.send("250 XDROPAFTERDATA armed")
             elif cmd == "STARTTLS":
                 self.send("454 TLS not available")
             elif cmd == "QUIT":

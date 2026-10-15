@@ -388,6 +388,7 @@ impl MailWindow {
         let draft_id = d.id.clone();
         let outbox = d.state.is_outbox();
         let cancellable = matches!(d.state, DraftState::Queued | DraftState::Failed(_));
+        let undecided = matches!(d.state, DraftState::Uncertain);
         let preview: String = d.body_text.lines().find(|l| !l.trim().is_empty() && !l.starts_with('>')).unwrap_or("").chars().take(90).collect();
 
         div()
@@ -427,6 +428,19 @@ impl MailWindow {
                             .text_color(state_color)
                             .child(icon(if outbox { "clock" } else { "check" }).size(px(12.)).text_color(state_color))
                             .child(state)
+                            .when(undecided, |row| {
+                                let id = draft_id.clone();
+                                row.child(div().flex_1()).child(
+                                    Button::new(SharedString::from(format!("resend-{}", draft_id)))
+                                        .ghost()
+                                        .xsmall()
+                                        .label("Send again")
+                                        .on_click(cx.listener(move |this, _, window, cx| {
+                                            cx.stop_propagation();
+                                            this.resend_draft(id.clone(), window, cx);
+                                        })),
+                                )
+                            })
                             .when(cancellable, |row| {
                                 let id = draft_id.clone();
                                 row.child(div().flex_1()).child(

@@ -90,7 +90,7 @@ pub fn draft_state_label(state: &crate::model::DraftState) -> String {
         Editing => "Saved on this device".to_owned(),
         Queued => "Waiting for connection".to_owned(),
         Sending => "Sending…".to_owned(),
-        Uncertain => "Delivery uncertain. Checking before retrying.".to_owned(),
+        Uncertain => "Delivery uncertain: the server may have it. Send again or discard.".to_owned(),
         Failed(reason) => format!("Couldn’t send: {reason}"),
         Sent => "Sent".to_owned(),
     }
