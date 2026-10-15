@@ -1,7 +1,7 @@
 //! Server settings for an email address: Thunderbird's ISPDB, then a small preset table,
 //! then the common `mail.<domain>` guess.
 
-use overlook_core::{MailServers, Security, ServerEndpoint};
+use overlook_core::{MailServers, Security, ServerEndpoint, ServerProtocol};
 use std::time::Duration;
 
 /// Where the settings came from, for the dialog's explanation line.
@@ -25,17 +25,45 @@ pub struct Suggestion {
 
 pub const ISPDB_BASE: &str = "https://autoconfig.thunderbird.net/v1.1/";
 
-/// Looks the domain up, online then offline. Never fails: the worst case is the guess.
+/// Looks the domain up for an IMAP account, online then offline. Never fails: the worst
+/// case is the guess.
 pub fn lookup(email: &str) -> Suggestion {
+    lookup_for(ServerProtocol::Imap, email)
+}
+
+/// [`lookup`] for the given incoming protocol (IMAP or POP3).
+pub fn lookup_for(protocol: ServerProtocol, email: &str) -> Suggestion {
     let email = email.trim();
     let domain = email.rsplit('@').next().unwrap_or("").trim().to_ascii_lowercase();
-    if let Some(s) = preset(&domain, email) {
+    let preset = match protocol {
+        ServerProtocol::Pop3 => preset_pop3(&domain, email),
+        _ => preset(&domain, email),
+    };
+    if let Some(s) = preset {
         return s;
     }
-    if let Some(s) = ispdb(&domain, email) {
+    if let Some(s) = ispdb(protocol, &domain, email) {
         return s;
     }
-    guess(&domain, email)
+    guess_for(protocol, &domain, email)
+}
+
+/// POP3 settings for the providers that still offer POP3; most of the IMAP table do not.
+pub fn preset_pop3(domain: &str, email: &str) -> Option<Suggestion> {
+    const TABLE: &[(&[&str], &str, &str, u16, &str, u16, Security)] = &[
+        (&["fastmail.com", "fastmail.fm", "messagingengine.com", "fastmail.us", "fastmail.uk", "fastmail.de"], "Fastmail", "pop.fastmail.com", 995, "smtp.fastmail.com", 465, Security::Tls),
+        (&["yahoo.com", "ymail.com", "rocketmail.com", "yahoo.co.uk", "yahoo.ca", "yahoo.de", "yahoo.fr"], "Yahoo Mail", "pop.mail.yahoo.com", 995, "smtp.mail.yahoo.com", 465, Security::Tls),
+        (&["aol.com"], "AOL Mail", "pop.aol.com", 995, "smtp.aol.com", 465, Security::Tls),
+        (&["zoho.com", "zohomail.com", "zoho.eu", "zohomail.eu"], "Zoho Mail", "poppro.zoho.com", 995, "smtp.zoho.com", 465, Security::Tls),
+        (&["posteo.de", "posteo.net", "posteo.eu", "posteo.org", "posteo.ch", "posteo.at"], "Posteo", "posteo.de", 995, "posteo.de", 465, Security::Tls),
+        (&["mailbox.org"], "mailbox.org", "pop3.mailbox.org", 995, "smtp.mailbox.org", 465, Security::Tls),
+        (&["gmx.de", "gmx.net", "gmx.at", "gmx.ch", "gmx.com", "gmx.us"], "GMX", "pop.gmx.net", 995, "mail.gmx.net", 465, Security::Tls),
+        (&["web.de"], "WEB.DE", "pop3.web.de", 995, "smtp.web.de", 465, Security::Tls),
+        (&["gmail.com", "googlemail.com"], "Gmail over POP3 (needs an app password and POP enabled in Gmail)", "pop.gmail.com", 995, "smtp.gmail.com", 465, Security::Tls),
+    ];
+    let row = TABLE.iter().find(|(domains, ..)| domains.iter().any(|d| *d == domain))?;
+    let (_, provider, ih, ip, sh, sp, ssec) = *row;
+    Some(Suggestion { servers: servers(ih, ip, Security::Tls, sh, sp, ssec, email), source: Source::Preset, provider: Some(provider.to_owned()) })
 }
 
 /// The built-in table alone (no network), for tests and the offline path.
@@ -62,15 +90,21 @@ pub fn preset(domain: &str, email: &str) -> Option<Suggestion> {
 }
 
 pub fn guess(domain: &str, email: &str) -> Suggestion {
+    guess_for(ServerProtocol::Imap, domain, email)
+}
+
+/// The `mail.<domain>` convention with the protocol's implicit-TLS port.
+pub fn guess_for(protocol: ServerProtocol, domain: &str, email: &str) -> Suggestion {
     let host = if domain.is_empty() { String::new() } else { format!("mail.{domain}") };
-    Suggestion { servers: servers(&host, 993, Security::Tls, &host, 587, Security::StartTls, email), source: Source::Guess, provider: None }
+    let port = if protocol == ServerProtocol::Pop3 { 995 } else { 993 };
+    Suggestion { servers: servers(&host, port, Security::Tls, &host, 587, Security::StartTls, email), source: Source::Guess, provider: None }
 }
 
 fn servers(ih: &str, ip: u16, isec: Security, sh: &str, sp: u16, ssec: Security, email: &str) -> MailServers {
     MailServers { incoming: ServerEndpoint::new(ih, ip, isec, email), outgoing: ServerEndpoint::new(sh, sp, ssec, email), pop3: None, imap: None }
 }
 
-fn ispdb(domain: &str, email: &str) -> Option<Suggestion> {
+fn ispdb(protocol: ServerProtocol, domain: &str, email: &str) -> Option<Suggestion> {
     if domain.is_empty() || !domain.contains('.') {
         return None;
     }
@@ -80,14 +114,21 @@ fn ispdb(domain: &str, email: &str) -> Option<Suggestion> {
         return None;
     }
     let body = response.body_mut().read_to_string().ok()?;
-    parse_ispdb(&body, email)
+    parse_ispdb_for(protocol, &body, email)
 }
 
-/// Reads the ISPDB XML. The format is small and regular, so a tag scanner is enough: the
-/// first `incomingServer type="imap"` and the first `outgoingServer` win.
+/// Reads the ISPDB XML for an IMAP account. The format is small and regular, so a tag
+/// scanner is enough: the first `incomingServer type="imap"` and the first
+/// `outgoingServer` win.
 pub fn parse_ispdb(xml: &str, email: &str) -> Option<Suggestion> {
+    parse_ispdb_for(ServerProtocol::Imap, xml, email)
+}
+
+/// [`parse_ispdb`] for the given incoming protocol (`type="imap"` or `type="pop3"`).
+pub fn parse_ispdb_for(protocol: ServerProtocol, xml: &str, email: &str) -> Option<Suggestion> {
+    let wanted = if protocol == ServerProtocol::Pop3 { "type=\"pop3\"" } else { "type=\"imap\"" };
     let provider = text_in(xml, "displayName").map(|s| s.trim().to_owned()).filter(|s| !s.is_empty());
-    let incoming_xml = elements(xml, "incomingServer").into_iter().find(|(attrs, _)| attrs.contains("type=\"imap\""))?.1;
+    let incoming_xml = elements(xml, "incomingServer").into_iter().find(|(attrs, _)| attrs.contains(wanted))?.1;
     let outgoing_xml = elements(xml, "outgoingServer").into_iter().next()?.1;
     let endpoint = |block: &str, default_port: u16| -> Option<ServerEndpoint> {
         let host = text_in(block, "hostname")?.trim().to_owned();
@@ -105,7 +146,7 @@ pub fn parse_ispdb(xml: &str, email: &str) -> Option<Suggestion> {
         };
         Some(ServerEndpoint::new(host, port, security, username))
     };
-    let incoming = endpoint(&incoming_xml, 993)?;
+    let incoming = endpoint(&incoming_xml, if protocol == ServerProtocol::Pop3 { 995 } else { 993 })?;
     let outgoing = endpoint(&outgoing_xml, 587)?;
     if incoming.is_insecure_remote() || outgoing.is_insecure_remote() {
         return None;
@@ -185,6 +226,13 @@ mod tests {
         assert_eq!(s.provider.as_deref(), Some("Example & Co"));
         assert_eq!((s.servers.incoming.host.as_str(), s.servers.incoming.port, s.servers.incoming.security, s.servers.incoming.username.as_str()), ("imap.example.com", 143, Security::StartTls, "jason"));
         assert_eq!((s.servers.outgoing.host.as_str(), s.servers.outgoing.port, s.servers.outgoing.security, s.servers.outgoing.username.as_str()), ("smtp.example.com", 465, Security::Tls, "jason@example.com"));
+        let pop = parse_ispdb_for(ServerProtocol::Pop3, xml, "jason@example.com").unwrap();
+        assert_eq!((pop.servers.incoming.host.as_str(), pop.servers.incoming.port, pop.servers.incoming.security, pop.servers.incoming.username.as_str()), ("pop.example.com", 995, Security::Tls, "jason@example.com"));
+        assert_eq!(pop.servers.outgoing.host, "smtp.example.com");
+        assert!(parse_ispdb_for(ServerProtocol::Pop3, &xml.replace("type=\"pop3\"", "type=\"exchange\""), "j@example.com").is_none());
+        assert_eq!(preset_pop3("gmx.net", "x@gmx.net").unwrap().servers.incoming.host, "pop.gmx.net");
+        assert!(preset_pop3("icloud.com", "x@icloud.com").is_none(), "iCloud has no POP3");
+        assert_eq!(guess_for(ServerProtocol::Pop3, "example.com", "x@example.com").servers.incoming.port, 995);
         assert!(parse_ispdb("<clientConfig/>", "x@y.z").is_none());
         let plain = xml.replace("<socketType>STARTTLS</socketType>", "<socketType>plain</socketType>");
         assert!(parse_ispdb(&plain, "jason@example.com").is_none(), "plaintext to a remote host is never suggested");

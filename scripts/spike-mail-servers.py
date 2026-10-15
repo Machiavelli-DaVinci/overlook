@@ -1,5 +1,6 @@
 #!/usr/bin/env python3
-"""Scripted plaintext IMAP (port 1143) and SMTP (port 2525) servers for the Overlook IMAP work.
+"""Scripted plaintext IMAP (port 1143), POP3 (port 1110) and SMTP (port 2525) servers for the
+Overlook IMAP/POP3 work.
 
 Not a real server: it answers the commands the provider issues with Dovecot-shaped responses
 from an in-memory mailbox. User: spike / password: secret.
@@ -22,10 +23,15 @@ Fault injection, for the exit-criterion run (any connection, no login needed):
 SMTP:
   XDROPAFTERDATA             the next DATA body is read, then the connection closes
                              without the 250 reply (an uncertain send)
+
+POP3 (M4) serves the INBOX folder's messages as a maildrop (UIDL "uidl-<uid>"): CAPA, USER,
+PASS, STAT, LIST, UIDL, TOP, RETR, DELE, RSET, NOOP, QUIT, with DELE committed on QUIT and
+discarded otherwise. STLS is refused. XDROPAFTER / XFAILNEXT / XSTATE work there too; a
+POP3 DELE + QUIT removes the message from INBOX for the IMAP side as well.
 """
 import base64, email, email.policy, re, socketserver, threading, time
 
-IMAP_PORT, SMTP_PORT = 1143, 2525
+IMAP_PORT, POP3_PORT, SMTP_PORT = 1143, 1110, 2525
 USER, PASSWORD = "spike", "secret"
 CAPS = "IMAP4rev1 UIDPLUS MOVE IDLE SPECIAL-USE LITERAL+ ENABLE"
 
@@ -416,15 +422,120 @@ class Smtp(socketserver.StreamRequestHandler):
             else:
                 self.send("502 5.5.2 Command not implemented")
 
+class Pop3(socketserver.StreamRequestHandler):
+    """RFC 1939 over the INBOX folder. Message numbers are positions in the UID order of the
+    messages present at login (a maildrop is frozen for the session)."""
+    muted = False
+    def send(self, s):
+        if not self.muted: self.wfile.write((s + "\r\n").encode())
+    def body(self, raw):
+        if self.muted: return
+        out = b""
+        for line in raw.splitlines(keepends=True):
+            out += (b"." if line.startswith(b".") else b"") + line
+        if not out.endswith(b"\n"): out += b"\r\n"
+        self.wfile.write(out + b".\r\n")
+    def handle(self):
+        self.send("+OK Spike POP3 ready.")
+        user, authed, uids, marked = None, False, [], set()
+        while True:
+            line = self.rfile.readline()
+            if not line: return
+            text = line.decode(errors="replace").rstrip("\r\n")
+            cmd, _, args = text.partition(" ")
+            cmd = cmd.upper()
+            print("POP3 <", "PASS ****" if cmd == "PASS" else text, flush=True)
+            if cmd.startswith("X"):
+                if cmd == "XSTATE":
+                    with LOCK:
+                        for p, f in FOLDERS.items(): print(f"  {p}: {sorted(f.messages)}", flush=True)
+                    self.send("+OK printed"); continue
+                if cmd == "XDROPAFTER":
+                    w, _, n = args.partition(" ")
+                    with LOCK: FAULTS["drop_after"], FAULTS["drop_count"] = w.upper(), int(n or 1)
+                    self.send("+OK armed"); continue
+                if cmd == "XFAILNEXT":
+                    w, _, reply = args.partition(" ")
+                    with LOCK: FAULTS["fail_next"] = (w.upper(), reply)
+                    self.send("+OK armed"); continue
+                self.send("-ERR unknown control"); continue
+            kind, reply = fault_check(text)
+            if kind == "fail":
+                print(f"POP3 fault: answering -ERR {reply}", flush=True)
+                self.send(f"-ERR {reply}"); continue
+            if kind == "drop":
+                print("POP3 fault: executing, then dropping the connection without a reply", flush=True)
+                self.muted = True
+            if not authed and cmd not in ("USER", "PASS", "CAPA", "QUIT", "STLS"):
+                self.send("-ERR [AUTH] Unauthenticated")
+            elif cmd == "CAPA":
+                self.send("+OK"); self.body(b"TOP\r\nUIDL\r\nUSER\r\nPIPELINING\r\n")
+            elif cmd == "STLS":
+                self.send("-ERR STLS is not offered by the fake server")
+            elif cmd == "USER":
+                user = args; self.send("+OK")
+            elif cmd == "PASS":
+                if (user, args) == (USER, PASSWORD):
+                    authed = True
+                    with LOCK: uids = sorted(FOLDERS["INBOX"].messages)
+                    self.send(f"+OK Logged in. {len(uids)} messages")
+                else:
+                    self.send("-ERR [AUTH] Authentication failed.")
+            elif cmd in ("NOOP",):
+                self.send("+OK")
+            elif cmd == "RSET":
+                marked.clear(); self.send("+OK")
+            elif cmd in ("STAT", "LIST", "UIDL"):
+                with LOCK:
+                    rows = [(i + 1, u, len(FOLDERS["INBOX"].messages[u][2])) for i, u in enumerate(uids)
+                            if (i + 1) not in marked and u in FOLDERS["INBOX"].messages]
+                if cmd == "STAT":
+                    self.send(f"+OK {len(rows)} {sum(r[2] for r in rows)}")
+                else:
+                    fmt = (lambda r: f"{r[0]} {r[2]}") if cmd == "LIST" else (lambda r: f"{r[0]} uidl-{r[1]}")
+                    if args.strip():
+                        hit = [r for r in rows if str(r[0]) == args.strip()]
+                        self.send(f"+OK {fmt(hit[0])}" if hit else "-ERR no such message")
+                    else:
+                        self.send(f"+OK {len(rows)} messages"); self.body("".join(fmt(r) + "\r\n" for r in rows).encode())
+            elif cmd in ("RETR", "TOP"):
+                parts = args.split()
+                n = int(parts[0]) if parts and parts[0].isdigit() else 0
+                lines = int(parts[1]) if cmd == "TOP" and len(parts) > 1 and parts[1].isdigit() else 0
+                with LOCK:
+                    raw = FOLDERS["INBOX"].messages.get(uids[n - 1])[2] if 0 < n <= len(uids) and n not in marked and uids[n - 1] in FOLDERS["INBOX"].messages else None
+                if raw is None:
+                    self.send("-ERR no such message"); continue
+                if cmd == "TOP":
+                    head, _, body = raw.partition(b"\r\n\r\n")
+                    raw = head + b"\r\n\r\n" + b"".join(body.splitlines(keepends=True)[:lines])
+                self.send(f"+OK {len(raw)} octets"); self.body(raw)
+            elif cmd == "DELE":
+                n = int(args) if args.strip().isdigit() else 0
+                if 0 < n <= len(uids) and n not in marked:
+                    marked.add(n); self.send(f"+OK message {n} deleted")
+                else:
+                    self.send("-ERR no such message")
+            elif cmd == "QUIT":
+                if authed:
+                    with LOCK:
+                        for n in marked: FOLDERS["INBOX"].messages.pop(uids[n - 1], None)
+                    if marked: print(f"POP3 committed {len(marked)} deletion(s)", flush=True)
+                self.send("+OK Logging out."); return
+            else:
+                self.send("-ERR Unknown command")
+            if self.muted: return
+
 class Server(socketserver.ThreadingTCPServer):
     allow_reuse_address = True
     daemon_threads = True
 
 if __name__ == "__main__":
-    imap = Server(("127.0.0.1", IMAP_PORT), Imap); smtp = Server(("127.0.0.1", SMTP_PORT), Smtp)
+    imap = Server(("127.0.0.1", IMAP_PORT), Imap); pop3 = Server(("127.0.0.1", POP3_PORT), Pop3); smtp = Server(("127.0.0.1", SMTP_PORT), Smtp)
     threading.Thread(target=imap.serve_forever, daemon=True).start()
+    threading.Thread(target=pop3.serve_forever, daemon=True).start()
     threading.Thread(target=smtp.serve_forever, daemon=True).start()
-    print(f"fake IMAP on 127.0.0.1:{IMAP_PORT}, fake SMTP on 127.0.0.1:{SMTP_PORT}; user {USER}", flush=True)
+    print(f"fake IMAP on 127.0.0.1:{IMAP_PORT}, fake POP3 on 127.0.0.1:{POP3_PORT}, fake SMTP on 127.0.0.1:{SMTP_PORT}; user {USER}", flush=True)
     try:
         while True: time.sleep(3600)
     except KeyboardInterrupt:

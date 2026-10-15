@@ -324,6 +324,8 @@ pub struct MailWindow {
     inbox_tab: FocusTab,
     /// Attachments being fetched right now.
     downloading: HashSet<AttachmentId>,
+    /// "Back up mail…" is copying the profile.
+    pub(crate) backing_up: bool,
     attachments_dir: PathBuf,
 
     // Calendar module state.
@@ -497,6 +499,7 @@ impl MailWindow {
             focused_enabled,
             inbox_tab: FocusTab::Focused,
             downloading: HashSet::new(),
+            backing_up: false,
             attachments_dir,
             module: startup_module,
             cal_view: CalView::Week,
@@ -565,6 +568,7 @@ impl MailWindow {
         match std::env::var("OVERLOOK_SIGN_IN").as_deref() {
             Ok("gmail") => this.start_google_sign_in(None, window, cx),
             Ok("imap") => this.open_account_setup(ProviderKind::Imap, SetupMode::New, window, cx),
+            Ok("pop3") => this.open_account_setup(ProviderKind::Pop3, SetupMode::New, window, cx),
             _ => {}
         }
 

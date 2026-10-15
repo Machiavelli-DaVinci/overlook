@@ -11,6 +11,7 @@ pub mod gmail;
 pub mod imap;
 pub mod mime;
 pub mod outgoing;
+pub mod pop3;
 pub mod sample;
 pub mod smtp;
 

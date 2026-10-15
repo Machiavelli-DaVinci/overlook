@@ -1,4 +1,4 @@
-//! Account setup for IMAP (and, later, POP3) accounts: name, address and password first,
+//! Account setup for IMAP and POP3 accounts: name, address and password first,
 //! then server settings found through autoconfiguration, with an Advanced page that is
 //! always reachable, a "Test connection" that probes both servers off the UI thread, and a
 //! save path that mirrors the Google sign-in's tail (account row, server settings, keyring,
@@ -27,6 +27,7 @@ use overlook_core::time::now;
 use overlook_core::*;
 use overlook_provider::autoconfig::{self, Source, Suggestion};
 use overlook_provider::imap::ImapProvider;
+use overlook_provider::pop3::Pop3Provider;
 use overlook_provider::{smtp, MailProvider, ProviderError};
 use std::time::Duration;
 
@@ -62,6 +63,13 @@ pub struct AccountSetup {
     pub out_security: Security,
     pub same_password: bool,
     pub out_password: Entity<InputState>,
+    /// POP3 retention: keep messages on the server after downloading them.
+    pub leave_on_server: bool,
+    /// POP3 retention: with `leave_on_server`, delete server copies after this many days
+    /// (empty: never).
+    pub delete_after_days: Entity<InputState>,
+    /// POP3 retention: delete the server copy when a message is moved to Trash.
+    pub delete_when_trashed: bool,
     /// What the background task is doing, while it runs.
     pub busy: Option<&'static str>,
     /// Where the server settings came from.
@@ -78,6 +86,20 @@ impl AccountSetup {
         match &self.mode {
             SetupMode::New => None,
             SetupMode::Edit(id) | SetupMode::UpdatePassword(id) => Some(id),
+        }
+    }
+
+    fn incoming_protocol(&self) -> ServerProtocol {
+        match self.kind {
+            ProviderKind::Pop3 => ServerProtocol::Pop3,
+            _ => ServerProtocol::Imap,
+        }
+    }
+
+    fn incoming_name(&self) -> &'static str {
+        match self.kind {
+            ProviderKind::Pop3 => "POP3",
+            _ => "IMAP",
         }
     }
 }
@@ -103,11 +125,8 @@ fn probe_line(what: &str, endpoint: &ServerEndpoint, result: Result<(), Provider
 
 impl MailWindow {
     pub(crate) fn open_account_setup(&mut self, kind: ProviderKind, mode: SetupMode, window: &mut Window, cx: &mut Context<Self>) {
-        if kind == ProviderKind::Pop3 {
-            window.push_notification(Notification::info("POP3 accounts are coming in a later release. IMAP works today."), cx);
-            return;
-        }
         let existing = mode.clone();
+        let protocol = if kind == ProviderKind::Pop3 { ServerProtocol::Pop3 } else { ServerProtocol::Imap };
         let (account, servers) = match &existing {
             SetupMode::New => (None, None),
             SetupMode::Edit(id) | SetupMode::UpdatePassword(id) => (self.accounts.iter().find(|a| &a.id == id).cloned(), self.store.servers(id).ok().flatten()),
@@ -121,12 +140,14 @@ impl MailWindow {
         let outgoing = servers.as_ref().map(|s| s.outgoing.clone());
         let in_security = incoming.as_ref().map(|e| e.security).unwrap_or(Security::Tls);
         let out_security = outgoing.as_ref().map(|e| e.security).unwrap_or(Security::StartTls);
-        let in_host = field(cx, "imap.example.com", incoming.as_ref().map(|e| e.host.clone()).unwrap_or_default());
-        let in_port = field(cx, "993", incoming.as_ref().map(|e| e.port.to_string()).unwrap_or_else(|| ServerProtocol::Imap.default_port(in_security).to_string()));
+        let in_host = field(cx, if protocol == ServerProtocol::Pop3 { "pop.example.com" } else { "imap.example.com" }, incoming.as_ref().map(|e| e.host.clone()).unwrap_or_default());
+        let in_port = field(cx, if protocol == ServerProtocol::Pop3 { "995" } else { "993" }, incoming.as_ref().map(|e| e.port.to_string()).unwrap_or_else(|| protocol.default_port(in_security).to_string()));
         let in_user = field(cx, "Usually your email address", incoming.as_ref().map(|e| e.username.clone()).unwrap_or_else(|| email_value.clone()));
         let out_host = field(cx, "smtp.example.com", outgoing.as_ref().map(|e| e.host.clone()).unwrap_or_default());
         let out_port = field(cx, "587", outgoing.as_ref().map(|e| e.port.to_string()).unwrap_or_else(|| ServerProtocol::Smtp.default_port(out_security).to_string()));
         let out_user = field(cx, "Usually your email address", outgoing.as_ref().map(|e| e.username.clone()).unwrap_or_else(|| email_value.clone()));
+        let policy = servers.as_ref().and_then(|s| s.pop3.clone()).unwrap_or_default();
+        let delete_after_days = field(cx, "never", policy.delete_after_days.map(|d| d.to_string()).unwrap_or_default());
         let out_password = cx.new(|cx| InputState::new(window, cx).placeholder("Outgoing server password").masked(true));
         let same_password = match account.as_ref() {
             Some(a) => !matches!(credentials::load_password(&a.id, credentials::KIND_PASSWORD_OUTGOING), Ok(Some(_))),
@@ -156,6 +177,9 @@ impl MailWindow {
             out_security,
             same_password,
             out_password,
+            leave_on_server: policy.leave_on_server,
+            delete_after_days,
+            delete_when_trashed: policy.delete_on_server_when_trashed,
             busy: None,
             note: None,
             error: None,
@@ -196,8 +220,9 @@ impl MailWindow {
         setup.generation += 1;
         let generation = setup.generation;
         cx.notify();
+        let protocol = setup.incoming_protocol();
         cx.spawn_in(window, async move |this, cx| {
-            let suggestion = cx.background_spawn(async move { autoconfig::lookup(&email) }).await;
+            let suggestion = cx.background_spawn(async move { autoconfig::lookup_for(protocol, &email) }).await;
             let _ = this.update_in(cx, |this, window, cx| {
                 let Some(setup) = this.account_setup.as_mut() else { return };
                 if setup.generation != generation {
@@ -214,7 +239,8 @@ impl MailWindow {
     fn setup_manual(&mut self, window: &mut Window, cx: &mut Context<Self>) {
         let email = self.setup_value(cx, |s| &s.email).to_lowercase();
         let domain = email.rsplit('@').next().unwrap_or("").to_owned();
-        let suggestion = autoconfig::guess(&domain, &email);
+        let protocol = self.account_setup.as_ref().map(|s| s.incoming_protocol()).unwrap_or(ServerProtocol::Imap);
+        let suggestion = autoconfig::guess_for(protocol, &domain, &email);
         self.apply_suggestion(suggestion, window, cx);
     }
 
@@ -250,7 +276,8 @@ impl MailWindow {
 
     fn setup_set_security(&mut self, incoming: bool, security: Security, window: &mut Window, cx: &mut Context<Self>) {
         let Some(setup) = self.account_setup.as_mut() else { return };
-        let (protocol, port_input, current) = if incoming { (ServerProtocol::Imap, setup.in_port.clone(), &mut setup.in_security) } else { (ServerProtocol::Smtp, setup.out_port.clone(), &mut setup.out_security) };
+        let incoming_protocol = setup.incoming_protocol();
+        let (protocol, port_input, current) = if incoming { (incoming_protocol, setup.in_port.clone(), &mut setup.in_security) } else { (ServerProtocol::Smtp, setup.out_port.clone(), &mut setup.out_security) };
         let previous_default = protocol.default_port(*current).to_string();
         *current = security;
         let next_default = protocol.default_port(security).to_string();
@@ -265,6 +292,20 @@ impl MailWindow {
     fn setup_toggle_same_password(&mut self, same: bool, cx: &mut Context<Self>) {
         if let Some(setup) = self.account_setup.as_mut() {
             setup.same_password = same;
+        }
+        cx.notify();
+    }
+
+    fn setup_toggle_leave_on_server(&mut self, leave: bool, cx: &mut Context<Self>) {
+        if let Some(setup) = self.account_setup.as_mut() {
+            setup.leave_on_server = leave;
+        }
+        cx.notify();
+    }
+
+    fn setup_toggle_delete_when_trashed(&mut self, delete: bool, cx: &mut Context<Self>) {
+        if let Some(setup) = self.account_setup.as_mut() {
+            setup.delete_when_trashed = delete;
         }
         cx.notify();
     }
@@ -313,8 +354,20 @@ impl MailWindow {
         if !setup.same_password && out_password.is_none() && !matches!(setup.mode, SetupMode::Edit(_)) {
             return Err("Enter the outgoing server’s password, or use the same password for both.".into());
         }
-        let existing_policy = setup.account_id().and_then(|id| self.store.servers(id).ok().flatten()).and_then(|s| s.imap);
-        Ok((MailServers { incoming, outgoing, pop3: None, imap: existing_policy }, password, out_password))
+        let existing = setup.account_id().and_then(|id| self.store.servers(id).ok().flatten());
+        let (pop3, imap) = match setup.kind {
+            ProviderKind::Pop3 => {
+                let days = value(&setup.delete_after_days);
+                let delete_after_days = if days.is_empty() || days.eq_ignore_ascii_case("never") {
+                    None
+                } else {
+                    Some(days.parse::<u32>().map_err(|_| "“Delete from the server after” must be a number of days, or empty for never.".to_owned())?)
+                };
+                (Some(Pop3Policy { leave_on_server: setup.leave_on_server, delete_after_days: if setup.leave_on_server { delete_after_days } else { None }, delete_on_server_when_trashed: setup.delete_when_trashed }), None)
+            }
+            _ => (None, existing.and_then(|s| s.imap)),
+        };
+        Ok((MailServers { incoming, outgoing, pop3, imap }, password, out_password))
     }
 
     /// The passwords to use: typed ones, or the saved ones in edit mode.
@@ -354,15 +407,22 @@ impl MailWindow {
         setup.busy = Some("Testing the connection…");
         setup.generation += 1;
         let generation = setup.generation;
+        let kind = setup.kind;
         cx.notify();
         cx.spawn_in(window, async move |this, cx| {
             let lines = cx
                 .background_spawn(async move {
-                    let imap = ImapProvider::new(servers.clone(), password.clone()).with_timeout(PROBE_TIMEOUT);
-                    let incoming = pollster_block(imap.probe());
-                    imap.disconnect();
+                    let (what, incoming) = if kind == ProviderKind::Pop3 {
+                        let pop3 = Pop3Provider::new(servers.clone(), password.clone(), std::env::temp_dir()).with_timeout(PROBE_TIMEOUT);
+                        ("Incoming (POP3)", pollster_block(pop3.probe()))
+                    } else {
+                        let imap = ImapProvider::new(servers.clone(), password.clone()).with_timeout(PROBE_TIMEOUT);
+                        let result = pollster_block(imap.probe());
+                        imap.disconnect();
+                        ("Incoming (IMAP)", result)
+                    };
                     let outgoing = smtp::Transport::new(servers.outgoing.clone(), out_password.unwrap_or(password)).with_timeout(PROBE_TIMEOUT).probe();
-                    vec![probe_line("Incoming (IMAP)", &servers.incoming, incoming), probe_line("Outgoing (SMTP)", &servers.outgoing, outgoing)]
+                    vec![probe_line(what, &servers.incoming, incoming), probe_line("Outgoing (SMTP)", &servers.outgoing, outgoing)]
                 })
                 .await;
             let _ = this.update_in(cx, |this, _window, cx| {
@@ -439,7 +499,11 @@ impl MailWindow {
             window.push_notification(Notification::warning(format!("The outgoing password could not be saved: {e}")), cx);
         }
         // A fresh provider drops any connection made with the old settings.
-        self.providers.insert(account.id.clone(), providers::imap_providers(servers, password, out_password.clone()));
+        let bundle = match kind {
+            ProviderKind::Pop3 => providers::pop3_providers(&account.id, servers, password, out_password.clone()),
+            _ => providers::imap_providers(servers, password, out_password.clone()),
+        };
+        self.providers.insert(account.id.clone(), bundle);
         self.provider_issues.remove(&account.id);
         let _ = self.store.set_sync_state(&account.id, &SyncState::Syncing, None);
         self.accounts = self.store.accounts().unwrap_or_default();
@@ -485,8 +549,9 @@ impl MailWindow {
         let Some(setup) = self.account_setup.as_ref() else { return div().into_any_element() };
         let busy = setup.busy;
         let field = |label: &str, input: AnyElement| v_flex().gap(px(4.)).child(div().text_size(px(11.)).font_weight(FontWeight::MEDIUM).text_color(p.muted).child(label.to_owned())).child(input);
+        let is_pop3 = setup.kind == ProviderKind::Pop3;
         let title = match (&setup.mode, setup.step) {
-            (SetupMode::New, SetupStep::Basics) => "Add an IMAP account".to_owned(),
+            (SetupMode::New, SetupStep::Basics) => format!("Add {} account", if is_pop3 { "a POP3" } else { "an IMAP" }),
             (SetupMode::New, SetupStep::Servers) => "Server settings".to_owned(),
             (SetupMode::Edit(_), _) => "Server settings".to_owned(),
             (SetupMode::UpdatePassword(_), _) => "Update password".to_owned(),
@@ -495,7 +560,11 @@ impl MailWindow {
         let body: AnyElement = match setup.step {
             SetupStep::Basics => v_flex()
                 .gap(px(12.))
-                .child(div().text_size(px(13.)).text_color(p.muted).child("Overlook reads mail over IMAP and sends it over SMTP. Your password is kept in the system keyring and never written to disk by Overlook."))
+                .child(div().text_size(px(13.)).text_color(p.muted).child(if is_pop3 {
+                    "Overlook downloads mail over POP3 and sends it over SMTP. Downloaded messages are kept on this device as the only copy, so back them up from Settings → About. Your password is kept in the system keyring and never written to disk by Overlook."
+                } else {
+                    "Overlook reads mail over IMAP and sends it over SMTP. Your password is kept in the system keyring and never written to disk by Overlook."
+                }))
                 .child(field("Your name", Input::new(&setup.name).into_any_element()))
                 .child(field("Email address", Input::new(&setup.email).into_any_element()))
                 .child(field("Password", Input::new(&setup.password).into_any_element()))
@@ -509,7 +578,7 @@ impl MailWindow {
                         .child(divider(&p))
                 })
                 .children(setup.note.clone().map(|n| div().text_size(px(12.)).text_color(p.muted).child(n)))
-                .child(div().text_size(px(13.)).font_weight(FontWeight::SEMIBOLD).child("Incoming (IMAP)"))
+                .child(div().text_size(px(13.)).font_weight(FontWeight::SEMIBOLD).child(format!("Incoming ({})", setup.incoming_name())))
                 .child(h_flex().gap(px(10.)).child(div().flex_1().child(field("Host", Input::new(&setup.in_host).into_any_element()))).child(div().w(px(90.)).child(field("Port", Input::new(&setup.in_port).into_any_element()))).child(field("Security", self.security_picker("setup-in-security", true, setup.in_security, cx))))
                 .child(field("User name", Input::new(&setup.in_user).into_any_element()))
                 .child(div().text_size(px(13.)).font_weight(FontWeight::SEMIBOLD).pt(px(6.)).child("Outgoing (SMTP)"))
@@ -517,6 +586,22 @@ impl MailWindow {
                 .child(field("User name", Input::new(&setup.out_user).into_any_element()))
                 .child(h_flex().items_center().gap(px(10.)).child(Switch::new("setup-same-password").checked(setup.same_password).label("Use the same password for sending").on_click(cx.listener(|this, checked: &bool, _w, cx| this.setup_toggle_same_password(*checked, cx)))))
                 .when(!setup.same_password, |d| d.child(field("Outgoing password", Input::new(&setup.out_password).into_any_element())))
+                .when(is_pop3, |d| {
+                    d.child(div().text_size(px(13.)).font_weight(FontWeight::SEMIBOLD).pt(px(6.)).child("On the server"))
+                        .child(h_flex().items_center().gap(px(10.)).child(Switch::new("setup-leave-on-server").checked(setup.leave_on_server).label("Leave messages on the server after downloading").on_click(cx.listener(|this, checked: &bool, _w, cx| this.setup_toggle_leave_on_server(*checked, cx)))))
+                        .when(setup.leave_on_server, |d| {
+                            d.child(
+                                h_flex()
+                                    .items_center()
+                                    .gap(px(10.))
+                                    .child(div().text_size(px(13.)).child("Delete from the server after"))
+                                    .child(div().w(px(90.)).child(Input::new(&setup.delete_after_days).into_any_element()))
+                                    .child(div().text_size(px(13.)).text_color(p.muted).child("days (empty: never)")),
+                            )
+                        })
+                        .when(!setup.leave_on_server, |d| d.child(div().text_size(px(12.)).text_color(p.muted).child("Each message is deleted from the server once its download is saved here.")))
+                        .child(h_flex().items_center().gap(px(10.)).child(Switch::new("setup-delete-when-trashed").checked(setup.delete_when_trashed).label("Also delete from the server when a message is moved to Trash").on_click(cx.listener(|this, checked: &bool, _w, cx| this.setup_toggle_delete_when_trashed(*checked, cx)))))
+                })
                 .children(setup.test_result.iter().map(|(ok, line)| {
                     h_flex()
                         .items_start()

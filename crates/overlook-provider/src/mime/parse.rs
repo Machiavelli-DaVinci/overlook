@@ -113,6 +113,28 @@ pub fn headers_from_rfc822(account: &Account, bytes: &[u8], local_id: MessageId,
     m
 }
 
+/// The decoded bytes of the part at IMAP-style section `path` (`1`, `2.1`, …) of a raw
+/// message, numbered as [`message_from_rfc822`] numbers attachments. A forwarded
+/// `message/rfc822` part yields the nested message's bytes. `None` when there is no such
+/// part. Lets POP3 (and anything holding the whole message) serve attachments from disk.
+pub fn part_bytes(bytes: &[u8], path: &str) -> Option<Vec<u8>> {
+    let parsed = MessageParser::default().parse(bytes)?;
+    let mut id = 0u32;
+    if path != "1" || matches!(parsed.parts.first().map(|p| &p.body), Some(PartType::Multipart(_))) {
+        for index in path.split('.') {
+            let n: usize = index.parse().ok()?;
+            let PartType::Multipart(children) = &parsed.parts.get(id as usize)?.body else { return None };
+            id = *children.get(n.checked_sub(1)?)?;
+        }
+    }
+    Some(match &parsed.parts.get(id as usize)?.body {
+        PartType::Binary(b) | PartType::InlineBinary(b) => b.to_vec(),
+        PartType::Text(t) | PartType::Html(t) => t.as_bytes().to_vec(),
+        PartType::Message(m) => m.raw_message.to_vec(),
+        PartType::Multipart(_) => return None,
+    })
+}
+
 fn addresses(list: Option<&mail_parser::Address<'_>>) -> Vec<Address> {
     let mut out = Vec::new();
     if let Some(list) = list {
@@ -471,5 +493,20 @@ Content-Disposition: attachment; filename*=UTF-8''r%C3%A9sum%C3%A9.pdf
         // A header line without any line ending is not a header; the bytes are still shown.
         let unterminated = message_from_rfc822(&acct, b"Subject: Only a subject", MessageId::from("s2"), &f);
         assert!(unterminated.snippet.contains("Only a subject"), "{unterminated:?}");
+    }
+
+    #[test]
+    fn part_bytes_follow_attachment_section_paths() {
+        let account = account();
+        let raw = b"From: a@example.com\r\nTo: b@example.com\r\nSubject: parts\r\nMIME-Version: 1.0\r\nContent-Type: multipart/mixed; boundary=\"outer\"\r\n\r\n--outer\r\nContent-Type: multipart/alternative; boundary=\"inner\"\r\n\r\n--inner\r\nContent-Type: text/plain\r\n\r\nText.\r\n--inner\r\nContent-Type: text/html\r\n\r\n<p>Html</p>\r\n--inner--\r\n--outer\r\nContent-Type: application/pdf; name=\"r.pdf\"\r\nContent-Disposition: attachment; filename=\"r.pdf\"\r\nContent-Transfer-Encoding: base64\r\n\r\nJVBERi0xLjQK\r\n--outer--\r\n";
+        let m = message_from_rfc822(&account, raw, MessageId::from("m"), &MessageFlags::default());
+        let section = m.attachments[0].provider_id.as_ref().unwrap().0.clone();
+        assert_eq!(section, "2");
+        assert_eq!(part_bytes(raw, &section).unwrap(), b"%PDF-1.4\n");
+        assert_eq!(part_bytes(raw, "1.1").unwrap(), b"Text.", "mail-parser trims the boundary CRLF");
+        assert!(part_bytes(raw, "1").is_none(), "a multipart container has no bytes of its own");
+        assert!(part_bytes(raw, "7").is_none());
+        let plain = b"From: a@example.com\r\nSubject: p\r\nContent-Type: text/plain\r\n\r\nHello\r\n";
+        assert_eq!(part_bytes(plain, "1").unwrap(), b"Hello\r\n");
     }
 }

@@ -164,6 +164,20 @@ pub struct ImapFolder {
     pub subscribed: bool,
 }
 
+/// One row of the store's `pop3_seen` ledger, mirrored from the POP3 provider's checkpoint
+/// after each cycle: every UIDL ever listed for the account, so a message that reappears on
+/// the server or was deleted there is never downloaded twice or lost locally. The
+/// checkpoint stays authoritative.
+#[derive(Clone, Debug, PartialEq, Eq, Serialize, Deserialize, Default)]
+#[serde(default)]
+pub struct Pop3Seen {
+    pub uidl: String,
+    /// When the UIDL was first listed (ms since the epoch); retention counts from here.
+    pub seen_at: i64,
+    /// The server no longer lists it (deleted by Overlook's retention policy or elsewhere).
+    pub deleted_on_server: bool,
+}
+
 /// Everything needed to reach an IMAP or POP3 account and its SMTP server, except passwords.
 #[derive(Clone, Debug, PartialEq, Eq, Serialize, Deserialize)]
 pub struct MailServers {

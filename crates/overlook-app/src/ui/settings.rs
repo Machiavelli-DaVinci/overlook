@@ -11,9 +11,10 @@ use gpui_kit::base::{h_flex, v_flex};
 use gpui_kit::component::button::{Button, ButtonVariants};
 use gpui_kit::component::input::{Input, InputEvent, InputState, Textarea, TextareaState};
 use gpui_kit::component::menu::{DropdownMenu, PopupMenuItem};
+use gpui_kit::component::notification::Notification;
 use gpui_kit::component::scroll::ScrollableElement;
 use gpui_kit::component::switch::Switch;
-use gpui_kit::component::Sizable;
+use gpui_kit::component::{Disableable, Sizable, WindowExt};
 use gpui_kit::prelude::*;
 use gpui_kit::*;
 use overlook_core::*;
@@ -838,6 +839,15 @@ impl MailWindow {
             .child(setting_row("Source", "", Button::new("about-repo").ghost().small().icon(icon("external-link").size(px(14.))).label("github.com/last-refuge/overlook").on_click(|_, _, cx| cx.open_url("https://github.com/last-refuge/overlook")).into_any_element()))
             .child(section("On this device", None))
             .child(setting_row("Mail, events, drafts, and attachments", &data_dir_text, Button::new("about-open-data").ghost().small().icon(icon("folder-open").size(px(14.))).label("Open folder").on_click(move |_, _, cx| cx.reveal_path(&data_dir)).into_any_element()))
+            .child(setting_row(
+                "Back up mail",
+                if self.accounts.iter().any(|a| a.provider == ProviderKind::Pop3) {
+                    "Copies the database, downloaded POP3 messages and attachments to a folder you choose. POP3 mail exists only on this device: back it up regularly."
+                } else {
+                    "Copies the database, downloaded messages and attachments to a folder you choose. To restore, stop Overlook and replace the data folder with the copy."
+                },
+                Button::new("about-backup").small().icon(icon("hard-drive-download").size(px(14.))).label("Back up mail…").loading(self.backing_up).disabled(self.backing_up).on_click(cx.listener(|this, _, window, cx| this.back_up_mail(window, cx))).into_any_element(),
+            ))
             .child(setting_row("Google OAuth client", &config, div().into_any_element()))
             .child(setting_row("Sign-in tokens", "Stored in the system keyring (Secret Service), never in files.", div().into_any_element()))
             .child(section("Keyboard", None))
@@ -858,6 +868,36 @@ fn hour_text(hour: u8) -> String {
 }
 
 impl MailWindow {
+    /// Settings → About → "Back up mail…": asks for a folder, then copies the profile there
+    /// off the UI thread.
+    fn back_up_mail(&mut self, window: &mut Window, cx: &mut Context<Self>) {
+        if self.backing_up {
+            return;
+        }
+        let receiver = cx.prompt_for_paths(PathPromptOptions { files: false, directories: true, multiple: false, prompt: Some("Back up here".into()) });
+        let store = self.store.clone();
+        let data_dir = crate::data_dir();
+        cx.spawn_in(window, async move |this, cx| {
+            let Ok(Ok(Some(paths))) = receiver.await else { return };
+            let Some(target) = paths.into_iter().next() else { return };
+            let _ = this.update_in(cx, |this, _window, cx| {
+                this.backing_up = true;
+                cx.notify();
+            });
+            let shown = target.clone();
+            let result = cx.background_spawn(async move { crate::backup::write_backup(&store, &data_dir, &target) }).await;
+            let _ = this.update_in(cx, |this, window, cx| {
+                this.backing_up = false;
+                match result {
+                    Ok(files) => window.push_notification(Notification::success(format!("Backed up {files} files to {}.", shown.display())), cx),
+                    Err(e) => window.push_notification(Notification::error(format!("The backup did not finish: {e}")), cx),
+                }
+                cx.notify();
+            });
+        })
+        .detach();
+    }
+
     /// "Add account" with one entry per account type.
     fn add_account_menu(&self, cx: &mut Context<Self>) -> AnyElement {
         let t = cx.entity().downgrade();
@@ -876,7 +916,7 @@ impl MailWindow {
                     let _ = i.update(cx, |this, cx| this.open_account_setup(ProviderKind::Imap, super::SetupMode::New, window, cx));
                 }));
                 let p = t.clone();
-                menu.item(PopupMenuItem::new("POP3 (coming soon)").on_click(move |_, window, cx| {
+                menu.item(PopupMenuItem::new("POP3…").on_click(move |_, window, cx| {
                     let _ = p.update(cx, |this, cx| this.open_account_setup(ProviderKind::Pop3, super::SetupMode::New, window, cx));
                 }))
             })

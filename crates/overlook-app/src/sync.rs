@@ -298,17 +298,32 @@ fn drain_backlog(store: &Store, provider: &dyn MailProvider, account: &Account, 
     Ok(())
 }
 
-/// Keeps the store's `imap_folders` rows in step with an IMAP provider's checkpoint, so
-/// folder state can be read without parsing the checkpoint. The checkpoint stays
-/// authoritative; other providers have no folder rows.
-fn mirror_imap_folders(store: &Store, provider: &dyn MailProvider, account: &AccountId, checkpoint: Option<&str>) {
-    if provider.kind() != ProviderKind::Imap {
-        return;
+/// Keeps the store's `imap_folders` (IMAP) or `pop3_seen` (POP3) rows in step with the
+/// provider's checkpoint, so that state can be read without parsing the checkpoint. The
+/// checkpoint stays authoritative; other providers have no such rows.
+fn mirror_provider_state(store: &Store, provider: &dyn MailProvider, account: &AccountId, checkpoint: Option<&str>) {
+    let Some(cp) = checkpoint else { return };
+    let result = match provider.kind() {
+        ProviderKind::Imap => store.replace_imap_folders(account, &overlook_provider::imap::folder_states(cp)),
+        ProviderKind::Pop3 => store.replace_pop3_seen(account, &overlook_provider::pop3::seen_rows(cp)),
+        _ => return,
+    };
+    if let Err(e) = result {
+        warn!("could not record {} state for {}: {e}", provider.kind().label(), account.0);
     }
-    if let Some(cp) = checkpoint {
-        if let Err(e) = store.replace_imap_folders(account, &overlook_provider::imap::folder_states(cp)) {
-            warn!("could not record IMAP folder state: {e}");
+}
+
+/// Stores a snapshot's labels. For a local-primary account (POP3) the provider's labels are
+/// local too, so they are merged rather than replacing what the user made here.
+fn store_snapshot_labels(store: &Store, account: &AccountId, labels: &[Label]) -> Result<(), ProviderError> {
+    let local_primary = store.is_local_primary(account).unwrap_or(false);
+    if local_primary {
+        for label in labels {
+            store.upsert_label(label).map_err(|e| ProviderError::Temporary(e.to_string()))?;
         }
+        Ok(())
+    } else {
+        store.replace_labels(account, labels).map_err(|e| ProviderError::Temporary(e.to_string()))
     }
 }
 
@@ -332,11 +347,11 @@ fn download(store: &Store, provider: &dyn MailProvider, account: &Account, outco
 
     let full = |outcome: &mut SyncOutcome| -> Result<usize, ProviderError> {
         let mut snapshot = pollster_block(provider.fetch_snapshot(account))?;
-        store.replace_labels(acct, &snapshot.labels).map_err(|e| ProviderError::Temporary(e.to_string()))?;
+        store_snapshot_labels(store, acct, &snapshot.labels)?;
         reconcile_incoming(store, acct, &mut snapshot.messages, &mut Vec::new());
         store.merge_remote_messages(&snapshot.messages, &protected).map_err(|e| ProviderError::Temporary(e.to_string()))?;
         store.set_checkpoint(acct, snapshot.checkpoint.as_deref()).map_err(|e| ProviderError::Temporary(e.to_string()))?;
-        mirror_imap_folders(store, provider, acct, snapshot.checkpoint.as_deref());
+        mirror_provider_state(store, provider, acct, snapshot.checkpoint.as_deref());
         outcome.downloaded += snapshot.messages.len();
         // Queue bodies that are not on disk yet; the backlog survives restarts.
         enqueue(store, acct, snapshot.message_ids, true);
@@ -353,7 +368,7 @@ fn download(store: &Store, provider: &dyn MailProvider, account: &Account, outco
             return Ok(());
         }
         let mut snapshot = pollster_block(provider.fetch_snapshot(account))?;
-        store.replace_labels(acct, &snapshot.labels).map_err(|e| ProviderError::Temporary(e.to_string()))?;
+        store_snapshot_labels(store, acct, &snapshot.labels)?;
         reconcile_incoming(store, acct, &mut snapshot.messages, &mut Vec::new());
         store.merge_remote_messages(&snapshot.messages, &protected).map_err(|e| ProviderError::Temporary(e.to_string()))?;
         // Version 3 added category/importance hints to the mapping: refresh what is stored.
@@ -389,7 +404,7 @@ fn download(store: &Store, provider: &dyn MailProvider, account: &Account, outco
                 }
                 if let Some(new_cp) = changes.checkpoint.as_deref() {
                     store.set_checkpoint(acct, Some(new_cp)).map_err(|e| ProviderError::Temporary(e.to_string()))?;
-                    mirror_imap_folders(store, provider, acct, Some(new_cp));
+                    mirror_provider_state(store, provider, acct, Some(new_cp));
                 }
                 outcome.downloaded += changes.upserts.len();
                 if !changes.message_ids.is_empty() {
@@ -1582,5 +1597,332 @@ mod tests {
 
         live.disconnect();
         let _ = std::fs::remove_dir_all(&dir);
+    }
+
+    // ------------------------------------------ the real POP3 provider, fake servers
+
+    mod pop3 {
+        use super::*;
+        use overlook_provider::pop3::fake::{serve as serve_pop3, FakeMessage as PopMessage, FakeServer as PopServer, FakeState as PopState};
+        use overlook_provider::pop3::{is_sent_copy, Pop3Provider};
+
+        struct PopEnv {
+            dir: std::path::PathBuf,
+            pop3: PopServer,
+            smtp: FakeSmtp,
+            account: Account,
+        }
+
+        impl Drop for PopEnv {
+            fn drop(&mut self) {
+                let _ = std::fs::remove_dir_all(&self.dir);
+            }
+        }
+
+        fn pop_raw(from: &str, subject: &str, rfc: &str, date: &str) -> Vec<u8> {
+            format!("From: {from}\r\nTo: jason@example.com\r\nSubject: {subject}\r\nMessage-ID: {rfc}\r\nDate: {date}\r\n\r\nBody of {subject}.\r\n").into_bytes()
+        }
+
+        fn pop_env(name: &str) -> PopEnv {
+            let mut state = PopState::default();
+            state.add(PopMessage::new("U1", pop_raw("ada@example.com", "First", "<first@example.com>", "Sat, 10 Oct 2026 09:00:00 +0000")));
+            state.add(PopMessage::new("U2", pop_raw("bob@example.com", "Second", "<second@example.com>", "Sun, 11 Oct 2026 09:00:00 +0000")));
+            let mut reply = pop_raw("ada@example.com", "Re: First", "<third@example.com>", "Mon, 12 Oct 2026 09:00:00 +0000");
+            let headers_end = reply.windows(4).position(|w| w == b"\r\n\r\n").unwrap();
+            reply.splice(headers_end..headers_end, b"\r\nIn-Reply-To: <first@example.com>\r\nReferences: <first@example.com>".iter().copied());
+            state.add(PopMessage::new("U3", reply));
+            let pop3 = serve_pop3(state);
+            let smtp = serve_many(Behaviour::Normal);
+            let account = Account { id: AccountId::from("pop3:jason@example.com"), provider: ProviderKind::Pop3, display_name: "Jason".into(), email: "jason@example.com".into(), created_at: 0 };
+            let dir = std::env::temp_dir().join(format!("overlook-{name}-{}", std::process::id()));
+            let _ = std::fs::remove_dir_all(&dir);
+            std::fs::create_dir_all(&dir).unwrap();
+            PopEnv { dir, pop3, smtp, account }
+        }
+
+        fn pop_servers(env: &PopEnv, policy: Option<Pop3Policy>) -> MailServers {
+            MailServers {
+                incoming: ServerEndpoint::new("127.0.0.1", env.pop3.addr.port(), Security::None, "jason@example.com"),
+                outgoing: ServerEndpoint::new("127.0.0.1", env.smtp.addr.port(), Security::None, "jason@example.com"),
+                pop3: policy,
+                imap: None,
+            }
+        }
+
+        fn pop_provider(env: &PopEnv, policy: Option<Pop3Policy>) -> Arc<Pop3Provider> {
+            Arc::new(Pop3Provider::new(pop_servers(env, policy), "hunter2", env.dir.join("raw")).with_timeout(Duration::from_secs(5)))
+        }
+
+        fn pop_store(env: &PopEnv) -> Arc<Store> {
+            let store = Arc::new(Store::open(&env.dir.join("overlook.sqlite")).unwrap());
+            store.upsert_account(&env.account).unwrap();
+            store
+        }
+
+        fn imap_message_named(store: &Store, account: &AccountId, subject: &str) -> Message {
+            store.messages_for_account(account).unwrap().into_iter().find(|m| m.subject == subject && !m.is_outgoing).unwrap_or_else(|| panic!("no message {subject}"))
+        }
+
+        fn subjects(store: &Store, env: &PopEnv) -> Vec<String> {
+            let mut s: Vec<String> = store.messages_for_account(&env.account.id).unwrap().into_iter().map(|m| m.subject).collect();
+            s.sort();
+            s
+        }
+
+        #[test]
+        fn pop3_account_downloads_once_and_never_duplicates_across_polls_and_restarts() {
+            let env = pop_env("pop3-once");
+            let provider = pop_provider(&env, None);
+            let store = pop_store(&env);
+            let outcome = block_on(run_sync(store.clone(), provider.clone(), None, env.account.clone()));
+            assert_eq!(outcome.state, Some(SyncState::UpToDate), "{outcome:?}");
+            assert_eq!(subjects(&store, &env), vec!["First", "Re: First", "Second"]);
+            assert!(backlog(&store, &env.account.id).is_empty());
+            let labels = store.labels(&env.account.id).unwrap();
+            assert_eq!(labels.iter().map(|l| (l.kind, l.provider_id.is_none())).collect::<Vec<_>>(), vec![(LabelKind::Inbox, true), (LabelKind::Sent, true), (LabelKind::Archive, true), (LabelKind::Trash, true)]);
+            let first = imap_message_named(&store, &env.account.id, "First");
+            let reply = imap_message_named(&store, &env.account.id, "Re: First");
+            assert_eq!(first.conversation_id, reply.conversation_id, "threaded by References");
+            assert_eq!(first.label_ids.iter().map(|l| l.as_str()).collect::<Vec<_>>(), vec!["pop3:jason@example.com:inbox"]);
+            assert!(!first.is_read);
+            assert!(env.dir.join("raw").join(format!("{}.eml", first.id.as_str().replace([':', '/'], "_"))).exists());
+            let mut seen: Vec<String> = store.pop3_seen(&env.account.id).unwrap().into_iter().map(|r| r.uidl).collect();
+            seen.sort();
+            assert_eq!(seen, vec!["U1", "U2", "U3"]);
+
+            // Poll again, several times: nothing new, nothing doubled.
+            for _ in 0..3 {
+                let outcome = block_on(run_sync(store.clone(), provider.clone(), None, env.account.clone()));
+                assert_eq!((outcome.state, outcome.downloaded), (Some(SyncState::UpToDate), 0));
+            }
+            assert_eq!(store.message_count(&env.account.id).unwrap(), 3);
+            assert_eq!(env.pop3.lock().commands("RETR"), 3);
+
+            // Read one, then restart with a fresh provider and a reopened store; new mail arrives.
+            store.apply_change(&env.account.id, overlook_store::LocalChange::SetRead { message_ids: vec![first.id.clone()], read: true }).unwrap();
+            drop(store);
+            env.pop3.lock().add(PopMessage::new("U4", pop_raw("new@example.com", "Fourth", "<fourth@example.com>", "Tue, 13 Oct 2026 09:00:00 +0000")));
+            let store = pop_store(&env);
+            let restarted = pop_provider(&env, None);
+            let outcome = block_on(run_sync(store.clone(), restarted.clone(), None, env.account.clone()));
+            assert_eq!(outcome.state, Some(SyncState::UpToDate), "{outcome:?}");
+            assert_eq!(store.message_count(&env.account.id).unwrap(), 4);
+            assert!(store.message(&first.id).unwrap().unwrap().is_read, "local flags survive the replayed SetRead and the restart");
+            assert_eq!(store.pending_count(&env.account.id).unwrap(), 0, "a local-only operation is applied at once");
+            assert_eq!(env.pop3.lock().commands("RETR"), 4);
+            assert!(env.pop3.lock().deleted.is_empty(), "the default policy leaves mail on the server");
+        }
+
+        #[test]
+        fn pop3_retention_honours_leave_on_server_and_delete_after_days() {
+            let env = pop_env("pop3-retention");
+            let store = pop_store(&env);
+            let delete_now = pop_provider(&env, Some(Pop3Policy { leave_on_server: false, ..Default::default() }));
+            block_on(run_sync(store.clone(), delete_now.clone(), None, env.account.clone()));
+            assert_eq!(store.message_count(&env.account.id).unwrap(), 3);
+            assert!(env.pop3.lock().deleted.is_empty(), "deletion waits for the next cycle, after the store committed");
+            block_on(run_sync(store.clone(), delete_now.clone(), None, env.account.clone()));
+            {
+                let s = env.pop3.lock();
+                assert!(s.uidls().is_empty(), "every downloaded message was deleted from the server");
+                assert_eq!(s.deleted.len(), 3);
+            }
+            assert_eq!(store.message_count(&env.account.id).unwrap(), 3, "and all of them stay local");
+            assert!(store.pop3_seen(&env.account.id).unwrap().iter().all(|r| r.deleted_on_server));
+
+            // delete_after_days on a fresh account: nothing goes until the entry is old enough.
+            let env2 = pop_env("pop3-days");
+            let store2 = pop_store(&env2);
+            let after_30 = pop_provider(&env2, Some(Pop3Policy { delete_after_days: Some(30), ..Default::default() }));
+            block_on(run_sync(store2.clone(), after_30.clone(), None, env2.account.clone()));
+            block_on(run_sync(store2.clone(), after_30.clone(), None, env2.account.clone()));
+            assert_eq!(env2.pop3.lock().uidls().len(), 3);
+            // Age one entry by editing the stored checkpoint, as time would.
+            let cp = store2.checkpoint(&env2.account.id).unwrap().unwrap();
+            let mut parsed = overlook_provider::pop3::Checkpoint::parse(&cp).unwrap();
+            parsed.entries.get_mut("U1").unwrap().seen_at -= 31 * 86_400_000;
+            store2.set_checkpoint(&env2.account.id, Some(&parsed.to_json())).unwrap();
+            let fresh = pop_provider(&env2, Some(Pop3Policy { delete_after_days: Some(30), ..Default::default() }));
+            block_on(run_sync(store2.clone(), fresh, None, env2.account.clone()));
+            assert_eq!(env2.pop3.lock().deleted, vec!["U1"]);
+            assert_eq!(store2.message_count(&env2.account.id).unwrap(), 3);
+        }
+
+        #[test]
+        fn pop3_trash_deletes_on_the_server_when_asked_and_sends_through_smtp() {
+            let env = pop_env("pop3-trash-send");
+            let store = pop_store(&env);
+            let provider = pop_provider(&env, Some(Pop3Policy { delete_on_server_when_trashed: true, ..Default::default() }));
+            block_on(run_sync(store.clone(), provider.clone(), None, env.account.clone()));
+            let second = imap_message_named(&store, &env.account.id, "Second");
+            store.apply_change(&env.account.id, overlook_store::LocalChange::Trash { message_ids: vec![second.id.clone()] }).unwrap();
+            let first = imap_message_named(&store, &env.account.id, "First");
+            store.apply_change(&env.account.id, overlook_store::LocalChange::Archive { message_ids: vec![first.id.clone()] }).unwrap();
+            let mut draft = Draft::new(env.account.id.clone(), DraftKind::Reply, now());
+            draft.to = vec![Address::named("Ada", "ada@example.com")];
+            draft.subject = "Re: First".into();
+            draft.body_text = "Replying.".into();
+            draft.in_reply_to = Some(first.id.clone());
+            draft.conversation_id = Some(first.conversation_id.clone());
+            store.save_draft(&draft).unwrap();
+            store.queue_send(&draft).unwrap();
+
+            let outcome = block_on(run_sync(store.clone(), provider.clone(), None, env.account.clone()));
+            assert_eq!(outcome.state, Some(SyncState::UpToDate), "{outcome:?}");
+            assert_eq!((outcome.applied, outcome.sent.clone(), outcome.failed.clone()), (3, vec!["Re: First".to_owned()], vec![]));
+            assert_eq!(env.pop3.lock().deleted, vec!["U2"], "only the trashed message left the server");
+            assert_eq!(store.message(&second.id).unwrap().unwrap().label_ids.iter().map(|l| l.as_str()).collect::<Vec<_>>(), vec!["pop3:jason@example.com:trash"]);
+            assert!(store.message(&first.id).unwrap().unwrap().label_ids.is_empty(), "archived = out of the Inbox, as for Gmail");
+            let archived = store.conversations(&env.account.id, "jason@example.com", &overlook_store::MailboxView::Kind(LabelKind::Archive), overlook_store::ListFilter::All, None).unwrap();
+            assert!(archived.iter().any(|c| c.id == first.conversation_id), "shown in the Archive view");
+            assert_eq!(env.smtp.seen.lock().unwrap().len(), 1);
+            let sent = imap_message_named(&store, &env.account.id, "Re: First");
+            let sent = store.messages_for_account(&env.account.id).unwrap().into_iter().find(|m| m.is_outgoing && m.subject == "Re: First").unwrap_or(sent);
+            assert!(sent.provider_id.as_ref().is_some_and(is_sent_copy));
+            assert_eq!(sent.label_ids.iter().map(|l| l.as_str()).collect::<Vec<_>>(), vec!["pop3:jason@example.com:sent"]);
+            assert_eq!(sent.conversation_id, first.conversation_id, "the reply threads with the original");
+            assert_eq!(store.drafts(&env.account.id, true).unwrap().len(), 0, "the draft left the Outbox");
+            assert_eq!(store.message_count(&env.account.id).unwrap(), 4);
+
+            // Another poll: the Trash and Archive labels hold, the sent copy is not re-downloaded.
+            block_on(run_sync(store.clone(), provider.clone(), None, env.account.clone()));
+            assert_eq!(store.message_count(&env.account.id).unwrap(), 4);
+            assert_eq!(store.message(&second.id).unwrap().unwrap().label_ids.len(), 1);
+
+            // An uncertain send stays Uncertain for the user (nothing to reconcile against).
+            env.smtp.set(Behaviour::DropAfterData);
+            let mut draft2 = Draft::new(env.account.id.clone(), DraftKind::New, now());
+            draft2.to = vec![Address::named("Bob", "bob@example.com")];
+            draft2.subject = "Uncertain".into();
+            draft2.body_text = "?".into();
+            store.save_draft(&draft2).unwrap();
+            store.queue_send(&draft2).unwrap();
+            let outcome = block_on(run_sync(store.clone(), provider.clone(), None, env.account.clone()));
+            assert_eq!(outcome.uncertain, vec!["Uncertain".to_owned()]);
+            env.smtp.set(Behaviour::Normal);
+            let outcome = block_on(run_sync(store.clone(), provider.clone(), None, env.account.clone()));
+            assert!(outcome.sent.is_empty(), "not resent on its own");
+            assert_eq!(store.drafts(&env.account.id, true).unwrap()[0].state, DraftState::Uncertain);
+        }
+
+        /// The plan's M4 exit criterion against `scripts/spike-mail-servers.py` (start it
+        /// first; it keeps state between runs, so use a fresh process per run). Run with
+        /// `cargo test -p overlook pop3_exit_criteria -- --ignored --nocapture`; optional
+        /// `OVERLOOK_SPIKE_POP3_PORT` / `OVERLOOK_SPIKE_SMTP_PORT` (1110 / 2525). Downloads
+        /// the maildrop once, polls without duplicates, sends through SMTP, honours
+        /// delete-after-N-days and then leave-on-server off (the spike's INBOX ends empty),
+        /// and writes a backup that opens on a clean directory.
+        #[test]
+        #[ignore]
+        fn pop3_exit_criteria_against_the_spike_servers() {
+            let port = |name: &str, default: u16| std::env::var(name).ok().and_then(|p| p.parse().ok()).unwrap_or(default);
+            let (pop3_port, smtp_port) = (port("OVERLOOK_SPIKE_POP3_PORT", 1110), port("OVERLOOK_SPIKE_SMTP_PORT", 2525));
+            let servers = |policy: Option<Pop3Policy>| MailServers {
+                incoming: ServerEndpoint::new("127.0.0.1", pop3_port, Security::None, "spike"),
+                outgoing: ServerEndpoint::new("127.0.0.1", smtp_port, Security::None, "spike"),
+                pop3: policy,
+                imap: None,
+            };
+            let account = Account { id: AccountId::from("pop3:spike@example.com"), provider: ProviderKind::Pop3, display_name: "Spike".into(), email: "spike@example.com".into(), created_at: 0 };
+            let dir = std::env::temp_dir().join(format!("overlook-spike-m4-{}", std::process::id()));
+            let _ = std::fs::remove_dir_all(&dir);
+            std::fs::create_dir_all(&dir).unwrap();
+            let provider = |policy: Option<Pop3Policy>| Arc::new(Pop3Provider::new(servers(policy), "secret", dir.join("raw")).with_timeout(Duration::from_secs(5)));
+            let store = Arc::new(Store::open(&dir.join("overlook.sqlite")).unwrap());
+            store.upsert_account(&account).unwrap();
+
+            let keep = provider(None);
+            let outcome = block_on(run_sync(store.clone(), keep.clone(), None, account.clone()));
+            assert_eq!(outcome.state, Some(SyncState::UpToDate), "{outcome:?}");
+            let count = store.message_count(&account.id).unwrap();
+            eprintln!("initial download: {count} messages, {} .eml files", std::fs::read_dir(dir.join("raw")).map(|d| d.count()).unwrap_or(0));
+            assert!(count >= 3);
+            for _ in 0..2 {
+                let outcome = block_on(run_sync(store.clone(), keep.clone(), None, account.clone()));
+                assert_eq!((outcome.state, outcome.downloaded), (Some(SyncState::UpToDate), 0), "repeated polls download nothing");
+            }
+            assert_eq!(store.message_count(&account.id).unwrap(), count);
+            let restarted = provider(None);
+            block_on(run_sync(store.clone(), restarted, None, account.clone()));
+            assert_eq!(store.message_count(&account.id).unwrap(), count, "a fresh provider reads the ledger from the checkpoint");
+            eprintln!("repeated polls: still {count} messages");
+
+            // Send through SMTP: the Sent copy is local.
+            let mut draft = Draft::new(account.id.clone(), DraftKind::New, now());
+            draft.to = vec![Address::named("Ada", "ada@example.com")];
+            draft.subject = format!("From POP3 {}", std::process::id());
+            draft.body_text = "Sent through the spike SMTP.".into();
+            store.save_draft(&draft).unwrap();
+            store.queue_send(&draft).unwrap();
+            let outcome = block_on(run_sync(store.clone(), keep.clone(), None, account.clone()));
+            assert_eq!(outcome.sent, vec![draft.subject.clone()], "{outcome:?}");
+            let sent = store.messages_for_account(&account.id).unwrap().into_iter().find(|m| m.subject == draft.subject).unwrap();
+            assert!(sent.label_ids.iter().any(|l| l.as_str().ends_with(":sent")));
+            assert!(dir.join("raw").join(format!("{}.eml", sent.id.as_str().replace([':', '/'], "_"))).exists(), "the sent bytes are kept");
+            eprintln!("sent {:?}; local Sent copy {}", draft.subject, sent.id.0);
+
+            // delete-after-N-days: age one ledger entry, the next cycle deletes only that one.
+            let cp = store.checkpoint(&account.id).unwrap().unwrap();
+            let mut parsed = overlook_provider::pop3::Checkpoint::parse(&cp).unwrap();
+            let oldest = parsed.entries.keys().next().unwrap().clone();
+            parsed.entries.get_mut(&oldest).unwrap().seen_at -= 31 * 86_400_000;
+            store.set_checkpoint(&account.id, Some(&parsed.to_json())).unwrap();
+            let after_30 = provider(Some(Pop3Policy { delete_after_days: Some(30), ..Default::default() }));
+            block_on(run_sync(store.clone(), after_30, None, account.clone()));
+            let rows = store.pop3_seen(&account.id).unwrap();
+            assert_eq!(rows.iter().filter(|r| r.deleted_on_server).map(|r| r.uidl.clone()).collect::<Vec<_>>(), vec![oldest.clone()]);
+            assert_eq!(store.message_count(&account.id).unwrap(), count + 1, "deleting on the server removes nothing locally");
+            eprintln!("delete after 30 days: {oldest} deleted on the server, the rest kept");
+
+            // leave-on-server off: everything downloaded leaves the server.
+            let delete = provider(Some(Pop3Policy { leave_on_server: false, ..Default::default() }));
+            block_on(run_sync(store.clone(), delete.clone(), None, account.clone()));
+            let rows = store.pop3_seen(&account.id).unwrap();
+            assert!(rows.iter().all(|r| r.deleted_on_server), "{rows:?}");
+            let outcome = block_on(run_sync(store.clone(), delete, None, account.clone()));
+            assert_eq!((outcome.state, outcome.downloaded), (Some(SyncState::UpToDate), 0));
+            assert_eq!(store.message_count(&account.id).unwrap(), count + 1);
+            eprintln!("leave on server off: the spike INBOX is empty, {} messages still local", count + 1);
+
+            // Backup opens on a clean directory and serves message sources from its own raw/.
+            let target = dir.join("backup");
+            let files = crate::backup::write_backup(&store, &dir, &target).unwrap();
+            let restored = Store::open(&target.join("overlook.sqlite")).unwrap();
+            assert_eq!(restored.message_count(&account.id).unwrap(), count + 1);
+            let restored_provider = Pop3Provider::new(servers(None), "secret", target.join("raw"));
+            let m = restored.messages_for_account(&account.id).unwrap().into_iter().find(|m| !m.is_outgoing).unwrap();
+            let raw = block_on(restored_provider.fetch_raw(&account, &m)).unwrap();
+            assert!(String::from_utf8_lossy(&raw).contains("Message-ID:"));
+            eprintln!("backup: {files} files at {}; reopened with {} messages", target.display(), count + 1);
+            let _ = std::fs::remove_dir_all(&dir);
+        }
+
+        #[test]
+        fn pop3_user_labels_survive_a_full_resync_and_backup_opens_on_a_clean_dir() {
+            let env = pop_env("pop3-labels-backup");
+            let store = pop_store(&env);
+            let provider = pop_provider(&env, None);
+            block_on(run_sync(store.clone(), provider.clone(), None, env.account.clone()));
+            let user = Label { id: LabelId::from("pop3:jason@example.com:user:projects"), account_id: env.account.id.clone(), kind: LabelKind::User, name: "Projects".into(), provider_id: None, color: Some("plum".into()), sort_order: 10 };
+            store.upsert_label(&user).unwrap();
+            // A lost checkpoint forces a full snapshot: the local label stays, nothing doubles.
+            store.set_checkpoint(&env.account.id, Some("not a pop3 checkpoint")).unwrap();
+            let outcome = block_on(run_sync(store.clone(), pop_provider(&env, None), None, env.account.clone()));
+            assert_eq!(outcome.state, Some(SyncState::UpToDate), "{outcome:?}");
+            assert_eq!(store.message_count(&env.account.id).unwrap(), 3);
+            assert!(store.labels(&env.account.id).unwrap().iter().any(|l| l.id == user.id));
+            assert_eq!(env.pop3.lock().commands("RETR"), 3, "messages already on disk are not fetched again");
+
+            let target = env.dir.join("backup");
+            let files = crate::backup::write_backup(&store, &env.dir, &target).unwrap();
+            assert_eq!(files, 1 + 3, "the database and three .eml files");
+            let restored = Store::open(&target.join("overlook.sqlite")).unwrap();
+            assert_eq!(restored.message_count(&env.account.id).unwrap(), 3);
+            assert_eq!(restored.pop3_seen(&env.account.id).unwrap().len(), 3);
+            let message = restored.messages_for_account(&env.account.id).unwrap().remove(0);
+            let restored_provider = Pop3Provider::new(pop_servers(&env, None), "hunter2", target.join("raw"));
+            let raw = block_on(restored_provider.fetch_raw(&env.account, &message)).unwrap();
+            assert!(String::from_utf8_lossy(&raw).contains(&format!("Subject: {}", message.subject)), "the restored copy serves message sources from its own raw/");
+        }
     }
 }

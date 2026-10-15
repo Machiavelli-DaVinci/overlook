@@ -73,7 +73,7 @@ fn io_error(host: &str, what: &str, e: &std::io::Error) -> ProviderError {
     }
 }
 
-fn tcp_connect(endpoint: &ServerEndpoint, timeout: Duration) -> Result<TcpStream, ProviderError> {
+pub(crate) fn tcp_connect(endpoint: &ServerEndpoint, timeout: Duration) -> Result<TcpStream, ProviderError> {
     let host = endpoint.host.trim();
     if host.is_empty() {
         return Err(ProviderError::Rejected("no incoming server is set for this account".into()));
@@ -89,7 +89,7 @@ fn tcp_connect(endpoint: &ServerEndpoint, timeout: Duration) -> Result<TcpStream
 
 /// Completes the TLS handshake before the stream is handed to the IMAP client, so a
 /// certificate problem is reported as such rather than as a lost connection.
-fn wrap_tls(host: &str, mut tcp: TcpStream) -> Result<Stream, ProviderError> {
+pub(crate) fn wrap_tls(host: &str, mut tcp: TcpStream) -> Result<Stream, ProviderError> {
     let name = rustls::pki_types::ServerName::try_from(host.to_owned()).map_err(|e| ProviderError::Rejected(format!("“{host}” is not a valid server name: {e}")))?;
     let mut conn = rustls::ClientConnection::new(tls_config(), name).map_err(|e| ProviderError::Rejected(format!("TLS setup failed: {e}")))?;
     while conn.is_handshaking() {

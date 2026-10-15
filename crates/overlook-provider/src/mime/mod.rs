@@ -6,7 +6,7 @@
 
 pub mod parse;
 
-pub use parse::{headers_from_rfc822, message_from_rfc822, MessageFlags};
+pub use parse::{headers_from_rfc822, message_from_rfc822, part_bytes, MessageFlags};
 
 use base64::Engine;
 

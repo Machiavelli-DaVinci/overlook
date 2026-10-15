@@ -233,6 +233,15 @@ impl Store {
     /// (the pending intent wins until it is replayed). A download without a cached body
     /// keeps the body already on disk.
     pub fn merge_remote_messages(&self, messages: &[Message], protected: &BTreeSet<MessageId>) -> Result<()> {
+        // For local-primary accounts (POP3) read, star and label state exists only here: a
+        // message served again by the provider (a retried download, a re-parse) must not
+        // reset what the user did to it.
+        let mut local_primary: HashSet<AccountId> = HashSet::new();
+        for account in messages.iter().map(|m| &m.account_id).collect::<HashSet<_>>() {
+            if self.is_local_primary(account)? {
+                local_primary.insert(account.clone());
+            }
+        }
         self.with_tx(|tx| {
             for incoming in messages {
                 let mut existing = load_messages(tx, "WHERE m.id=?1", params![incoming.id.0])?.pop();
@@ -267,7 +276,7 @@ impl Store {
                     if merged.focus_override.is_none() {
                         merged.focus_override = local.focus_override;
                     }
-                    if protected.contains(&incoming.id) {
+                    if protected.contains(&incoming.id) || local_primary.contains(&incoming.account_id) {
                         merged.is_read = local.is_read;
                         merged.is_starred = local.is_starred;
                         merged.label_ids = local.label_ids;
@@ -987,7 +996,8 @@ impl Store {
     }
 
     /// Whether this device holds the only copy of the account's mail (POP3). Eviction must
-    /// never touch such accounts.
+    /// never touch such accounts, and [`Store::merge_remote_messages`] keeps their local
+    /// flags and labels, which the provider cannot know.
     pub fn is_local_primary(&self, account: &AccountId) -> Result<bool> {
         self.with_conn(|c| {
             let provider: Option<String> = c.query_row("SELECT provider FROM accounts WHERE id=?1", [&account.0], |r| r.get(0)).optional()?;
@@ -1108,6 +1118,38 @@ impl Store {
                     params![account.0, f.path, f.uidvalidity.map(i64::from), i64::from(f.highest_uid), f.highest_modseq.map(|v| v as i64), f.delimiter, f.special_use, f.subscribed as i64],
                 )?;
             }
+            Ok(())
+        })
+    }
+
+    /// The POP3 ledger rows mirrored from the provider's checkpoint (see [`Pop3Seen`]).
+    pub fn pop3_seen(&self, account: &AccountId) -> Result<Vec<Pop3Seen>> {
+        self.with_conn(|c| {
+            let mut stmt = c.prepare("SELECT uidl, seen_at, deleted_on_server FROM pop3_seen WHERE account_id=?1 ORDER BY seen_at, uidl")?;
+            let rows = stmt.query_map([&account.0], |r| Ok(Pop3Seen { uidl: r.get(0)?, seen_at: r.get(1)?, deleted_on_server: r.get::<_, i64>(2)? != 0 }))?;
+            Ok(rows.collect::<std::result::Result<Vec<_>, _>>()?)
+        })
+    }
+
+    /// Replaces the account's POP3 ledger rows.
+    pub fn replace_pop3_seen(&self, account: &AccountId, rows: &[Pop3Seen]) -> Result<()> {
+        self.with_tx(|tx| {
+            tx.execute("DELETE FROM pop3_seen WHERE account_id=?1", [&account.0])?;
+            for r in rows {
+                tx.execute("INSERT INTO pop3_seen(account_id, uidl, seen_at, deleted_on_server) VALUES(?1,?2,?3,?4)", params![account.0, r.uidl, r.seen_at, r.deleted_on_server as i64])?;
+            }
+            Ok(())
+        })
+    }
+
+    /// Writes a consistent copy of the whole database to `path` (`VACUUM INTO`), for the
+    /// "Back up mail" action. The copy is a plain SQLite file that `Store::open` reads.
+    pub fn backup_to(&self, path: &Path) -> Result<()> {
+        if path.exists() {
+            std::fs::remove_file(path).map_err(|e| StoreError::Sqlite(rusqlite::Error::InvalidPath(std::path::PathBuf::from(format!("{}: {e}", path.display())))))?;
+        }
+        self.with_conn(|c| {
+            c.execute("VACUUM INTO ?1", [path.to_string_lossy().as_ref()])?;
             Ok(())
         })
     }
@@ -2310,6 +2352,66 @@ mod tests {
         store.upsert_account(&pop).unwrap();
         assert!(store.is_local_primary(&pop.id).unwrap());
         assert!(!store.is_local_primary(&AccountId::from("nobody")).unwrap());
+    }
+
+    #[test]
+    fn local_primary_accounts_keep_their_flags_when_a_message_is_served_again() {
+        let store = Store::open_in_memory().unwrap();
+        let pop = Account { id: AccountId::from("pop3:j"), provider: ProviderKind::Pop3, ..account() };
+        store.upsert_account(&pop).unwrap();
+        for (kind, name) in [(LabelKind::Inbox, "Inbox"), (LabelKind::Trash, "Trash")] {
+            store.upsert_label(&Label { id: LabelId::from(format!("pop3:j:{}", kind.as_key()).as_str()), account_id: pop.id.clone(), kind, name: name.into(), provider_id: None, color: None, sort_order: 0 }).unwrap();
+        }
+        let mut m = message("pop3:j:m1", "Hello", "Body", &[]);
+        m.account_id = pop.id.clone();
+        m.label_ids = [LabelId::from("pop3:j:inbox")].into_iter().collect();
+        store.merge_remote_messages(&[m.clone()], &BTreeSet::new()).unwrap();
+        let mut read = store.message(&m.id).unwrap().unwrap();
+        read.is_read = true;
+        read.is_starred = true;
+        read.label_ids = [LabelId::from("pop3:j:trash")].into_iter().collect();
+        store.upsert_messages(&[read]).unwrap();
+        store.merge_remote_messages(&[m.clone()], &BTreeSet::new()).unwrap();
+        let again = store.message(&m.id).unwrap().unwrap();
+        assert!(again.is_read && again.is_starred, "the provider's unread copy did not reset the local state");
+        assert_eq!(again.label_ids.iter().map(|l| l.as_str()).collect::<Vec<_>>(), vec!["pop3:j:trash"]);
+
+        // A cache account (Gmail-like) takes the provider's flags as before.
+        store.upsert_account(&account()).unwrap();
+        let m2 = message("acct-1:m2", "Hi", "Body", &[]);
+        store.merge_remote_messages(&[m2.clone()], &BTreeSet::new()).unwrap();
+        let mut read = store.message(&m2.id).unwrap().unwrap();
+        read.is_read = true;
+        store.upsert_messages(&[read]).unwrap();
+        store.merge_remote_messages(&[m2.clone()], &BTreeSet::new()).unwrap();
+        assert!(!store.message(&m2.id).unwrap().unwrap().is_read);
+    }
+
+    #[test]
+    fn pop3_seen_rows_round_trip_and_backup_reopens() {
+        let store = Store::open_in_memory().unwrap();
+        let pop = Account { id: AccountId::from("pop3:j"), provider: ProviderKind::Pop3, ..account() };
+        store.upsert_account(&pop).unwrap();
+        let rows = vec![Pop3Seen { uidl: "b".into(), seen_at: 2, deleted_on_server: true }, Pop3Seen { uidl: "a".into(), seen_at: 1, deleted_on_server: false }];
+        store.replace_pop3_seen(&pop.id, &rows).unwrap();
+        let back = store.pop3_seen(&pop.id).unwrap();
+        assert_eq!(back.iter().map(|r| (r.uidl.as_str(), r.seen_at, r.deleted_on_server)).collect::<Vec<_>>(), vec![("a", 1, false), ("b", 2, true)]);
+        store.replace_pop3_seen(&pop.id, &rows[..1]).unwrap();
+        assert_eq!(store.pop3_seen(&pop.id).unwrap().len(), 1);
+        assert!(store.pop3_seen(&AccountId::from("nobody")).unwrap().is_empty());
+
+        let dir = std::env::temp_dir().join(format!("overlook-store-backup-{}", std::process::id()));
+        let _ = std::fs::remove_dir_all(&dir);
+        std::fs::create_dir_all(&dir).unwrap();
+        let copy = dir.join("overlook.sqlite");
+        store.backup_to(&copy).unwrap();
+        let reopened = Store::open(&copy).unwrap();
+        assert_eq!(reopened.accounts().unwrap().len(), 1);
+        assert_eq!(reopened.pop3_seen(&pop.id).unwrap().len(), 1);
+        // A second backup over the same file replaces it.
+        store.backup_to(&copy).unwrap();
+        drop(reopened);
+        let _ = std::fs::remove_dir_all(&dir);
     }
 
     #[test]
