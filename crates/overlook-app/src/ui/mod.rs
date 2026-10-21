@@ -304,6 +304,8 @@ pub struct MailWindow {
     /// at once; the store write and a fresh copy follow on a background thread.
     mail_index: MailIndex,
     mail_index_account: Option<AccountId>,
+    /// Indexes of the other accounts, so switching back shows them at once.
+    other_indexes: HashMap<AccountId, MailIndex>,
     /// Bumped whenever the index changes; a background rebuild started earlier is dropped.
     mail_index_generation: u64,
     /// Local changes waiting to be written, in order, and the batch being written now.
@@ -512,6 +514,7 @@ impl MailWindow {
             counts: HashMap::new(),
             mail_index: MailIndex::default(),
             mail_index_account: None,
+            other_indexes: HashMap::new(),
             mail_index_generation: 0,
             local_writes: VecDeque::new(),
             local_in_flight: Vec::new(),
@@ -766,6 +769,7 @@ impl MailWindow {
     }
 
     pub(crate) fn remove_account(&mut self, id: AccountId, window: &mut Window, cx: &mut Context<Self>) {
+        self.other_indexes.remove(&id);
         if self.composer.is_some() {
             self.close_composer(window, cx);
         }
@@ -1052,10 +1056,24 @@ impl MailWindow {
     pub(crate) fn reload(&mut self, cx: &mut Context<Self>) {
         let acct = self.account.id.clone();
         if self.mail_index_account.as_ref() != Some(&acct) {
-            // First load or another account: there is nothing in memory to show yet.
-            self.mail_index = self.store.mail_index(&acct).unwrap_or_default();
-            self.mail_index_account = Some(acct.clone());
-            self.mail_index_generation += 1;
+            // Another account (or the first load): show its last index if there is one and
+            // refresh it in the background; read it here only the first time.
+            let previous = std::mem::take(&mut self.mail_index);
+            if let Some(old) = self.mail_index_account.take() {
+                self.other_indexes.insert(old, previous);
+            }
+            match self.other_indexes.remove(&acct) {
+                Some(index) => {
+                    self.mail_index = index;
+                    self.mail_index_account = Some(acct.clone());
+                    self.rebuild_mail_index(cx);
+                }
+                None => {
+                    self.mail_index = self.store.mail_index(&acct).unwrap_or_default();
+                    self.mail_index_account = Some(acct.clone());
+                    self.mail_index_generation += 1;
+                }
+            }
         } else {
             self.rebuild_mail_index(cx);
         }

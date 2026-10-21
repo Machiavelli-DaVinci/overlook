@@ -254,10 +254,40 @@ impl MailWindow {
         // Debounced durable autosave.
         cx.spawn_in(window, async move |this, cx| {
             cx.background_executor().timer(Duration::from_millis(700)).await;
-            let _ = this.update_in(cx, |this, window, cx| {
+            let _ = this.update_in(cx, |this, _window, cx| {
                 if this.composer.as_ref().is_some_and(|c| c.save_generation == generation && c.dirty) {
-                    this.save_composer(window, cx);
+                    this.autosave_composer(generation, cx);
                 }
+            });
+        })
+        .detach();
+    }
+
+    /// The idle autosave: the write (a durable transaction that may wait for a sync's
+    /// write) runs off the UI thread, so typing never hitches. "Saved" shows only after it
+    /// commits, and only if nothing was typed meanwhile.
+    fn autosave_composer(&mut self, generation: u64, cx: &mut Context<Self>) {
+        self.sync_composer_fields(cx);
+        let Some(c) = self.composer.as_ref() else { return };
+        if c.draft.is_empty() && c.last_saved.is_none() {
+            return;
+        }
+        let draft = c.draft.clone();
+        let store = self.store.clone();
+        cx.spawn(async move |this, cx| {
+            let result = cx.background_spawn(async move { store.save_editing_draft(&draft).map(|_| ()) }).await;
+            let _ = this.update(cx, |this, cx| {
+                let Some(c) = this.composer.as_mut() else { return };
+                match result {
+                    Ok(()) if c.save_generation == generation => {
+                        c.dirty = false;
+                        c.last_saved = Some(now());
+                    }
+                    Ok(()) => {}
+                    Err(e) => c.error = Some(format!("Couldn’t save on this device: {e}")),
+                }
+                this.reload_drafts();
+                cx.notify();
             });
         })
         .detach();

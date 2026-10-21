@@ -761,6 +761,19 @@ impl Store {
         self.with_tx(|tx| save_draft_tx(tx, draft))
     }
 
+    /// Saves a draft only while it is still being edited (or new). A background autosave
+    /// that lands after Send must not turn the queued message back into a draft.
+    pub fn save_editing_draft(&self, draft: &Draft) -> Result<bool> {
+        self.with_tx(|tx| {
+            let current = load_drafts(tx, "WHERE d.id=?1", params![draft.id.0])?.pop();
+            if current.is_some_and(|d| d.state != DraftState::Editing) {
+                return Ok(false);
+            }
+            save_draft_tx(tx, draft)?;
+            Ok(true)
+        })
+    }
+
     pub fn draft(&self, id: &DraftId) -> Result<Option<Draft>> {
         self.with_conn(|c| {
             let mut found = load_drafts(c, "WHERE d.id=?1", params![id.0])?;
@@ -2083,6 +2096,22 @@ mod tests {
         }
         assert_eq!(index.message_ids_in(&ConversationId::from("conv-m1")), vec![MessageId::from("m1")]);
         assert!(index.message_ids_in(&ConversationId::from("missing")).is_empty());
+    }
+
+    #[test]
+    fn a_late_autosave_does_not_unqueue_a_sent_draft() {
+        let store = Store::open_in_memory().unwrap();
+        seeded(&store);
+        let acct = AccountId::from("acct-1");
+        let mut draft = Draft::new(acct.clone(), DraftKind::New, 10);
+        draft.to = vec![Address::named("Maya Chen", "maya@northstar.example")];
+        draft.subject = "Agenda".into();
+        draft.body_text = "Points.".into();
+        assert!(store.save_editing_draft(&draft).unwrap(), "a new draft is saved");
+        store.queue_send(&draft).unwrap();
+        assert!(!store.save_editing_draft(&draft).unwrap(), "the queued message is left alone");
+        assert_eq!(store.drafts(&acct, true).unwrap().len(), 1);
+        assert_eq!(store.pending_count(&acct).unwrap(), 1);
     }
 
     #[test]
