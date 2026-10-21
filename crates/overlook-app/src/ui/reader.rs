@@ -71,17 +71,59 @@ impl MailWindow {
         if cache.len() >= 4 {
             return (div().p_3().child("Collapse another message to load this browser-rendered body (four live documents maximum).").into_any_element(), 0);
         }
-        let mut doc = overlook_core::browser::prepare_document(source);
-        if let Some(m) = original { doc.html = self.resolve_inline_images(m, doc.html); }
-        let count = doc.remote_resources;
+        let (html, count) = self.browser_document(source, original);
         let native_scroll = (key.starts_with("message-") || key.starts_with("outbox-")).then(|| self.reader_scroll.clone());
         let view = cx.new(|cx| {
-            let mut body = crate::browser_body::BrowserBody::new(doc.html, allow_remote, dark, cx);
+            let mut body = if key.starts_with("message-") {
+                // Start at the reader's width, reuse a finished render when there is one,
+                // and show the text until Chromium's first tiles arrive.
+                let placeholder = SharedString::from(placeholder_text(source));
+                crate::browser_body::BrowserBody::new_sized(html, allow_remote, dark, crate::browser_body::reader_size(), Some(placeholder), cx)
+            } else {
+                crate::browser_body::BrowserBody::new(html, allow_remote, dark, cx)
+            };
             if let Some(scroll) = native_scroll { body.attach_native_scroll(scroll); }
             body
         });
         cache.insert(key, (fingerprint, count, view.clone()));
         (view.into_any_element(), count)
+    }
+
+    /// The document Chromium renders for a body: prepared, with inline images resolved.
+    /// Opening and pre-rendering must agree on it exactly to share a finished render.
+    pub(super) fn browser_document(&self, source: &str, original: Option<&Message>) -> (String, usize) {
+        let mut doc = overlook_core::browser::prepare_document(source);
+        if let Some(m) = original { doc.html = self.resolve_inline_images(m, doc.html); }
+        (doc.html, doc.remote_resources)
+    }
+
+    /// The HTML Chromium is given for a message (plain text is converted).
+    pub(super) fn message_source(m: &Message) -> String {
+        match (&m.body.html, &m.body.text) {
+            (Some(h), _) => h.clone(),
+            (None, Some(t)) => text_to_html(t),
+            (None, None) => String::new(),
+        }
+    }
+
+    /// A plain-text message, drawn natively: no browser process, nothing to wait for.
+    fn native_text_body(&self, m: &Message) -> AnyElement {
+        let text = m.body.text.as_deref().unwrap_or_default();
+        div()
+            .px(px(16.))
+            .py(px(12.))
+            .text_size(px(14.))
+            .line_height(px(21.))
+            .child(
+                gpui_kit::component::text::TextView::html(SharedString::from(format!("text-{}", m.id)), plain_text_html(text))
+                    .selectable(true)
+                    .on_link_click(|url, _, _, cx| {
+                        if crate::browser_body::allowed_url(url) {
+                            cx.open_url(url);
+                        }
+                    }),
+            )
+            .into_any_element()
     }
 
     pub(super) fn render_reader(&self, cx: &mut Context<Self>) -> impl IntoElement {
@@ -486,14 +528,12 @@ impl MailWindow {
         let who = if m.is_outgoing { Address::named("You", &self.account.email) } else { m.from.clone() };
         let owner = self.owner();
         let allow_remote = self.remote_allowed.contains(&m.id) || self.prefs.remote_images == RemoteImages::Allow;
-        let html = match (&m.body.html, &m.body.text) {
-            (Some(h), _) => h.clone(),
-            (None, Some(t)) => text_to_html(t),
-            (None, None) => String::new(),
+        let (body_view, remote_resources) = if m.body.html.is_none() && m.body.text.as_deref().is_some_and(|t| !t.trim().is_empty()) {
+            (self.native_text_body(m), 0)
+        } else {
+            let html = Self::message_source(m);
+            self.browser_message_body(format!("message-{}", m.id), &html, Some(m), allow_remote, p.is_dark(), cx)
         };
-        let (body_view, remote_resources) = self.browser_message_body(
-            format!("message-{}", m.id), &html, Some(m), allow_remote, p.is_dark(), cx,
-        );
         let to_line = {
             let names = |list: &[Address]| -> Vec<String> {
                 list.iter().map(|a| if a.email.eq_ignore_ascii_case(&self.account.email) { "me".to_owned() } else { a.display_name() }).collect()
@@ -1122,4 +1162,61 @@ fn base64_encode(bytes: &[u8]) -> String {
         out.push(if chunk.len() > 2 { TABLE[n as usize & 63] as char } else { '=' });
     }
     out
+}
+
+/// The first part of a body as plain text, for the placeholder shown while Chromium renders.
+fn placeholder_text(source: &str) -> String {
+    let text = overlook_core::sanitize::html_to_text(source);
+    let mut out: String = text.chars().take(4000).collect();
+    if out.len() < text.len() {
+        out.push('…');
+    }
+    out
+}
+
+/// Plain text as simple HTML for the native text view: lines kept, links clickable.
+fn plain_text_html(text: &str) -> String {
+    fn escape(s: &str) -> String {
+        s.replace('&', "&amp;").replace('<', "&lt;").replace('>', "&gt;").replace('"', "&quot;")
+    }
+    let mut out = String::new();
+    for paragraph in text.replace("\r\n", "\n").split("\n\n") {
+        out.push_str("<p>");
+        for (i, line) in paragraph.split('\n').enumerate() {
+            if i > 0 {
+                out.push_str("<br>");
+            }
+            for (j, word) in line.split(' ').enumerate() {
+                if j > 0 {
+                    out.push(' ');
+                }
+                let bare = word.trim_end_matches(['.', ',', ')', ';', ':', '!', '?']);
+                if bare.starts_with("https://") || bare.starts_with("http://") {
+                    out.push_str(&format!("<a href=\"{0}\">{0}</a>{1}", escape(bare), escape(&word[bare.len()..])));
+                } else {
+                    out.push_str(&escape(word));
+                }
+            }
+        }
+        out.push_str("</p>");
+    }
+    out
+}
+
+#[cfg(test)]
+mod tests {
+    #[test]
+    fn plain_text_keeps_lines_escapes_markup_and_links_urls() {
+        let html = super::plain_text_html("Hi <b>&\nSee https://example.com/a?b=1&c=2.\n\nBye");
+        assert_eq!(
+            html,
+            "<p>Hi &lt;b&gt;&amp;<br>See <a href=\"https://example.com/a?b=1&amp;c=2\">https://example.com/a?b=1&amp;c=2</a>.</p><p>Bye</p>"
+        );
+    }
+
+    #[test]
+    fn placeholder_is_plain_text_and_bounded() {
+        assert_eq!(super::placeholder_text("<p>Hello <b>there</b></p>").trim(), "Hello there");
+        assert!(super::placeholder_text(&"x".repeat(10_000)).chars().count() <= 4001);
+    }
 }

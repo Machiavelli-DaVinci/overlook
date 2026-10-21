@@ -1,7 +1,9 @@
 //! Linux private-pipe Chromium renderer. No UI work or mail access happens here.
 //!
-//! Initially one sandboxed process per view (at most four), rather than a shared
-//! browser: this keeps failures and lifetime isolation simple. The last handle
+//! One sandboxed process per document (at most six live: open documents, a pre-render
+//! and one warm spare), rather than a shared browser: this keeps failures and lifetime
+//! isolation simple. The warm spare is a process started ahead of time and handed to
+//! exactly one document; it is never reused for another. The last handle
 //! signals cancellation; the worker kills/reaps Chromium and removes its 0700
 //! profile. No screenshots or response bodies are persisted by the host.
 //! Remote resources are fetched by a separate, cookie-less host agent, never by
@@ -34,6 +36,8 @@ const MAX_PACKET: usize = 32 * 1024 * 1024;
 const MAX_RESOURCE: u64 = 8 * 1024 * 1024;
 const COMMAND_TIMEOUT: Duration = Duration::from_secs(10);
 static WORKERS: AtomicUsize = AtomicUsize::new(0);
+/// Live Chromium processes: up to four open documents, one pre-render and one warm spare.
+const MAX_WORKERS: usize = 6;
 static SERIAL: AtomicUsize = AtomicUsize::new(0);
 type Result<T> = std::result::Result<T, String>;
 
@@ -49,7 +53,7 @@ impl WorkerSlot {
     fn acquire() -> Option<Self> {
         let mut n = WORKERS.load(Ordering::Acquire);
         loop {
-            if n >= 4 {
+            if n >= MAX_WORKERS {
                 return None;
             }
             match WORKERS.compare_exchange_weak(n, n + 1, Ordering::AcqRel, Ordering::Acquire) {
@@ -62,7 +66,68 @@ impl WorkerSlot {
 impl Drop for WorkerSlot {
     fn drop(&mut self) {
         WORKERS.fetch_sub(1, Ordering::AcqRel);
+        POOL_WAKE.notify_all();
     }
+}
+
+/// A Chromium already started and attached to a blank page, so opening a message skips
+/// the launch (most of the time to first paint). It is handed to exactly one document and
+/// never reused: each message still gets its own fresh process and profile.
+struct Warm {
+    actor: Actor,
+    stop: Arc<AtomicBool>,
+    slot: WorkerSlot,
+}
+static POOL: Mutex<Option<Warm>> = Mutex::new(None);
+static POOL_WAKE: std::sync::Condvar = std::sync::Condvar::new();
+static POOL_STARTED: std::sync::Once = std::sync::Once::new();
+/// Tests that count live processes empty the pool and stop it refilling.
+#[cfg(test)]
+static POOL_PAUSED: AtomicBool = AtomicBool::new(false);
+
+fn pool_paused() -> bool {
+    #[cfg(test)]
+    return POOL_PAUSED.load(Ordering::Acquire);
+    #[cfg(not(test))]
+    false
+}
+
+/// Starts keeping one spare Chromium ready. The launcher thread lives as long as the
+/// app: Chromium's parent-death signal follows the thread that started it.
+pub fn prewarm() {
+    POOL_STARTED.call_once(|| {
+        let _ = thread::Builder::new().name("browser-pool".into()).spawn(|| loop {
+            let mut pool = POOL.lock().unwrap();
+            while pool.is_some() || pool_paused() {
+                pool = POOL_WAKE.wait_timeout(pool, Duration::from_millis(500)).unwrap().0;
+            }
+            drop(pool);
+            let Some(slot) = WorkerSlot::acquire() else {
+                // Every slot is busy with open documents; try again when one closes.
+                let pool = POOL.lock().unwrap();
+                let _ = POOL_WAKE.wait_timeout(pool, Duration::from_millis(500)).unwrap();
+                continue;
+            };
+            let stop = Arc::new(AtomicBool::new(false));
+            match Actor::start(stop.clone(), false) {
+                Ok(actor) if !pool_paused() => *POOL.lock().unwrap() = Some(Warm { actor, stop, slot }),
+                Ok(_) => {}
+                // No Chromium (or it cannot start): documents report that themselves.
+                Err(_) => {
+                    drop(slot);
+                    thread::sleep(Duration::from_secs(30));
+                }
+            }
+        });
+    });
+}
+
+fn take_warm() -> Option<Warm> {
+    let warm = POOL.lock().unwrap().take();
+    if warm.is_some() {
+        POOL_WAKE.notify_all();
+    }
+    warm
 }
 
 #[derive(Debug)]
@@ -135,10 +200,17 @@ fn chromium_executable() -> Option<PathBuf> {
 
 impl BrowserHandle {
     pub fn new(html: String, allow_remote: bool, dark: bool) -> Self {
+        Self::new_sized(html, allow_remote, dark, None)
+    }
+
+    /// Like [`Self::new`], laid out from the start at `size` (CSS width, device scale) so
+    /// the first tiles are not a throwaway render at a default width.
+    pub fn new_sized(html: String, allow_remote: bool, dark: bool, size: Option<(u32, f64)>) -> Self {
+        let warm = if html.len() > MAX_HTML { None } else { take_warm() };
         let inner = Arc::new(Inner {
             commands: Mutex::new(VecDeque::new()),
             events: Mutex::new(VecDeque::new()),
-            stop: Arc::new(AtomicBool::new(false)),
+            stop: warm.as_ref().map(|w| w.stop.clone()).unwrap_or_else(|| Arc::new(AtomicBool::new(false))),
         });
         let handle = Self(inner.clone());
         if html.len() > MAX_HTML {
@@ -167,22 +239,35 @@ impl BrowserHandle {
                 // Wait off the UI thread instead of permanently failing the new
                 // document while the old process is being reaped.
                 let deadline = Instant::now() + Duration::from_secs(10);
-                let slot = loop {
-                    if stop.load(Ordering::Acquire) {
-                        return;
-                    }
-                    if let Some(slot) = WorkerSlot::acquire() {
-                        break slot;
-                    }
-                    if Instant::now() >= deadline {
-                        emit(BrowserEvent::Error("Browser view limit (4) reached".into()));
-                        return;
-                    }
-                    thread::sleep(Duration::from_millis(25));
+                let (warm_actor, slot) = match warm {
+                    Some(Warm { actor, slot, .. }) => (Some(actor), slot),
+                    None => loop {
+                        if stop.load(Ordering::Acquire) {
+                            return;
+                        }
+                        if let Some(slot) = WorkerSlot::acquire() {
+                            break (None, slot);
+                        }
+                        if Instant::now() >= deadline {
+                            emit(BrowserEvent::Error("Browser view limit reached".into()));
+                            return;
+                        }
+                        thread::sleep(Duration::from_millis(25));
+                    },
                 };
                 let _slot = slot;
                 let result = (|| {
-                    let mut actor = Actor::start(stop.clone(), allow_remote)?;
+                    let mut actor = match warm_actor {
+                        Some(mut actor) => {
+                            actor.allow_remote = allow_remote;
+                            actor
+                        }
+                        None => Actor::start(stop.clone(), allow_remote)?,
+                    };
+                    if let Some((width, scale)) = size {
+                        actor.width = width.clamp(1, 2048);
+                        actor.scale = if scale.is_finite() { scale.clamp(0.5, 2.0) } else { 1.0 };
+                    }
                     actor.load(&html, dark)?;
                     actor.cdp.call("Page.stopScreencast", json!({}))?;
                     actor.refresh_layout(&emit)?;
@@ -1519,6 +1604,48 @@ mod tests {
             }
         }
         assert!(failures.is_empty(), "synthetic repro failures:\n{}", failures.join("\n"));
+    }
+
+    #[test]
+    #[ignore = "Chromium timing diagnostic: cold launch vs warm pool"]
+    fn browser_warm_pool_first_tile_timing() {
+        fn first_tile(handle: &BrowserHandle) -> Duration {
+            let started = Instant::now();
+            loop {
+                for event in handle.drain_events() {
+                    match event {
+                        BrowserEvent::Tile { .. } => return started.elapsed(),
+                        BrowserEvent::Error(e) => panic!("{e}"),
+                        _ => {}
+                    }
+                }
+                assert!(started.elapsed() < Duration::from_secs(15), "no tile");
+                thread::sleep(Duration::from_millis(2));
+            }
+        }
+        let doc = repro_outlook_document();
+        let cold = BrowserHandle::new_sized(doc.clone(), false, false, Some((760, 1.25)));
+        let cold_time = first_tile(&cold);
+        drop(cold);
+        prewarm();
+        let deadline = Instant::now() + Duration::from_secs(10);
+        while POOL.lock().unwrap().is_none() {
+            assert!(Instant::now() < deadline, "pool never filled");
+            thread::sleep(Duration::from_millis(10));
+        }
+        let warm = BrowserHandle::new_sized(doc, false, false, Some((760, 1.25)));
+        let warm_time = first_tile(&warm);
+        eprintln!("first tile: cold {cold_time:?}, warm {warm_time:?}");
+        // Leave no process behind for diagnostics that count them.
+        drop(warm);
+        POOL_PAUSED.store(true, Ordering::Release);
+        let deadline = Instant::now() + Duration::from_secs(10);
+        while WORKERS.load(Ordering::Acquire) != 0 {
+            drop(take_warm());
+            assert!(Instant::now() < deadline, "warm process did not retire");
+            thread::sleep(Duration::from_millis(25));
+        }
+        assert!(warm_time < cold_time, "a warm process must paint sooner than a cold launch");
     }
 
     #[test]

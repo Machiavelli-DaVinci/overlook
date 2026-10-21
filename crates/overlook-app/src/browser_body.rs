@@ -174,6 +174,113 @@ impl<T> Tiles<T> {
     }
 }
 
+/// A finished render, kept so a message shows instantly when opened again or after it
+/// was pre-rendered. Keyed by document, CSS width and device scale.
+#[derive(Clone)]
+struct FinishedRender {
+    key: (u64, u32, u64),
+    height: u32,
+    tiles: Vec<(u32, u32, Arc<RenderImage>)>,
+}
+
+/// How many finished renders to keep. Each holds a few decoded tiles of one message.
+const FINISHED_LIMIT: usize = 8;
+
+thread_local! {
+    static FINISHED: std::cell::RefCell<std::collections::VecDeque<FinishedRender>> = Default::default();
+    /// The width and scale of the last message body laid out in the reader, so new ones
+    /// (and pre-renders) start at the real pane width.
+    static READER_SIZE: Cell<Option<(u32, f64)>> = const { Cell::new(None) };
+}
+
+fn render_key(document_hash: u64, size: (u32, f64)) -> (u64, u32, u64) {
+    (document_hash, size.0, size.1.to_bits())
+}
+
+/// The size message bodies are laid out at, once the reader has shown one.
+pub fn reader_size() -> Option<(u32, f64)> {
+    READER_SIZE.with(Cell::get)
+}
+
+fn finished_render(key: (u64, u32, u64)) -> Option<FinishedRender> {
+    FINISHED.with(|f| {
+        let mut f = f.borrow_mut();
+        let i = f.iter().position(|r| r.key == key)?;
+        let render = f.remove(i)?;
+        f.push_back(render.clone());
+        Some(render)
+    })
+}
+
+fn remember_render(render: FinishedRender) {
+    FINISHED.with(|f| {
+        let mut f = f.borrow_mut();
+        f.retain(|r| r.key != render.key);
+        f.push_back(render);
+        while f.len() > FINISHED_LIMIT {
+            f.pop_front();
+        }
+    });
+}
+
+/// Whether a document is already rendered at this size (pre-rendering skips it).
+pub fn is_rendered(document: &str, allow_remote: bool, dark: bool, size: (u32, f64)) -> bool {
+    let key = render_key(document_hash(document, allow_remote, dark), size);
+    FINISHED.with(|f| f.borrow().iter().any(|r| r.key == key))
+}
+
+/// Renders a document off-screen at `size` and keeps the first screenful, so opening
+/// it later shows it at once. The Chromium process is released when done.
+pub fn prerender(document: String, allow_remote: bool, dark: bool, size: (u32, f64), cx: &mut App) -> Task<()> {
+    let key = render_key(document_hash(&document, allow_remote, dark), size);
+    let browser = BrowserHandle::new_sized(document, allow_remote, dark, Some(size));
+    browser.visible_range(0, VIEWPORT_HEIGHT);
+    cx.spawn(async move |cx| {
+        let started = std::time::Instant::now();
+        let mut height = None;
+        let mut encoded: Vec<EncodedTile> = Vec::new();
+        let mut revision = None;
+        loop {
+            cx.background_executor().timer(Duration::from_millis(16)).await;
+            for event in browser.drain_events() {
+                match event {
+                    BrowserEvent::Layout { width, height: h } if width == size.0 => height = Some(h.clamp(1, MAX_DOCUMENT_HEIGHT)),
+                    BrowserEvent::Tile { png, width, height, top, revision: r } if width == size.0 && height > 0 && height <= OVERSCAN => {
+                        // A newer layout replaces older tiles.
+                        if revision.is_some_and(|old| r > old) {
+                            encoded.clear();
+                        }
+                        if revision.is_none_or(|old| r >= old) {
+                            revision = Some(r);
+                            encoded.retain(|t| t.top != top);
+                            encoded.push(EncodedTile { bytes: png, width, height, top, revision: r });
+                        }
+                    }
+                    BrowserEvent::Error(_) => return,
+                    _ => {}
+                }
+            }
+            if let Some(h) = height {
+                let want = h.min(VIEWPORT_HEIGHT);
+                let covered = (0..want).step_by(16).all(|y| encoded.iter().any(|t| t.top <= y && y < t.top + t.height));
+                if covered {
+                    break;
+                }
+            }
+            if started.elapsed() > Duration::from_secs(10) {
+                return;
+            }
+        }
+        drop(browser);
+        let Some(height) = height else { return };
+        let decoded = cx
+            .background_executor()
+            .spawn(async move { encoded.into_iter().filter_map(|t| decode_frame(&t.bytes).ok().map(|img| (t.top, t.height, img))).collect::<Vec<_>>() })
+            .await;
+        let _ = cx.update(|_| remember_render(FinishedRender { key, height, tiles: decoded }));
+    })
+}
+
 fn freeze_failure<T>(tiles: &mut Tiles<T>, height: &mut u32) {
     tiles.freeze();
     if tiles.cached.is_empty() { *height = 160; }
@@ -200,7 +307,7 @@ fn classify_error(raw: &str, startup: bool) -> &'static str {
         "Chromium rejected Fetch.fulfillRequest" | "Chromium rejected Fetch.failRequest" => "resourceCompletion",
         "Chromium rejected Page.captureScreenshot" | "Missing Chromium tile" | "Missing Chromium screenshot" => "captureFailed",
         "Invalid Chromium tile" | "Invalid Chromium screenshot" | "Invalid Chromium PNG" => "decodeFailed",
-        "Browser HTML exceeds 8 MiB" | "Browser view limit (4) reached" |
+        "Browser HTML exceeds 8 MiB" | "Browser view limit reached" |
         "Browser input queue overflow" | "Chromium protocol size limit exceeded" |
         "Chromium event queue limit exceeded" | "Chromium command size limit exceeded" |
         "Chromium process-tree limit exceeded" | "Browser tile size limit exceeded" |
@@ -295,10 +402,25 @@ pub struct BrowserBody {
     has_rendered: bool,
     buttons: u32,
     native_scroll: Option<ScrollHandle>,
+    /// The message as plain text, shown natively until the first tiles arrive.
+    placeholder: Option<SharedString>,
 }
 
 impl BrowserBody {
     pub fn new(document: String, allow_remote: bool, dark: bool, cx: &mut Context<Self>) -> Self {
+        Self::new_sized(document, allow_remote, dark, None, None, cx)
+    }
+
+    /// Starts the document at `size` (the reader's width and scale) and shows a finished
+    /// render of it at once when one is cached. `placeholder` is shown until then.
+    pub fn new_sized(
+        document: String,
+        allow_remote: bool,
+        dark: bool,
+        size: Option<(u32, f64)>,
+        placeholder: Option<SharedString>,
+        cx: &mut Context<Self>,
+    ) -> Self {
         // Only the weak entity is retained across awaits. Dropping the view drops
         // its last browser handle and cancels/reaps the engine worker.
         cx.spawn(async move |this, cx| loop {
@@ -312,22 +434,45 @@ impl BrowserBody {
         .detach();
         let document_hash = document_hash(&document, allow_remote, dark);
         let prepared = RetryDocument::new(document, allow_remote, dark);
+        let mut tiles = Tiles::new();
+        let mut height = 300;
+        let finished = size.and_then(|size| finished_render(render_key(document_hash, size)));
+        if let Some(render) = &finished {
+            height = render.height;
+            for (top, h, image) in &render.tiles {
+                tiles.insert(*top, *h, image.clone());
+            }
+        }
         Self {
             document_hash,
-            browser: prepared.start(),
+            browser: BrowserHandle::new_sized(prepared.html.to_string(), allow_remote, dark, size),
             prepared,
             focus: cx.focus_handle(),
             bounds: Rc::new(Cell::new(Bounds::default())),
             scale: Rc::new(Cell::new(1.0)),
-            last_resize: None,
-            tiles: Tiles::new(),
+            // Started at `size`: no resize (and no throwaway layout) unless the pane differs.
+            last_resize: size,
+            tiles,
             visible: Rc::new(Cell::new((0, 0))),
             requested: Rc::new(Cell::new(None)),
-            height: 300,
+            height,
             error: None,
-            has_rendered: false,
+            has_rendered: finished.is_some(),
             buttons: 0,
             native_scroll: None,
+            placeholder,
+        }
+    }
+
+    /// Keeps the current paint as this document's finished render.
+    fn remember(&self) {
+        if let Some(size) = self.last_resize {
+            remember_render(FinishedRender {
+                key: render_key(self.document_hash, size),
+                height: self.height,
+                // The opening screenful is what makes a revisit instant; the rest renders live.
+                tiles: self.tiles.cached.iter().filter(|t| t.top < VIEWPORT_HEIGHT + OVERSCAN).map(|t| (t.top, t.height, t.image.clone())).collect(),
+            });
         }
     }
 
@@ -391,6 +536,9 @@ impl BrowserBody {
         if self.bounds.get().size.width <= px(0.) { return; }
         let width = (f32::from(self.bounds.get().size.width).round() as u32).max(MIN_WIDTH);
         let size = (width.min(2048), self.scale.get());
+        if self.native_scroll.is_some() {
+            READER_SIZE.with(|s| s.set(Some(size)));
+        }
         let events = self.browser.drain_events();
         // Terminal errors win over queued geometry, preserving the decoded
         // surface without allocating a second tile cache.
@@ -547,6 +695,7 @@ impl BrowserBody {
                             if let Some(evicted) = view.tiles.insert(top, height, frame) {
                                 view.browser.forget_tile(evicted, revision);
                             }
+                            view.remember();
                         }
                         Err(_) => {
                             view.fail("decodeFailed", cx);
@@ -630,9 +779,16 @@ impl Render for BrowserBody {
                 .child(Button::new("browser-retry").label("Retry")
                     .on_click(cx.listener(|this, _, _, cx| this.retry(cx))))
         });
+        // Until Chromium's first tiles arrive, show the message as plain text rather
+        // than a blank surface.
+        let placeholder = (!self.has_rendered && self.error.is_none() && self.tiles.cached.is_empty())
+            .then(|| self.placeholder.clone())
+            .flatten()
+            .map(|text| div().absolute().inset_0().px(px(16.)).py(px(12.)).text_size(px(14.)).line_height(px(21.)).child(text));
         let content = {
             div()
                 .size_full()
+                .children(placeholder)
                 .children(self.tiles.cached.iter().map(|tile| {
                     img(tile.image.clone())
                         .absolute()
@@ -798,7 +954,7 @@ fn mouse_button(button: MouseButton) -> (&'static str, u32) {
         _ => ("none", 0),
     }
 }
-fn allowed_url(url: &str) -> bool {
+pub(crate) fn allowed_url(url: &str) -> bool {
     if url.chars().any(|c| c.is_control() || c.is_whitespace()) {
         return false;
     }
@@ -847,6 +1003,32 @@ fn browser_key(key: &str) -> (String, String) {
 mod tests {
     use super::{allowed_url, browser_handles_key, browser_key, document_hash, local_position};
     use gpui_kit::{point, px, size, Bounds, Keystroke};
+
+    fn tiny_frame() -> std::sync::Arc<gpui_kit::RenderImage> {
+        let mut png = Vec::new();
+        image::RgbaImage::new(1, 1).write_to(&mut std::io::Cursor::new(&mut png), image::ImageFormat::Png).unwrap();
+        super::decode_frame(&png).unwrap()
+    }
+
+    #[test]
+    fn finished_renders_are_found_by_document_and_size_and_bounded() {
+        let size = (760, 1.25);
+        assert!(!super::is_rendered("<p>a</p>", false, false, size));
+        let key = super::render_key(document_hash("<p>a</p>", false, false), size);
+        super::remember_render(super::FinishedRender { key, height: 640, tiles: vec![(0, 512, tiny_frame())] });
+        assert!(super::is_rendered("<p>a</p>", false, false, size));
+        // Another width, theme or consent is another render.
+        assert!(!super::is_rendered("<p>a</p>", false, false, (900, 1.25)));
+        assert!(!super::is_rendered("<p>a</p>", false, true, size));
+        assert!(!super::is_rendered("<p>a</p>", true, false, size));
+        assert_eq!(super::finished_render(key).map(|r| r.height), Some(640));
+        for i in 0..super::FINISHED_LIMIT {
+            let doc = format!("<p>{i}</p>");
+            let key = super::render_key(document_hash(&doc, false, false), size);
+            super::remember_render(super::FinishedRender { key, height: 1, tiles: Vec::new() });
+        }
+        assert!(!super::is_rendered("<p>a</p>", false, false, size), "oldest render is evicted");
+    }
 
     fn tile(top: u32, revision: u64, value: u8) -> super::EncodedTile {
         super::EncodedTile {

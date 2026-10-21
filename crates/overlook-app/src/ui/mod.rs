@@ -308,6 +308,9 @@ pub struct MailWindow {
     /// Local changes waiting to be written, in order, and the batch being written now.
     local_writes: VecDeque<(AccountId, LocalWrite)>,
     local_in_flight: Vec<(AccountId, LocalWrite)>,
+    /// Off-screen renders of the conversations next to the open one; replaced (and so
+    /// cancelled) whenever the selection moves.
+    prerender: Option<Task<()>>,
     drafts: Vec<Draft>,
     outbox: Vec<Draft>,
     status: AccountStatus,
@@ -502,6 +505,7 @@ impl MailWindow {
             mail_index_generation: 0,
             local_writes: VecDeque::new(),
             local_in_flight: Vec::new(),
+            prerender: None,
             drafts: Vec::new(),
             outbox: Vec::new(),
             status: AccountStatus::default(),
@@ -576,6 +580,8 @@ impl MailWindow {
             retry_attempts: HashMap::new(),
             _subscriptions: subs,
         };
+        // Keep a Chromium started so the first message opens without its launch.
+        crate::browser_engine::prewarm();
         // A fresh process has not reached any provider yet: say so until a probe succeeds.
         for a in this.accounts.clone() {
             if this.provider_issues.contains_key(&a.id) {
@@ -1600,7 +1606,52 @@ impl MailWindow {
             }
         }
         self.list_focus.focus(window, cx);
+        self.schedule_prerender(cx);
         cx.notify();
+    }
+
+    /// Renders the latest message of the conversations above and below the open one
+    /// off-screen, so moving to them (j/k, or archive/delete landing on the next) shows
+    /// them at once. Messages whose remote content would load are skipped: nothing is
+    /// fetched for mail the user has not opened.
+    fn schedule_prerender(&mut self, cx: &mut Context<Self>) {
+        self.prerender = None;
+        let Some(size) = crate::browser_body::reader_size() else { return };
+        let Some(i) = self.selected.as_ref().and_then(|id| self.conversations.iter().position(|c| &c.id == id)) else { return };
+        let ids: Vec<MessageId> = [Some(i + 1), i.checked_sub(1)]
+            .into_iter()
+            .flatten()
+            .filter_map(|j| self.conversations.get(j))
+            .map(|c| c.latest_message_id.clone())
+            .collect();
+        let dark = cx.palette().is_dark();
+        let store = self.store.clone();
+        self.prerender = Some(cx.spawn(async move |this, cx| {
+            // Let the open message paint and quick j/k runs settle before starting.
+            cx.background_executor().timer(Duration::from_millis(250)).await;
+            let messages = cx.background_spawn(async move { ids.into_iter().filter_map(|id| store.message(&id).ok().flatten()).collect::<Vec<_>>() }).await;
+            for m in messages {
+                let job = this
+                    .update(cx, |this, cx| {
+                        if m.body.html.is_none() {
+                            return None; // Plain text is drawn natively.
+                        }
+                        if this.remote_allowed.contains(&m.id) || this.prefs.remote_images == RemoteImages::Allow {
+                            return None;
+                        }
+                        let (html, _) = this.browser_document(&Self::message_source(&m), Some(&m));
+                        if crate::browser_body::is_rendered(&html, false, dark, size) {
+                            return None;
+                        }
+                        Some(crate::browser_body::prerender(html, false, dark, size, cx))
+                    })
+                    .ok()
+                    .flatten();
+                if let Some(job) = job {
+                    job.await;
+                }
+            }
+        }));
     }
 
     fn move_selection(&mut self, delta: i32, window: &mut Window, cx: &mut Context<Self>) {
