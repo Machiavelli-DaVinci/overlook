@@ -761,12 +761,13 @@ impl Store {
         self.with_tx(|tx| save_draft_tx(tx, draft))
     }
 
-    /// Saves a draft only while it is still being edited (or new). A background autosave
-    /// that lands after Send must not turn the queued message back into a draft.
+    /// Saves a draft only while it is still being edited (or new) and only over an older
+    /// copy. A background save that lands late must neither turn a queued message back into
+    /// a draft nor replace text saved after it.
     pub fn save_editing_draft(&self, draft: &Draft) -> Result<bool> {
         self.with_tx(|tx| {
             let current = load_drafts(tx, "WHERE d.id=?1", params![draft.id.0])?.pop();
-            if current.is_some_and(|d| d.state != DraftState::Editing) {
+            if current.is_some_and(|d| d.state != DraftState::Editing || d.updated_at > draft.updated_at) {
                 return Ok(false);
             }
             save_draft_tx(tx, draft)?;
@@ -2112,6 +2113,22 @@ mod tests {
         assert!(!store.save_editing_draft(&draft).unwrap(), "the queued message is left alone");
         assert_eq!(store.drafts(&acct, true).unwrap().len(), 1);
         assert_eq!(store.pending_count(&acct).unwrap(), 1);
+    }
+
+    #[test]
+    fn a_late_background_save_never_replaces_newer_text() {
+        let store = Store::open_in_memory().unwrap();
+        seeded(&store);
+        let acct = AccountId::from("acct-1");
+        let mut older = Draft::new(acct.clone(), DraftKind::New, 10);
+        older.body_text = "Hel".into();
+        older.updated_at = 100;
+        let mut newer = older.clone();
+        newer.body_text = "Hello there".into();
+        newer.updated_at = 200;
+        store.save_draft(&newer).unwrap();
+        assert!(!store.save_editing_draft(&older).unwrap());
+        assert_eq!(store.draft(&older.id).unwrap().unwrap().body_text, "Hello there");
     }
 
     #[test]

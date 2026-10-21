@@ -321,6 +321,9 @@ pub struct MailWindow {
     prefetching: bool,
     first_frame_logged: bool,
     palette: Option<palette::CommandPalette>,
+    /// Reply drafts discarded or closed empty while their first save was still running;
+    /// the save removes them again when it lands.
+    unwanted_drafts: HashSet<DraftId>,
     /// The message list draws only the rows in view; it keeps the rows it was last given
     /// so a change re-measures just the rows that differ.
     list_state: ListState,
@@ -526,6 +529,7 @@ impl MailWindow {
             prefetching: false,
             first_frame_logged: false,
             palette: None,
+            unwanted_drafts: HashSet::new(),
             list_state: ListState::new(0, ListAlignment::Top, px(600.)),
             shown_rows: Default::default(),
             drafts: Vec::new(),
@@ -2076,15 +2080,32 @@ impl MailWindow {
         // The quoted original is appended at send time and shown collapsed under the editor;
         // the body starts with two blank lines for the reply and the signature below them.
         draft.body_text = self.account_prefs_for(&self.account.id).signature_block(true);
-        if let Err(e) = self.store.save_draft(&draft) {
-            window.push_notification(Notification::error(format!("Couldn’t start the draft: {e}")), cx);
-            return;
-        }
-        self.reload_drafts();
+        // Open at once; the new draft is written in the background. Until it commits, the
+        // composer is not marked saved (nothing has been typed yet, so nothing can be lost).
+        let store = self.store.clone();
+        let to_save = draft.clone();
         self.open_composer(draft, window, cx);
-        if let Some(c) = self.composer.as_mut() {
-            c.last_saved = Some(now());
-        }
+        let draft_id = to_save.id.clone();
+        cx.spawn_in(window, async move |this, cx| {
+            let result = cx.background_spawn(async move { store.save_editing_draft(&to_save) }).await;
+            let _ = this.update_in(cx, |this, window, cx| {
+                match result {
+                    Ok(_) if this.unwanted_drafts.remove(&draft_id) => {
+                        let _ = this.store.delete_draft(&draft_id);
+                        this.reload_drafts();
+                    }
+                    Ok(_) => {
+                        if let Some(c) = this.composer.as_mut().filter(|c| c.draft.id == draft_id && c.last_saved.is_none()) {
+                            c.last_saved = Some(now());
+                        }
+                        this.reload_drafts();
+                    }
+                    Err(e) => window.push_notification(Notification::error(format!("Couldn’t start the draft: {e}")), cx),
+                }
+                cx.notify();
+            });
+        })
+        .detach();
     }
 
     pub(crate) fn open_draft(&mut self, id: DraftId, window: &mut Window, cx: &mut Context<Self>) {

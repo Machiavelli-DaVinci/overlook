@@ -320,6 +320,9 @@ impl MailWindow {
         if self.composer.is_some() {
             self.save_composer(window, cx);
             if let Some(c) = self.composer.take() {
+                if c.draft.is_empty() && c.last_saved.is_none() {
+                    self.unwanted_drafts.insert(c.draft.id.clone());
+                }
                 if c.draft.is_empty() && c.last_saved.is_some() {
                     // Nothing was written; do not leave an empty draft behind.
                     let _ = self.store.delete_draft(&c.draft.id);
@@ -333,6 +336,10 @@ impl MailWindow {
 
     pub(super) fn discard_composer(&mut self, window: &mut Window, cx: &mut Context<Self>) {
         if let Some(c) = self.composer.take() {
+            if c.last_saved.is_none() {
+                // Its first save may still be running; it removes the draft when it lands.
+                self.unwanted_drafts.insert(c.draft.id.clone());
+            }
             let _ = self.store.delete_draft(&c.draft.id);
             self.reload_drafts();
             window.push_notification(Notification::info("Draft discarded."), cx);
