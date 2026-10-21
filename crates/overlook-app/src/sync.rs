@@ -463,12 +463,20 @@ async fn replay_operations(
         Err(e) => return SyncState::SyncFailed(e.to_string()),
     };
 
-    let mut final_state = SyncState::UpToDate;
-    for op in ops {
-        if op.state == OperationState::Applied {
-            continue;
+    // Fewer provider calls: overridden flag changes are skipped and runs of the same change
+    // go as one batch. Each sent operation stands for the queued ones in `covered`.
+    let plan = overlook_core::ops::plan_replay(ops.into_iter().filter(|op| op.state != OperationState::Applied).collect());
+    for id in &plan.superseded {
+        let _ = store.set_operation_state(id, OperationState::Applied, None);
+    }
+    let set_states = |covered: &[OperationId], state: OperationState, error: Option<&str>| {
+        for id in covered {
+            let _ = store.set_operation_state(id, state.clone(), error);
         }
-        let _ = store.set_operation_state(&op.id, OperationState::InFlight, None);
+    };
+    let mut final_state = SyncState::UpToDate;
+    for (op, covered) in plan.send {
+        set_states(&covered, OperationState::InFlight, None);
         match &op.kind {
             OperationKind::SendDraft { draft_id } => {
                 let Some(draft) = store.draft(draft_id).ok().flatten() else {
@@ -636,17 +644,17 @@ async fn replay_operations(
                         if let Err(e) = store.apply_provider_id_changes(&applied.provider_ids) {
                             warn!("could not record provider id changes: {e}");
                         }
-                        let _ = store.set_operation_state(&op.id, OperationState::Applied, None);
-                        outcome.applied += 1;
+                        set_states(&covered, OperationState::Applied, None);
+                        outcome.applied += covered.len();
                     }
                     Err(ProviderError::Rejected(reason)) => {
-                        let _ = store.set_operation_state(&op.id, OperationState::Failed, Some(&reason));
+                        set_states(&covered, OperationState::Failed, Some(&reason));
                         outcome.failed.push(kind.describe());
                         final_state = SyncState::SyncFailed(reason);
                         break;
                     }
                     Err(err) => {
-                        let _ = store.set_operation_state(&op.id, OperationState::Pending, Some(&err.to_string()));
+                        set_states(&covered, OperationState::Pending, Some(&err.to_string()));
                         final_state = state_for(&err);
                         outcome.stopped_offline = matches!(err, ProviderError::Offline);
                         outcome.rate_limited = matches!(err, ProviderError::RateLimited(_));
