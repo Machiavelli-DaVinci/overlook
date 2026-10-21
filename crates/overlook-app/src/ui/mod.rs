@@ -37,8 +37,8 @@ use gpui_kit::base::{h_flex, v_flex};
 use overlook_core::time::{format_clock, now};
 use overlook_core::*;
 use overlook_provider::sample::SampleProvider;
-use overlook_store::{ListFilter, MailboxView, Store};
-use std::collections::{BTreeSet, HashMap, HashSet};
+use overlook_store::{LocalChange, ListFilter, MailIndex, MailboxView, Store};
+use std::collections::{BTreeSet, HashMap, HashSet, VecDeque};
 use std::sync::atomic::{AtomicBool, Ordering};
 use std::path::PathBuf;
 use std::sync::Arc;
@@ -174,6 +174,14 @@ pub struct QuickLook {
     pub error: Option<String>,
 }
 
+/// A local write the window already shows but the store may not have yet.
+#[derive(Clone)]
+enum LocalWrite {
+    Change(LocalChange),
+    FocusOverride { ids: Vec<MessageId>, focused: Option<bool> },
+    FocusRule { email: String, focused: Option<bool> },
+}
+
 /// The server-side part of a search.
 #[derive(Clone, Debug, PartialEq, Eq)]
 pub enum OnlineSearch {
@@ -290,6 +298,16 @@ pub struct MailWindow {
     labels: Vec<Label>,
     conversations: Vec<ConversationSummary>,
     counts: HashMap<MailboxView, usize>,
+    /// Headers of every message of the current account, for building the list and the
+    /// counts without the database. A local change lands here first so the list updates
+    /// at once; the store write and a fresh copy follow on a background thread.
+    mail_index: MailIndex,
+    mail_index_account: Option<AccountId>,
+    /// Bumped whenever the index changes; a background rebuild started earlier is dropped.
+    mail_index_generation: u64,
+    /// Local changes waiting to be written, in order, and the batch being written now.
+    local_writes: VecDeque<(AccountId, LocalWrite)>,
+    local_in_flight: Vec<(AccountId, LocalWrite)>,
     drafts: Vec<Draft>,
     outbox: Vec<Draft>,
     status: AccountStatus,
@@ -479,6 +497,11 @@ impl MailWindow {
             labels: Vec::new(),
             conversations: Vec::new(),
             counts: HashMap::new(),
+            mail_index: MailIndex::default(),
+            mail_index_account: None,
+            mail_index_generation: 0,
+            local_writes: VecDeque::new(),
+            local_in_flight: Vec::new(),
             drafts: Vec::new(),
             outbox: Vec::new(),
             status: AccountStatus::default(),
@@ -1003,30 +1026,51 @@ impl MailWindow {
 
     // ------------------------------------------------------------------ loading
 
-    /// Re-reads everything the window shows from the local store.
+    /// Re-reads everything the window shows from the local store. The conversation list
+    /// and counts come from the in-memory index at once; a fresh index is read on a
+    /// background thread and shown when it arrives.
     pub(crate) fn reload(&mut self, cx: &mut Context<Self>) {
         let acct = self.account.id.clone();
+        if self.mail_index_account.as_ref() != Some(&acct) {
+            // First load or another account: there is nothing in memory to show yet.
+            self.mail_index = self.store.mail_index(&acct).unwrap_or_default();
+            self.mail_index_account = Some(acct.clone());
+            self.mail_index_generation += 1;
+        } else {
+            self.rebuild_mail_index(cx);
+        }
+        self.refresh_mail();
+        self.reload_drafts();
+        self.status = self.store.account_status(&acct).unwrap_or_default();
+        self.load_thread();
+        self.reload_calendar();
+        self.reload_contacts();
+        cx.notify();
+    }
+
+    /// Rebuilds the conversation list, counts and labels from the in-memory index.
+    fn refresh_mail(&mut self) {
+        let acct = self.account.id.clone();
         let owner = self.account.email.clone();
-        self.labels = self.store.labels(&acct).unwrap_or_default();
+        self.labels = self.mail_index.labels().to_vec();
         let focus = self.inbox_focus();
         self.conversations = if self.search_query.trim().is_empty() {
-            self.store.conversations(&acct, &owner, &self.view, self.filter, focus).unwrap_or_default()
+            self.mail_index.conversations(&owner, &self.view, self.filter, focus)
         } else {
             self.search_results()
         };
-        self.search_coverage = self.search_coverage_line(&acct);
+        // Search coverage counts cached bodies, a full scan: only worth it while searching.
+        self.search_coverage = if self.search_query.trim().is_empty() { String::new() } else { self.search_coverage_line(&acct) };
         let mut counts = HashMap::new();
         for view in [MailboxView::Kind(LabelKind::Inbox), MailboxView::Kind(LabelKind::Starred)]
             .into_iter()
             .chain(self.labels.iter().filter(|l| l.kind == LabelKind::User).map(|l| MailboxView::Label(l.id.clone())))
         {
             let focus = if view == MailboxView::Kind(LabelKind::Inbox) && self.focused_enabled { Some(FocusTab::Focused) } else { None };
-            let n = self.store.view_count(&acct, &owner, &view, focus).unwrap_or(0);
+            let n = self.mail_index.view_count(&owner, &view, focus);
             counts.insert(view, n);
         }
         self.counts = counts;
-        self.reload_drafts();
-        self.status = self.store.account_status(&acct).unwrap_or_default();
         if let Some(sel) = &self.selected {
             if !self.conversations.iter().any(|c| &c.id == sel) && self.search_query.is_empty() {
                 // The selected conversation left this view (archived, trashed, filtered).
@@ -1034,10 +1078,31 @@ impl MailWindow {
                 self.thread.clear();
             }
         }
-        self.load_thread();
-        self.reload_calendar();
-        self.reload_contacts();
-        cx.notify();
+    }
+
+    /// Reads a fresh index on a background thread and shows it, unless a local change
+    /// arrived meanwhile (the write that follows it rebuilds the index again).
+    fn rebuild_mail_index(&mut self, cx: &mut Context<Self>) {
+        self.mail_index_generation += 1;
+        let generation = self.mail_index_generation;
+        let store = self.store.clone();
+        let acct = self.account.id.clone();
+        cx.spawn(async move |this, cx| {
+            let index = cx.background_spawn({
+                let acct = acct.clone();
+                async move { store.mail_index(&acct) }
+            })
+            .await;
+            let _ = this.update(cx, |this, cx| {
+                let current = this.mail_index_generation == generation && this.account.id == acct && this.local_writes.is_empty() && this.local_in_flight.is_empty();
+                if let (true, Ok(index)) = (current, index) {
+                    this.mail_index = index;
+                    this.refresh_mail();
+                    cx.notify();
+                }
+            });
+        })
+        .detach();
     }
 
     fn reload_drafts(&mut self) {
@@ -1056,6 +1121,8 @@ impl MailWindow {
             Some(id) => self.store.messages_in_conversation(&self.account.id, id).unwrap_or_default(),
             None => Vec::new(),
         };
+        let unwritten = self.unwritten_changes();
+        self.apply_to_thread(&unwritten);
     }
 
     /// Downloads the inline images of the open conversation that are not cached yet.
@@ -1079,33 +1146,9 @@ impl MailWindow {
     }
 
     fn search_results(&self) -> Vec<ConversationSummary> {
-        let acct = &self.account.id;
-        let hits = self.store.search(acct, &self.search_query).unwrap_or_default();
-        if hits.is_empty() {
-            return Vec::new();
-        }
+        let hits = self.store.search(&self.account.id, &self.search_query).unwrap_or_default();
         let hit_set: BTreeSet<MessageId> = hits.into_iter().collect();
-        let all = self.store.messages_for_account(acct).unwrap_or_default();
-        let pending = self.store.pending_message_ids(acct).unwrap_or_default();
-        let mut by_conv: HashMap<ConversationId, Vec<Message>> = HashMap::new();
-        let mut matched: BTreeSet<ConversationId> = BTreeSet::new();
-        for m in all {
-            if hit_set.contains(&m.id) {
-                matched.insert(m.conversation_id.clone());
-            }
-            by_conv.entry(m.conversation_id.clone()).or_default().push(m);
-        }
-        let mut out: Vec<ConversationSummary> = matched
-            .into_iter()
-            .filter_map(|id| ConversationSummary::from_messages(&by_conv[&id], &self.account.email, &pending))
-            .filter(|c| match self.filter {
-                ListFilter::All => true,
-                ListFilter::Unread => c.is_unread(),
-                ListFilter::Attachments => c.has_attachments,
-            })
-            .collect();
-        out.sort_by_key(|c| std::cmp::Reverse(c.latest));
-        out
+        self.mail_index.conversations_matching(&hit_set, &self.account.email, self.filter)
     }
 
     /// The Focused/Other split applies only to the Inbox when the feature is on.
@@ -1140,19 +1183,23 @@ impl MailWindow {
             return;
         }
         let sender = self.thread.iter().filter(|m| !m.is_outgoing).max_by_key(|m| m.date).map(|m| m.from.clone());
-        let _ = self.store.set_focus_override(&ids, Some(focused));
+        self.mail_index.set_focus_override(&ids, Some(focused));
+        self.local_writes.push_back((self.account.id.clone(), LocalWrite::FocusOverride { ids, focused: Some(focused) }));
         if always {
             if let Some(sender) = &sender {
-                let _ = self.store.set_focus_rule(&self.account.id, &sender.email, Some(focused));
+                self.mail_index.set_focus_rule(&sender.email, Some(focused));
+                self.local_writes.push_back((self.account.id.clone(), LocalWrite::FocusRule { email: sender.email.clone(), focused: Some(focused) }));
             }
         }
+        self.mail_index_generation += 1;
+        self.write_local_changes(window, cx);
         let target = if focused { "Focused" } else { "Other" };
         let text = match (&sender, always) {
             (Some(s), true) => format!("Moved to {target}. Messages from {} will go to {target}.", s.display_name()),
             _ => format!("Moved to {target}."),
         };
         let next = self.neighbour_after_removal();
-        self.reload(cx);
+        self.refresh_mail();
         self.select_after_removal(next, window, cx);
         window.push_notification(Notification::info(text), cx);
     }
@@ -1581,16 +1628,102 @@ impl MailWindow {
 
     // --------------------------------------------------------- local changes
 
-    fn apply_local(&mut self, change: overlook_store::LocalChange, window: &mut Window, cx: &mut Context<Self>) {
-        match self.store.apply_change(&self.account.id, change) {
-            Ok(_) => {
-                self.reload(cx);
-                if self.connected(&self.account.id) {
-                    self.sync_now(window, cx);
-                }
+    /// Applies a mailbox change: the list, counts and open conversation update at once in
+    /// memory, then the store write (with its pending operation) and the sync to the
+    /// provider run in the background, in the order the changes were made.
+    fn apply_local(&mut self, change: LocalChange, window: &mut Window, cx: &mut Context<Self>) {
+        self.mail_index.apply(&change);
+        self.mail_index_generation += 1;
+        self.apply_to_thread(std::slice::from_ref(&change));
+        self.refresh_mail();
+        self.local_writes.push_back((self.account.id.clone(), LocalWrite::Change(change)));
+        self.write_local_changes(window, cx);
+        cx.notify();
+    }
+
+    /// Shows changes that are not in the store yet on the open conversation.
+    fn apply_to_thread(&mut self, changes: &[LocalChange]) {
+        let inbox = self.labels.iter().find(|l| l.kind == LabelKind::Inbox).map(|l| l.id.clone());
+        let trash = self.labels.iter().find(|l| l.kind == LabelKind::Trash).map(|l| l.id.clone());
+        for change in changes {
+            let ids = change.message_ids();
+            for m in self.thread.iter_mut().filter(|m| ids.contains(&m.id)) {
+                overlook_store::apply_to_message(m, change, inbox.as_ref(), trash.as_ref());
             }
-            Err(e) => window.push_notification(Notification::error(format!("Couldn’t save that change: {e}")), cx),
         }
+    }
+
+    /// Mailbox changes made in the window that the store does not have yet.
+    fn unwritten_changes(&self) -> Vec<LocalChange> {
+        self.local_in_flight
+            .iter()
+            .chain(self.local_writes.iter())
+            .filter_map(|(_, w)| match w {
+                LocalWrite::Change(c) => Some(c.clone()),
+                _ => None,
+            })
+            .collect()
+    }
+
+    /// Writes queued local changes on a background thread, then reads a fresh index and
+    /// syncs. Only one write runs at a time, so changes reach the store in order.
+    fn write_local_changes(&mut self, window: &mut Window, cx: &mut Context<Self>) {
+        if !self.local_in_flight.is_empty() || self.local_writes.is_empty() {
+            return;
+        }
+        self.local_in_flight = self.local_writes.drain(..).collect();
+        let writes = self.local_in_flight.clone();
+        let store = self.store.clone();
+        let accounts: BTreeSet<AccountId> = writes.iter().map(|(a, _)| a.clone()).collect();
+        let acct = self.account.id.clone();
+        cx.spawn_in(window, async move |this, cx| {
+            let (errors, index) = cx
+                .background_spawn({
+                    let acct = acct.clone();
+                    async move {
+                        let errors: Vec<String> = writes
+                            .into_iter()
+                            .filter_map(|(acct, w)| {
+                                match w {
+                                    LocalWrite::Change(c) => store.apply_change(&acct, c).map(|_| ()),
+                                    LocalWrite::FocusOverride { ids, focused } => store.set_focus_override(&ids, focused),
+                                    LocalWrite::FocusRule { email, focused } => store.set_focus_rule(&acct, &email, focused),
+                                }
+                                .err()
+                                .map(|e| e.to_string())
+                            })
+                            .collect();
+                        (errors, store.mail_index(&acct))
+                    }
+                })
+                .await;
+            let _ = this.update_in(cx, |this, window, cx| {
+                this.local_in_flight.clear();
+                for e in &errors {
+                    window.push_notification(Notification::error(format!("Couldn’t save that change: {e}")), cx);
+                }
+                if !this.local_writes.is_empty() {
+                    // More changes arrived while writing; this index is already behind them.
+                    this.write_local_changes(window, cx);
+                    return;
+                }
+                if this.account.id == acct {
+                    if let Ok(index) = index {
+                        this.mail_index = index;
+                        this.mail_index_generation += 1;
+                        this.refresh_mail();
+                    }
+                }
+                for acct in accounts {
+                    this.next_retry.remove(&acct);
+                    if this.connected(&acct) {
+                        this.sync_account(acct, window, cx);
+                    }
+                }
+                cx.notify();
+            });
+        })
+        .detach();
     }
 
     fn selected_message_ids(&self) -> Vec<MessageId> {
@@ -1652,7 +1785,7 @@ impl MailWindow {
             return;
         }
         let trash = self.labels.iter().find(|l| l.kind == LabelKind::Trash).map(|l| l.id.clone());
-        let trashed: Vec<MessageId> = ids.iter().filter(|id| self.store.message(id).ok().flatten().is_some_and(|m| trash.as_ref().is_some_and(|t| m.has_label(t)))).cloned().collect();
+        let trashed: Vec<MessageId> = ids.iter().filter(|id| self.mail_index.message(id).is_some_and(|m| trash.as_ref().is_some_and(|t| m.has_label(t)))).cloned().collect();
         let others: Vec<MessageId> = ids.iter().filter(|id| !trashed.contains(id)).cloned().collect();
         let next = self.neighbour_after_removal();
         if !trashed.is_empty() {
@@ -1683,7 +1816,7 @@ impl MailWindow {
         }
         let name = self.labels.iter().find(|l| l.id == label_id).map(|l| l.name.clone()).unwrap_or_default();
         let inbox = self.labels.iter().find(|l| l.kind == LabelKind::Inbox).map(|l| l.id.clone());
-        let was_in_inbox: Vec<MessageId> = ids.iter().filter(|id| self.store.message(id).ok().flatten().is_some_and(|m| inbox.as_ref().is_some_and(|i| m.has_label(i)))).cloned().collect();
+        let was_in_inbox: Vec<MessageId> = ids.iter().filter(|id| self.mail_index.message(id).is_some_and(|m| inbox.as_ref().is_some_and(|i| m.has_label(i)))).cloned().collect();
         let next = self.neighbour_after_removal();
         self.apply_local(overlook_store::LocalChange::AddLabel { message_ids: ids.clone(), label_id: label_id.clone() }, window, cx);
         if !was_in_inbox.is_empty() {
@@ -1894,6 +2027,7 @@ impl MailWindow {
     // ------------------------------------------------------------------ sync
 
     /// Syncs the active account (manual: ignores the retry pause).
+
     pub(crate) fn sync_now(&mut self, window: &mut Window, cx: &mut Context<Self>) {
         let id = self.account.id.clone();
         self.next_retry.remove(&id);

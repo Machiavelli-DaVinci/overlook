@@ -12,9 +12,12 @@
 //! the primary copy. For POP3 accounts the local store *is* the primary copy: nothing may
 //! evict their messages. Any eviction routine must check [`Store::is_local_primary`] first.
 
+mod index;
 mod schema;
 
-use overlook_core::focus::{classify_focus, FocusRule, FocusTab};
+pub use index::{apply_to_message, MailIndex};
+
+use overlook_core::focus::{FocusRule, FocusTab};
 use overlook_core::sanitize::html_to_text;
 use overlook_core::time::{now, Timestamp};
 use overlook_core::*;
@@ -66,6 +69,18 @@ pub enum LocalChange {
 }
 
 impl LocalChange {
+    pub fn message_ids(&self) -> &[MessageId] {
+        match self {
+            LocalChange::SetRead { message_ids, .. }
+            | LocalChange::SetStarred { message_ids, .. }
+            | LocalChange::AddLabel { message_ids, .. }
+            | LocalChange::RemoveLabel { message_ids, .. }
+            | LocalChange::Archive { message_ids }
+            | LocalChange::Trash { message_ids }
+            | LocalChange::Untrash { message_ids } => message_ids,
+        }
+    }
+
     fn into_operation(self) -> OperationKind {
         match self {
             LocalChange::SetRead { message_ids, read } => OperationKind::SetRead { message_ids, read },
@@ -325,6 +340,18 @@ impl Store {
 
     /// Conversation summaries for a mailbox view, newest first. `focus` splits the Inbox
     /// into Focused and Other; `None` shows everything.
+    /// Every message of an account without its body, with labels, pending changes and
+    /// Focused Inbox rules: enough to build any conversation list or count in memory.
+    pub fn mail_index(&self, account: &AccountId) -> Result<MailIndex> {
+        let labels = self.labels(account)?;
+        let messages = self.with_conn(|c| load_messages_with(c, "WHERE m.account_id=?1", params![account.0], false))?;
+        let pending = self.pending_message_ids(account)?;
+        let rules = self.focus_rule_map(account)?;
+        Ok(MailIndex::new(labels, messages, pending, rules))
+    }
+
+    /// Conversation summaries for a mailbox view, newest first. `focus` splits the Inbox
+    /// into Focused and Other; `None` shows everything.
     pub fn conversations(
         &self,
         account: &AccountId,
@@ -333,88 +360,12 @@ impl Store {
         filter: ListFilter,
         focus: Option<FocusTab>,
     ) -> Result<Vec<ConversationSummary>> {
-        let labels = self.labels(account)?;
-        let kind_of = |id: &LabelId| labels.iter().find(|l| &l.id == id).map(|l| l.kind);
-        let label_of_kind = |kind: LabelKind| labels.iter().find(|l| l.kind == kind).map(|l| l.id.clone());
-        let inbox = label_of_kind(LabelKind::Inbox);
-        let trash = label_of_kind(LabelKind::Trash);
-        let spam = label_of_kind(LabelKind::Spam);
-        let sent = label_of_kind(LabelKind::Sent);
-        let in_trash = |m: &Message| trash.as_ref().is_some_and(|t| m.has_label(t));
-        let in_spam = |m: &Message| spam.as_ref().is_some_and(|t| m.has_label(t));
-
-        let all = self.messages_for_account(account)?;
-        let pending = self.pending_message_ids(account)?;
-        let (rules, correspondents) = if focus.is_some() {
-            (self.focus_rule_map(account)?, self.sent_recipients(account)?)
-        } else {
-            (HashMap::new(), HashSet::new())
-        };
-
-        // Group every message of the account by conversation first, then decide which
-        // conversations belong to the view. This keeps conversation counts consistent
-        // across views (a thread in Inbox still shows all its messages).
-        let mut by_conv: BTreeMap<ConversationId, Vec<Message>> = BTreeMap::new();
-        for m in all {
-            by_conv.entry(m.conversation_id.clone()).or_default().push(m);
-        }
-
-        let mut out = Vec::new();
-        for (_, msgs) in by_conv {
-            let matches_view = msgs.iter().any(|m| match view {
-                MailboxView::Label(id) => m.has_label(id) && !in_trash(m),
-                MailboxView::Kind(LabelKind::Inbox) => inbox.as_ref().is_some_and(|i| m.has_label(i)) && !in_trash(m),
-                MailboxView::Kind(LabelKind::Starred) => m.is_starred && !in_trash(m),
-                MailboxView::Kind(LabelKind::Sent) => sent.as_ref().is_some_and(|s| m.has_label(s)) && !in_trash(m),
-                MailboxView::Kind(LabelKind::Trash) => in_trash(m),
-                MailboxView::Kind(LabelKind::Spam) => in_spam(m),
-                MailboxView::Kind(LabelKind::Archive) => {
-                    !in_trash(m)
-                        && !in_spam(m)
-                        && !inbox.as_ref().is_some_and(|i| m.has_label(i))
-                        && !sent.as_ref().is_some_and(|s| m.has_label(s))
-                }
-                MailboxView::Kind(LabelKind::Drafts | LabelKind::Outbox) => false,
-                MailboxView::Kind(LabelKind::User) => m.label_ids.iter().any(|l| kind_of(l) == Some(LabelKind::User)),
-            });
-            if !matches_view {
-                continue;
-            }
-            // Inside Trash show only trashed messages; elsewhere hide trashed ones.
-            let visible: Vec<Message> = match view {
-                MailboxView::Kind(LabelKind::Trash) => msgs.into_iter().filter(|m| in_trash(m)).collect(),
-                _ => msgs.into_iter().filter(|m| !in_trash(m)).collect(),
-            };
-            if let Some(tab) = focus {
-                // A conversation follows its newest incoming message; threads with only our
-                // own mail count as Focused.
-                let decisive = visible.iter().filter(|m| !m.is_outgoing).max_by_key(|m| m.date).or_else(|| visible.iter().max_by_key(|m| m.date));
-                let focused = decisive.map(|m| classify_focus(m, &rules, &correspondents)).unwrap_or(true);
-                if focused != (tab == FocusTab::Focused) {
-                    continue;
-                }
-            }
-            let Some(summary) = ConversationSummary::from_messages(&visible, owner_email, &pending) else { continue };
-            let keep = match filter {
-                ListFilter::All => true,
-                ListFilter::Unread => summary.is_unread(),
-                ListFilter::Attachments => summary.has_attachments,
-            };
-            if keep {
-                out.push(summary);
-            }
-        }
-        out.sort_by_key(|c| std::cmp::Reverse(c.latest));
-        Ok(out)
+        Ok(self.mail_index(account)?.conversations(owner_email, view, filter, focus))
     }
 
     /// Unread conversation count for Inbox, starred count, and so on, for sidebar badges.
     pub fn view_count(&self, account: &AccountId, owner_email: &str, view: &MailboxView, focus: Option<FocusTab>) -> Result<usize> {
-        let convs = self.conversations(account, owner_email, view, ListFilter::All, focus)?;
-        Ok(match view {
-            MailboxView::Kind(LabelKind::Inbox) | MailboxView::Label(_) => convs.iter().filter(|c| c.is_unread()).count(),
-            _ => convs.len(),
-        })
+        Ok(self.mail_index(account)?.view_count(owner_email, view, focus))
     }
 
     // ------------------------------------------------------------ focused inbox
@@ -1612,9 +1563,16 @@ fn search_text(m: &Message) -> String {
 }
 
 fn load_messages(c: &Connection, where_clause: &str, args: impl rusqlite::Params) -> Result<Vec<Message>> {
+    load_messages_with(c, where_clause, args, true)
+}
+
+/// Loads messages with labels and attachments; `bodies: false` leaves the bodies empty,
+/// which is all a list or count needs and far less to read.
+fn load_messages_with(c: &Connection, where_clause: &str, args: impl rusqlite::Params, bodies: bool) -> Result<Vec<Message>> {
+    let body_columns = if bodies { "m.body_text, m.body_html" } else { "NULL, NULL" };
     let sql = format!(
         "SELECT m.id, m.account_id, m.conversation_id, m.provider_id, m.from_json, m.to_json, m.cc_json, m.bcc_json, m.reply_to_json,
-                m.subject, m.snippet, m.body_text, m.body_html, m.date, m.is_read, m.is_starred, m.is_outgoing, m.rfc_message_id, m.in_reply_to,
+                m.subject, m.snippet, {body_columns}, m.date, m.is_read, m.is_starred, m.is_outgoing, m.rfc_message_id, m.in_reply_to,
                 m.category, m.is_important, m.focus_override, m.invitation_json, m.references_json
          FROM messages m {where_clause} ORDER BY m.date DESC"
     );
@@ -2039,6 +1997,56 @@ mod tests {
         let archive = store.conversations(&acct, "jason@example.com", &MailboxView::Kind(LabelKind::Archive), ListFilter::All, None).unwrap();
         assert_eq!(archive.len(), 1);
         assert_eq!(store.account_status(&acct).unwrap().pending_operations, 2);
+    }
+
+    #[test]
+    fn in_memory_index_matches_the_store_after_each_change() {
+        let store = Store::open_in_memory().unwrap();
+        seeded(&store);
+        let acct = AccountId::from("acct-1");
+        let owner = "jason@example.com";
+        let m1 = || vec![MessageId::from("m1")];
+        let m2 = || vec![MessageId::from("m2")];
+        let changes = [
+            LocalChange::SetRead { message_ids: m1(), read: true },
+            LocalChange::SetStarred { message_ids: m2(), starred: true },
+            LocalChange::Archive { message_ids: m1() },
+            LocalChange::AddLabel { message_ids: m2(), label_id: LabelId::from("label-user") },
+            LocalChange::Trash { message_ids: m2() },
+            LocalChange::Untrash { message_ids: m2() },
+            LocalChange::RemoveLabel { message_ids: m1(), label_id: LabelId::from("label-user") },
+        ];
+        let views = [
+            MailboxView::Kind(LabelKind::Inbox),
+            MailboxView::Kind(LabelKind::Archive),
+            MailboxView::Kind(LabelKind::Starred),
+            MailboxView::Kind(LabelKind::Trash),
+            MailboxView::Label(LabelId::from("label-user")),
+        ];
+        let mut index = store.mail_index(&acct).unwrap();
+        for change in changes {
+            index.apply(&change);
+            store.apply_change(&acct, change.clone()).unwrap();
+            let fresh = store.mail_index(&acct).unwrap();
+            for view in &views {
+                assert_eq!(
+                    index.conversations(owner, view, ListFilter::All, None),
+                    fresh.conversations(owner, view, ListFilter::All, None),
+                    "{view:?} after {change:?}"
+                );
+                assert_eq!(index.view_count(owner, view, None), fresh.view_count(owner, view, None));
+            }
+        }
+    }
+
+    #[test]
+    fn index_leaves_bodies_out() {
+        let store = Store::open_in_memory().unwrap();
+        seeded(&store);
+        let index = store.mail_index(&AccountId::from("acct-1")).unwrap();
+        let m = index.message(&MessageId::from("m1")).unwrap();
+        assert!(m.body.text.is_none() && m.body.html.is_none());
+        assert!(m.has_label(&LabelId::from("label-inbox")));
     }
 
     #[test]
