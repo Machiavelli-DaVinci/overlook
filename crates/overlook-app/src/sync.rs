@@ -474,8 +474,13 @@ async fn replay_operations(
             let _ = store.set_operation_state(id, state.clone(), error);
         }
     };
+    // A send waits out the undo delay in the Outbox; the window syncs again when it ends.
+    let undo_ms = i64::from(store.setting::<overlook_core::prefs::Prefs>("prefs").ok().flatten().map(|p| p.undo_send_secs).unwrap_or(0)) * 1000;
     let mut final_state = SyncState::UpToDate;
     for (op, covered) in plan.send {
+        if matches!(op.kind, OperationKind::SendDraft { .. }) && overlook_core::time::now() - op.created_at < undo_ms {
+            continue;
+        }
         set_states(&covered, OperationState::InFlight, None);
         match &op.kind {
             OperationKind::SendDraft { draft_id } => {

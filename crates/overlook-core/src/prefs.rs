@@ -55,6 +55,8 @@ pub struct Prefs {
     pub mark_as_read: MarkAsRead,
     pub mark_as_read_delay_secs: u32,
     pub reply_all_by_default: bool,
+    /// Seconds a sent message waits in the Outbox so it can be undone; 0 sends at once.
+    pub undo_send_secs: u32,
     pub quote_on_reply: bool,
     pub remote_images: RemoteImages,
     pub attachments_dir: Option<String>,
@@ -84,6 +86,7 @@ impl Default for Prefs {
             mark_as_read: MarkAsRead::WhenSelected,
             mark_as_read_delay_secs: 3,
             reply_all_by_default: false,
+            undo_send_secs: 5,
             quote_on_reply: true,
             remote_images: RemoteImages::Block,
             attachments_dir: None,

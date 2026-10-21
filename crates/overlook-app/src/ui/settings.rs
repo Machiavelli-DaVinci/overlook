@@ -721,6 +721,14 @@ impl MailWindow {
             ))
             .child(section("Compose and reply", None))
             .child(setting_row(
+                "Undo send",
+                "A sent message waits this long in the Outbox, with an Undo button, before it leaves.",
+                choice(&[("Off", 0u32), ("5 seconds", 5), ("10 seconds", 10), ("20 seconds", 20), ("30 seconds", 30)], prefs.undo_send_secs, cx, |this, v, _w, cx| {
+                    this.prefs.undo_send_secs = v;
+                    this.save_prefs(cx);
+                }),
+            ))
+            .child(setting_row(
                 "Default reply",
                 "What the reply box and Ctrl R do.",
                 choice(&[("Reply", false), ("Reply all", true)], prefs.reply_all_by_default, cx, |this, v, _w, cx| {

@@ -332,17 +332,27 @@ impl MailWindow {
                 self.composer = None;
                 self.reload(cx);
                 let online = self.connected(&self.account.id);
-                window.push_notification(
-                    if online {
-                        Notification::info("Sending…")
-                    } else {
-                        Notification::info("Waiting for connection. We’ll send this when you’re back online.")
-                    },
-                    cx,
-                );
+                let delay = self.prefs.undo_send_secs;
+                let text = match (online, delay) {
+                    (false, _) => "Waiting for connection. We’ll send this when you’re back online.".to_owned(),
+                    (true, 0) => "Sending…".to_owned(),
+                    (true, s) => format!("Sending in {s} seconds."),
+                };
+                // The message is already safe in the Outbox; Undo takes it back to the composer
+                // until the sync that sends it starts.
+                let id = draft.id.clone();
+                self.toast_with_undo(text, move |this, window, cx| this.undo_send(id.clone(), window, cx), window, cx);
                 self.list_focus.focus(window, cx);
                 if online {
-                    self.sync_now(window, cx);
+                    if delay == 0 {
+                        self.sync_now(window, cx);
+                    } else {
+                        cx.spawn_in(window, async move |this, cx| {
+                            cx.background_executor().timer(std::time::Duration::from_millis(u64::from(delay) * 1000 + 300)).await;
+                            let _ = this.update_in(cx, |this, window, cx| this.sync_now(window, cx));
+                        })
+                        .detach();
+                    }
                 }
             }
             Err(e) => {
@@ -352,6 +362,17 @@ impl MailWindow {
             }
         }
         cx.notify();
+    }
+
+    /// Takes a just-sent message back out of the Outbox into the composer.
+    pub(super) fn undo_send(&mut self, id: DraftId, window: &mut Window, cx: &mut Context<Self>) {
+        match self.store.cancel_send(&id) {
+            Ok(_) => {
+                self.reload(cx);
+                self.open_draft(id, window, cx);
+            }
+            Err(e) => window.push_notification(Notification::warning(format!("Too late to undo: {e}")), cx),
+        }
     }
 
     pub(super) fn attach_files(&mut self, window: &mut Window, cx: &mut Context<Self>) {
