@@ -17,10 +17,9 @@ use gpui_kit::base::{h_flex, v_flex};
 use gpui_kit::component::button::{Button, ButtonVariants};
 use gpui_kit::component::input::{Input, InputState};
 use gpui_kit::component::menu::{DropdownMenu, PopupMenuItem};
-use gpui_kit::component::notification::Notification;
 use gpui_kit::component::scroll::ScrollableElement;
 use gpui_kit::component::switch::Switch;
-use gpui_kit::component::{Disableable, Sizable, WindowExt};
+use gpui_kit::component::{Disableable, Sizable};
 use gpui_kit::prelude::*;
 use gpui_kit::*;
 use overlook_core::time::now;
@@ -505,11 +504,11 @@ impl MailWindow {
             }
         };
         if let Err(e) = self.store.upsert_account(&account).and_then(|_| self.store.set_servers(&account.id, &servers)) {
-            window.push_notification(Notification::error(format!("Couldn’t save the account: {e}")), cx);
+            crate::ui::toast(window, cx, crate::notify::Level::Error, format!("Couldn’t save the account: {e}"));
             return;
         }
         if let Err(e) = credentials::save_password(&account.id, credentials::KIND_PASSWORD_INCOMING, &password) {
-            window.push_notification(Notification::error(format!("{e} Overlook cannot sync this account without it.")), cx);
+            crate::ui::toast(window, cx, crate::notify::Level::Error, format!("{e} Overlook cannot sync this account without it."));
             return;
         }
         let outgoing_result = match &out_password {
@@ -520,7 +519,7 @@ impl MailWindow {
             },
         };
         if let Err(e) = outgoing_result {
-            window.push_notification(Notification::warning(format!("The outgoing password could not be saved: {e}")), cx);
+            crate::ui::toast(window, cx, crate::notify::Level::Warning, format!("The outgoing password could not be saved: {e}"));
         }
         // A fresh provider drops any connection made with the old settings.
         let bundle = match kind {
@@ -539,11 +538,11 @@ impl MailWindow {
         }
         self.account_setup = None;
         if is_new {
-            window.push_notification(Notification::success(format!("Added {}. Downloading recent mail…", account.email)), cx);
+            crate::ui::toast(window, cx, crate::notify::Level::Success, format!("Added {}. Downloading recent mail…", account.email));
             self.settings = None;
             self.switch_account(account.id.clone(), window, cx);
         } else {
-            window.push_notification(Notification::success(format!("Saved the settings for {}.", account.email)), cx);
+            crate::ui::toast(window, cx, crate::notify::Level::Success, format!("Saved the settings for {}.", account.email));
             if self.settings.is_some() {
                 self.open_settings(super::SettingsPage::Accounts, window, cx);
             }

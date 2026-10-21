@@ -9,8 +9,7 @@ use crate::theme::ActivePalette;
 use gpui_kit::base::{h_flex, v_flex};
 use gpui_kit::component::button::{Button, ButtonVariants};
 use gpui_kit::component::input::{Input, InputState, Textarea, TextareaState};
-use gpui_kit::component::notification::Notification;
-use gpui_kit::component::{Sizable, WindowExt};
+use gpui_kit::component::{Sizable};
 use gpui_kit::prelude::*;
 use gpui_kit::*;
 use overlook_core::time::now;
@@ -185,7 +184,7 @@ impl MailWindow {
                 self.contact_form = None;
                 self.reload_contacts();
                 self.contact_selected = Some(contact.id.clone());
-                window.push_notification(Notification::info(if self.contacts_writable() { "Saved on this device. Syncing to Google Contacts…" } else { "Saved on this device. Sign in again to sync it to Google Contacts." }), cx);
+                crate::ui::toast(window, cx, crate::notify::Level::Info, if self.contacts_writable() { "Saved on this device. Syncing to Google Contacts…" } else { "Saved on this device. Sign in again to sync it to Google Contacts." });
                 if self.connected(&self.account.id) {
                     self.sync_now(window, cx);
                 }
@@ -207,13 +206,13 @@ impl MailWindow {
                 self.contact_selected = None;
                 self.contact_form = None;
                 self.reload_contacts();
-                window.push_notification(Notification::info(format!("Deleted {}.", c.display_name())), cx);
+                crate::ui::toast(window, cx, crate::notify::Level::Info, format!("Deleted {}.", c.display_name()));
                 if self.connected(&self.account.id) {
                     self.sync_now(window, cx);
                 }
                 cx.notify();
             }
-            Err(e) => window.push_notification(Notification::error(format!("Couldn’t delete the contact: {e}")), cx),
+            Err(e) => crate::ui::toast(window, cx, crate::notify::Level::Error, format!("Couldn’t delete the contact: {e}")),
         }
     }
 

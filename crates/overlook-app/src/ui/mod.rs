@@ -94,6 +94,48 @@ const WINDOW_CONTEXT: &str = "MailWindow";
 const LIST_CONTEXT: &str = "MessageList";
 const CALENDAR_CONTEXT: &str = "CalendarView";
 
+/// Incoming, unread Inbox messages in `next` that `previous` did not have, newest first,
+/// filtered by the new-mail preference (Focused only follows the Focused Inbox split).
+pub(crate) fn new_inbox_mail(
+    previous: &MailIndex,
+    next: &MailIndex,
+    owner: &str,
+    pref: NewMailNotifications,
+    focused_enabled: bool,
+    since: i64,
+) -> Vec<Message> {
+    if pref == NewMailNotifications::Off {
+        return Vec::new();
+    }
+    let inbox = MailboxView::Kind(LabelKind::Inbox);
+    let focus = (pref == NewMailNotifications::FocusedOnly && focused_enabled).then_some(FocusTab::Focused);
+    let mut out: Vec<Message> = next
+        .conversations(owner, &inbox, ListFilter::Unread, focus)
+        .iter()
+        .flat_map(|c| next.message_ids_in(&c.id))
+        .filter(|id| previous.message(id).is_none())
+        .filter_map(|id| next.message(&id).cloned())
+        .filter(|m| !m.is_read && !m.is_outgoing && m.date >= since)
+        .collect();
+    out.sort_by_key(|m| std::cmp::Reverse(m.date));
+    out
+}
+
+/// Shows an in-app toast and, when the Omarchy option is on, the same message as a
+/// desktop notification. Plain information stays in the app.
+pub(crate) fn toast(window: &mut Window, cx: &mut App, level: crate::notify::Level, text: impl Into<SharedString>) {
+    use crate::notify::Level;
+    let text: SharedString = text.into();
+    crate::notify::mirror(level, &text);
+    let note = match level {
+        Level::Success => Notification::success(text),
+        Level::Warning => Notification::warning(text),
+        Level::Error => Notification::error(text),
+        Level::Info | Level::Mail | Level::Reminder => Notification::info(text),
+    };
+    window.push_notification(note, cx);
+}
+
 /// Stored appearance preference, readable from window-level observers.
 pub struct AppearanceGlobal(pub AppearancePreference);
 impl Global for AppearanceGlobal {}
@@ -321,6 +363,8 @@ pub struct MailWindow {
     prefetching: bool,
     first_frame_logged: bool,
     palette: Option<palette::CommandPalette>,
+    /// When this window opened; mail older than this is never announced as new.
+    session_started: i64,
     /// Reply drafts discarded or closed empty while their first save was still running;
     /// the save removes them again when it lands.
     unwanted_drafts: HashSet<DraftId>,
@@ -473,6 +517,7 @@ impl MailWindow {
         let collapsed_sections: HashSet<String> = store.setting::<Vec<String>>("sidebar.collapsed").ok().flatten().unwrap_or_default().into_iter().collect();
         let focused_enabled = store.setting::<bool>("focused_inbox").ok().flatten().unwrap_or(true);
         let prefs: Prefs = store.setting::<Prefs>("prefs").ok().flatten().unwrap_or_default();
+        crate::notify::set_mirror(prefs.omarchy_notifications);
         let reminders_enabled = prefs.event_reminders;
         overlook_core::tz::set_clock_24h(prefs.clock_24h);
         let update_last_check = store.setting::<i64>("update.last_check").ok().flatten().unwrap_or(0);
@@ -529,6 +574,7 @@ impl MailWindow {
             prefetching: false,
             first_frame_logged: false,
             palette: None,
+            session_started: now(),
             unwanted_drafts: HashSet::new(),
             list_state: ListState::new(0, ListAlignment::Top, px(600.)),
             shown_rows: Default::default(),
@@ -790,7 +836,7 @@ impl MailWindow {
             }
         }
         if let Err(e) = self.store.delete_account(&id) {
-            window.push_notification(Notification::error(format!("Couldn’t remove the account: {e}")), cx);
+            crate::ui::toast(window, cx, crate::notify::Level::Error, format!("Couldn’t remove the account: {e}"));
             return;
         }
         self.providers.remove(&id);
@@ -805,7 +851,7 @@ impl MailWindow {
             }
         }
         let next = self.accounts[0].id.clone();
-        window.push_notification(Notification::info(format!("Removed {} from this device.", account.email)), cx);
+        crate::ui::toast(window, cx, crate::notify::Level::Info, format!("Removed {} from this device.", account.email));
         self.switch_account(next, window, cx);
     }
 
@@ -835,13 +881,13 @@ impl MailWindow {
                         this.update.latest = None;
                         this.update.last_result = Some(format!("You have the latest version ({}).", release.version));
                         if manual {
-                            window.push_notification(Notification::success(format!("You’re up to date. Overlook {} is the latest version.", updater::CURRENT_VERSION)), cx);
+                            crate::ui::toast(window, cx, crate::notify::Level::Success, format!("You’re up to date. Overlook {} is the latest version.", updater::CURRENT_VERSION));
                         }
                     }
                     Err(e) => {
                         this.update.last_result = Some(format!("Couldn’t check for updates: {e}"));
                         if manual {
-                            window.push_notification(Notification::warning(format!("Couldn’t check for updates: {e}")), cx);
+                            crate::ui::toast(window, cx, crate::notify::Level::Warning, format!("Couldn’t check for updates: {e}"));
                         }
                     }
                 }
@@ -936,7 +982,7 @@ impl MailWindow {
                     Err(e) => UpdatePhase::Failed(e),
                 };
                 if this.update.phase == UpdatePhase::ReadyToRestart {
-                    window.push_notification(Notification::success("Update installed. Restart Overlook to finish."), cx);
+                    crate::ui::toast(window, cx, crate::notify::Level::Success, "Update installed. Restart Overlook to finish.");
                 }
                 cx.notify();
             });
@@ -948,20 +994,20 @@ impl MailWindow {
 
     pub(crate) fn start_google_sign_in(&mut self, hint: Option<String>, window: &mut Window, cx: &mut Context<Self>) {
         if self.signin.is_some() {
-            window.push_notification(Notification::info("Finish the sign-in that is already open in your browser, or cancel it first."), cx);
+            crate::ui::toast(window, cx, crate::notify::Level::Info, "Finish the sign-in that is already open in your browser, or cancel it first.");
             return;
         }
         let config = match google_signin::load_client_config() {
             Ok(c) => c,
             Err(e) => {
-                window.push_notification(Notification::error(e), cx);
+                crate::ui::toast(window, cx, crate::notify::Level::Error, e);
                 return;
             }
         };
         let pending = match PendingSignIn::start(config, hint) {
             Ok(p) => p,
             Err(e) => {
-                window.push_notification(Notification::error(e), cx);
+                crate::ui::toast(window, cx, crate::notify::Level::Error, e);
                 return;
             }
         };
@@ -990,7 +1036,7 @@ impl MailWindow {
             Ok(r) => r,
             Err(e) => {
                 if !was_cancelled {
-                    window.push_notification(Notification::warning(e), cx);
+                    crate::ui::toast(window, cx, crate::notify::Level::Warning, e);
                 }
                 cx.notify();
                 return;
@@ -1012,14 +1058,14 @@ impl MailWindow {
                     created_at: now(),
                 };
                 if let Err(e) = self.store.upsert_account(&account) {
-                    window.push_notification(Notification::error(format!("Couldn’t save the account: {e}")), cx);
+                    crate::ui::toast(window, cx, crate::notify::Level::Error, format!("Couldn’t save the account: {e}"));
                     return;
                 }
                 account
             }
         };
         if let Err(e) = credentials::save_tokens(&account.id, &result.tokens) {
-            window.push_notification(Notification::error(format!("{e} Overlook cannot keep you signed in without it.")), cx);
+            crate::ui::toast(window, cx, crate::notify::Level::Error, format!("{e} Overlook cannot keep you signed in without it."));
             return;
         }
         match providers::gmail_providers(&account, result.tokens) {
@@ -1028,13 +1074,13 @@ impl MailWindow {
                 self.provider_issues.remove(&account.id);
             }
             Err(e) => {
-                window.push_notification(Notification::error(e), cx);
+                crate::ui::toast(window, cx, crate::notify::Level::Error, e);
                 return;
             }
         }
         let _ = self.store.set_sync_state(&account.id, &SyncState::Syncing, None);
         self.accounts = self.store.accounts().unwrap_or_default();
-        window.push_notification(Notification::success(format!("Signed in as {}. Downloading recent mail…", account.email)), cx);
+        crate::ui::toast(window, cx, crate::notify::Level::Success, format!("Signed in as {}. Downloading recent mail…", account.email));
         self.switch_account(account.id.clone(), window, cx);
         self.sync_account(account.id, window, cx);
     }
@@ -1127,6 +1173,25 @@ impl MailWindow {
         }
     }
 
+    /// Takes a freshly read index and announces mail that arrived since the last one.
+    fn replace_mail_index(&mut self, index: MailIndex) {
+        let previous = std::mem::replace(&mut self.mail_index, index);
+        // The first index of a session has nothing to compare against.
+        if previous.labels().is_empty() {
+            return;
+        }
+        let owner = self.account.email.clone();
+        let fresh = new_inbox_mail(&previous, &self.mail_index, &owner, self.prefs.new_mail_notifications, self.focused_enabled, self.session_started);
+        match fresh.as_slice() {
+            [] => {}
+            [one] => crate::notify::desktop(crate::notify::Level::Mail, one.from.display_name(), one.subject.clone()),
+            many => {
+                let senders: Vec<String> = many.iter().map(|m| m.from.display_name()).take(3).collect();
+                crate::notify::desktop(crate::notify::Level::Mail, format!("{} new messages", many.len()), format!("From {}", senders.join(", ")));
+            }
+        }
+    }
+
     /// Reads a fresh index on a background thread and shows it, unless a local change
     /// arrived meanwhile (the write that follows it rebuilds the index again).
     fn rebuild_mail_index(&mut self, cx: &mut Context<Self>) {
@@ -1143,7 +1208,7 @@ impl MailWindow {
             let _ = this.update(cx, |this, cx| {
                 let current = this.mail_index_generation == generation && this.account.id == acct && this.local_writes.is_empty() && this.local_in_flight.is_empty();
                 if let (true, Ok(index)) = (current, index) {
-                    this.mail_index = index;
+                    this.replace_mail_index(index);
                     this.refresh_mail();
                     cx.notify();
                 }
@@ -1248,7 +1313,7 @@ impl MailWindow {
         let next = self.neighbour_after_removal();
         self.refresh_mail();
         self.select_after_removal(next, window, cx);
-        window.push_notification(Notification::info(text), cx);
+        crate::ui::toast(window, cx, crate::notify::Level::Info, text);
     }
 
     // -------------------------------------------------------------- attachments
@@ -1263,7 +1328,7 @@ impl MailWindow {
             return;
         }
         if attachment.is_pdf() && downloaded.is_some() {
-            window.push_notification(Notification::info("Install poppler (pdftoppm) to preview PDFs inside Overlook."), cx);
+            crate::ui::toast(window, cx, crate::notify::Level::Info, "Install poppler (pdftoppm) to preview PDFs inside Overlook.");
         }
         if let Some(path) = downloaded {
             cx.open_with_system(&path);
@@ -1357,8 +1422,8 @@ impl MailWindow {
             let Ok(Ok(Some(target))) = receiver.await else { return };
             let _ = this.update_in(cx, |this, window, cx| {
                 this.with_raw_message(message, window, cx, move |_this, bytes, window, cx| match std::fs::write(&target, &bytes) {
-                    Ok(()) => window.push_notification(Notification::success(format!("Saved to {}", target.display())), cx),
-                    Err(e) => window.push_notification(Notification::error(format!("Couldn’t save the message: {e}")), cx),
+                    Ok(()) => crate::ui::toast(window, cx, crate::notify::Level::Success, format!("Saved to {}", target.display())),
+                    Err(e) => crate::ui::toast(window, cx, crate::notify::Level::Error, format!("Couldn’t save the message: {e}")),
                 });
             });
         })
@@ -1370,7 +1435,7 @@ impl MailWindow {
         let path = dir.join(format!("{}.eml", message.id.as_str().replace([':', '/'], "_")));
         self.with_raw_message(message, window, cx, move |_this, bytes, window, cx| {
             if let Err(e) = std::fs::create_dir_all(&dir).and_then(|_| std::fs::write(&path, &bytes)) {
-                window.push_notification(Notification::error(format!("Couldn’t write the source: {e}")), cx);
+                crate::ui::toast(window, cx, crate::notify::Level::Error, format!("Couldn’t write the source: {e}"));
                 return;
             }
             cx.open_with_system(&path);
@@ -1401,7 +1466,7 @@ impl MailWindow {
         let path = dir.join(format!("{}.html", message.id.as_str().replace([':', '/'], "_")));
         match std::fs::create_dir_all(&dir).and_then(|_| std::fs::write(&path, page)) {
             Ok(()) => cx.open_with_system(&path),
-            Err(e) => window.push_notification(Notification::error(format!("Couldn’t prepare the page: {e}")), cx),
+            Err(e) => crate::ui::toast(window, cx, crate::notify::Level::Error, format!("Couldn’t prepare the page: {e}")),
         }
     }
 
@@ -1429,8 +1494,8 @@ impl MailWindow {
 
     fn finish_save(&mut self, local: &std::path::Path, target: &std::path::Path, window: &mut Window, cx: &mut Context<Self>) {
         match std::fs::copy(local, target) {
-            Ok(_) => window.push_notification(Notification::success(format!("Saved to {}", target.display())), cx),
-            Err(e) => window.push_notification(Notification::error(format!("Couldn’t save the file: {e}")), cx),
+            Ok(_) => crate::ui::toast(window, cx, crate::notify::Level::Success, format!("Saved to {}", target.display())),
+            Err(e) => crate::ui::toast(window, cx, crate::notify::Level::Error, format!("Couldn’t save the file: {e}")),
         }
     }
 
@@ -1440,7 +1505,7 @@ impl MailWindow {
         }
         let Some(message) = self.store.message(&attachment.message_id).ok().flatten() else { return };
         let Some(provider) = self.providers.get(&self.account.id).map(|p| p.mail.clone()) else {
-            window.push_notification(Notification::warning("Sign in again to download attachments."), cx);
+            crate::ui::toast(window, cx, crate::notify::Level::Warning, "Sign in again to download attachments.");
             return;
         };
         let account = self.account.clone();
@@ -1474,7 +1539,7 @@ impl MailWindow {
                             AfterDownload::Inline => this.prepare_pdf_thumbnails(window, cx),
                         }
                     }
-                    Err(e) => window.push_notification(Notification::error(format!("Couldn’t download {}: {e}", attachment.filename)), cx),
+                    Err(e) => crate::ui::toast(window, cx, crate::notify::Level::Error, format!("Couldn’t download {}: {e}", attachment.filename)),
                 }
                 cx.notify();
             });
@@ -1869,7 +1934,7 @@ impl MailWindow {
             let _ = this.update_in(cx, |this, window, cx| {
                 this.local_in_flight.clear();
                 for e in &errors {
-                    window.push_notification(Notification::error(format!("Couldn’t save that change: {e}")), cx);
+                    crate::ui::toast(window, cx, crate::notify::Level::Error, format!("Couldn’t save that change: {e}"));
                 }
                 if !this.local_writes.is_empty() {
                     // More changes arrived while writing; this index is already behind them.
@@ -1878,7 +1943,7 @@ impl MailWindow {
                 }
                 if this.account.id == acct {
                     if let Ok(index) = index {
-                        this.mail_index = index;
+                        this.replace_mail_index(index);
                         this.mail_index_generation += 1;
                         this.refresh_mail();
                     }
@@ -2010,7 +2075,7 @@ impl MailWindow {
             MailboxView::Kind(LabelKind::Trash) => self.trash(ids, window, cx),
             MailboxView::Kind(LabelKind::Starred) => self.set_starred(vec![ids.last().cloned().unwrap_or_else(|| ids[0].clone())], true, window, cx),
             MailboxView::Label(label_id) => self.move_to_label(ids, label_id, window, cx),
-            _ => window.push_notification(Notification::info("Messages can be dropped on Inbox, Archive, Trash, Starred, or a label."), cx),
+            _ => crate::ui::toast(window, cx, crate::notify::Level::Info, "Messages can be dropped on Inbox, Archive, Trash, Starred, or a label."),
         }
     }
 
@@ -2100,7 +2165,7 @@ impl MailWindow {
                         }
                         this.reload_drafts();
                     }
-                    Err(e) => window.push_notification(Notification::error(format!("Couldn’t start the draft: {e}")), cx),
+                    Err(e) => crate::ui::toast(window, cx, crate::notify::Level::Error, format!("Couldn’t start the draft: {e}")),
                 }
                 cx.notify();
             });
@@ -2135,7 +2200,7 @@ impl MailWindow {
                     c.last_saved = Some(now());
                 }
             }
-            Err(e) => window.push_notification(Notification::warning(e.to_string()), cx),
+            Err(e) => crate::ui::toast(window, cx, crate::notify::Level::Warning, e.to_string()),
         }
     }
 
@@ -2146,7 +2211,7 @@ impl MailWindow {
                 self.reload(cx);
                 self.sync_account(draft.account_id, window, cx);
             }
-            Err(e) => window.push_notification(Notification::warning(e.to_string()), cx),
+            Err(e) => crate::ui::toast(window, cx, crate::notify::Level::Warning, e.to_string()),
         }
     }
 
@@ -2157,7 +2222,7 @@ impl MailWindow {
                 self.outbox_selected = None;
                 self.reload(cx);
             }
-            Err(e) => window.push_notification(Notification::warning(e.to_string()), cx),
+            Err(e) => crate::ui::toast(window, cx, crate::notify::Level::Warning, e.to_string()),
         }
     }
 
@@ -2280,19 +2345,21 @@ impl MailWindow {
                     this.prefetch_attachments(cx);
                 }
                 if first_download && outcome.downloaded > 0 {
-                    window.push_notification(Notification::success(format!("Downloaded {} recent messages for {}.", outcome.downloaded, account.email)), cx);
+                    crate::ui::toast(window, cx, crate::notify::Level::Success, format!("Downloaded {} recent messages for {}.", outcome.downloaded, account.email));
                 }
                 for subject in &outcome.sent {
-                    window.push_notification(Notification::success(format!("Sent: {subject}")), cx);
+                    crate::ui::toast(window, cx, crate::notify::Level::Success, format!("Sent: {subject}"));
                 }
                 for subject in &outcome.uncertain {
-                    window.push_notification(
-                        Notification::warning(format!("The connection dropped while sending “{subject}”. Overlook will check whether it arrived before trying again.")),
+                    crate::ui::toast(
+                        window,
                         cx,
+                        crate::notify::Level::Warning,
+                        format!("The connection dropped while sending “{subject}”. Overlook will check whether it arrived before trying again."),
                     );
                 }
                 for what in &outcome.failed {
-                    window.push_notification(Notification::error(format!("Couldn’t sync: {what}")), cx);
+                    crate::ui::toast(window, cx, crate::notify::Level::Error, format!("Couldn’t sync: {what}"));
                 }
                 let more_pending = this.store.pending_count(&account.id).unwrap_or(0) > 0;
                 let paused = this.next_retry.get(&account.id).is_some_and(|t| *t > now());
@@ -2843,7 +2910,7 @@ impl MailWindow {
                                     .item(PopupMenuItem::new("Drop the connection during the next send").on_click(move |_, window, cx| {
                                         let _ = b.update(cx, |this, cx| {
                                             this.sample.drop_next_send();
-                                            window.push_notification(Notification::info("The next send will lose its connection after the server accepts it."), cx);
+                                            crate::ui::toast(window, cx, crate::notify::Level::Info, "The next send will lose its connection after the server accepts it.");
                                         });
                                     }))
                             }),
@@ -3093,5 +3160,42 @@ impl Render for MailWindow {
             .when(self.account_setup.is_some(), |d| d.child(self.render_account_setup(cx)))
             .when(self.quick_look.is_some(), |d| d.child(self.render_quick_look(cx)))
             .when(self.palette.is_some(), |d| d.child(self.render_palette(cx)))
+    }
+}
+
+#[cfg(test)]
+mod new_mail_tests {
+    use super::new_inbox_mail;
+    use overlook_core::prefs::NewMailNotifications;
+    use overlook_core::*;
+    use overlook_store::Store;
+
+    #[test]
+    fn only_mail_that_arrived_since_the_last_index_is_announced() {
+        let store = Store::open_in_memory().unwrap();
+        let account = crate::seed_sample_account(&store).unwrap();
+        let before = store.mail_index(&account.id).unwrap();
+        let inbox = before.labels().iter().find(|l| l.kind == LabelKind::Inbox).unwrap().id.clone();
+        let mut fresh = before
+            .message(&before.message_ids_in(&before.conversations(&account.email, &overlook_store::MailboxView::Kind(LabelKind::Inbox), overlook_store::ListFilter::All, None)[0].id)[0])
+            .unwrap()
+            .clone();
+        fresh.id = MessageId::from("brand-new");
+        fresh.conversation_id = ConversationId::from("brand-new-conv");
+        fresh.provider_id = Some(ProviderId("brand-new".into()));
+        fresh.attachments.clear();
+        fresh.is_read = false;
+        fresh.is_outgoing = false;
+        fresh.date = 5_000_000_000_000;
+        fresh.label_ids = [inbox].into_iter().collect();
+        fresh.body = Body { text: Some("Hi".into()), html: None };
+        store.upsert_messages(&[fresh]).unwrap();
+        let after = store.mail_index(&account.id).unwrap();
+
+        let found = new_inbox_mail(&before, &after, &account.email, NewMailNotifications::All, false, 0);
+        assert_eq!(found.iter().map(|m| m.id.as_str()).collect::<Vec<_>>(), vec!["brand-new"]);
+        assert!(new_inbox_mail(&before, &after, &account.email, NewMailNotifications::Off, false, 0).is_empty());
+        assert!(new_inbox_mail(&after, &after, &account.email, NewMailNotifications::All, false, 0).is_empty(), "nothing new");
+        assert!(new_inbox_mail(&before, &after, &account.email, NewMailNotifications::All, false, 6_000_000_000_000).is_empty(), "older than the session");
     }
 }

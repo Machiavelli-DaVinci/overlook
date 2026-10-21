@@ -8,10 +8,9 @@ use gpui_kit::component::button::{Button, ButtonVariants};
 use super::mail_highlight::{list_marker_len, MailHighlighter, LANGUAGE};
 use gpui_kit::component::input::{Editor, EditorState, Input, InputEvent, InputHighlighter, InputState};
 use gpui_kit::component::menu::{DropdownMenu, PopupMenuItem};
-use gpui_kit::component::{Disableable, Sizable, WindowExt};
+use gpui_kit::component::{Disableable, Sizable};
 use overlook_core::compose::render_markdown;
 use std::rc::Rc;
-use gpui_kit::component::notification::Notification;
 use gpui_kit::prelude::*;
 use gpui_kit::*;
 use gpui_kit::base::{h_flex, v_flex};
@@ -342,7 +341,7 @@ impl MailWindow {
             }
             let _ = self.store.delete_draft(&c.draft.id);
             self.reload_drafts();
-            window.push_notification(Notification::info("Draft discarded."), cx);
+            crate::ui::toast(window, cx, crate::notify::Level::Info, "Draft discarded.");
             self.list_focus.focus(window, cx);
             cx.notify();
         }
@@ -408,7 +407,7 @@ impl MailWindow {
                 self.reload(cx);
                 self.open_draft(id, window, cx);
             }
-            Err(e) => window.push_notification(Notification::warning(format!("Too late to undo: {e}")), cx),
+            Err(e) => crate::ui::toast(window, cx, crate::notify::Level::Warning, format!("Too late to undo: {e}")),
         }
     }
 

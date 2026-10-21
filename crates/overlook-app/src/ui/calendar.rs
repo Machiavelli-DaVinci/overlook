@@ -278,7 +278,7 @@ impl MailWindow {
         if let Some(l) = &event.location {
             body.push_str(&format!("\n{l}"));
         }
-        crate::notify::desktop(title.clone(), body);
+        crate::notify::desktop(crate::notify::Level::Reminder, title.clone(), body);
         let t = cx.entity().downgrade();
         let id = event.id.clone();
         window.push_notification(
@@ -416,7 +416,7 @@ impl MailWindow {
                     self.sync_now(window, cx);
                 }
             }
-            Err(e) => window.push_notification(Notification::error(format!("Couldn’t save your response: {e}")), cx),
+            Err(e) => crate::ui::toast(window, cx, crate::notify::Level::Error, format!("Couldn’t save your response: {e}")),
         }
     }
 
@@ -432,19 +432,19 @@ impl MailWindow {
                     RecurrenceScope::Following => format!("Deleted “{}” and the following occurrences.", event.display_title()),
                     RecurrenceScope::All => format!("Deleted every occurrence of “{}”.", event.display_title()),
                 };
-                window.push_notification(Notification::info(what), cx);
+                crate::ui::toast(window, cx, crate::notify::Level::Info, what);
                 if self.connected(&self.account.id) {
                     self.sync_now(window, cx);
                 }
             }
-            Err(e) => window.push_notification(Notification::error(format!("Couldn’t delete the event: {e}")), cx),
+            Err(e) => crate::ui::toast(window, cx, crate::notify::Level::Error, format!("Couldn’t delete the event: {e}")),
         }
     }
 
     pub(crate) fn start_new_event(&mut self, window: &mut Window, cx: &mut Context<Self>) {
         let editable: Vec<&Calendar> = self.calendars.iter().filter(|c| c.can_edit).collect();
         if editable.is_empty() {
-            window.push_notification(Notification::warning("No calendar you can write to is connected yet."), cx);
+            crate::ui::toast(window, cx, crate::notify::Level::Warning, "No calendar you can write to is connected yet.");
             return;
         }
         let calendar = editable.iter().find(|c| c.is_primary).or(editable.first()).map(|c| c.id.clone());
@@ -536,7 +536,7 @@ impl MailWindow {
                     self.cal_selected = Some(existing_id);
                     self.cal_focus.focus(window, cx);
                     cx.notify();
-                    window.push_notification(Notification::info("Saved on this device. Syncing to your calendar…"), cx);
+                    crate::ui::toast(window, cx, crate::notify::Level::Info, "Saved on this device. Syncing to your calendar…");
                     if self.connected(&self.account.id) {
                         self.sync_now(window, cx);
                     }
@@ -580,7 +580,7 @@ impl MailWindow {
                 self.cal_selected = Some(event.id.clone());
                 self.cal_focus.focus(window, cx);
                 cx.notify();
-                window.push_notification(Notification::info("Saved on this device. Syncing to your calendar…"), cx);
+                crate::ui::toast(window, cx, crate::notify::Level::Info, "Saved on this device. Syncing to your calendar…");
                 if self.connected(&self.account.id) {
                     self.sync_now(window, cx);
                 }
@@ -982,12 +982,12 @@ impl MailWindow {
                 } else {
                     format!("Moved “{}” to {} {}.", event.display_title(), tz::format_day(start), tz::format_clock(start))
                 };
-                window.push_notification(Notification::info(what), cx);
+                crate::ui::toast(window, cx, crate::notify::Level::Info, what);
                 if self.connected(&self.account.id) {
                     self.sync_now(window, cx);
                 }
             }
-            Err(e) => window.push_notification(Notification::error(format!("Couldn’t move the event: {e}")), cx),
+            Err(e) => crate::ui::toast(window, cx, crate::notify::Level::Error, format!("Couldn’t move the event: {e}")),
         }
     }
 

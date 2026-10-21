@@ -11,10 +11,9 @@ use gpui_kit::base::{h_flex, v_flex};
 use gpui_kit::component::button::{Button, ButtonVariants};
 use gpui_kit::component::input::{Input, InputEvent, InputState, Textarea, TextareaState};
 use gpui_kit::component::menu::{DropdownMenu, PopupMenuItem};
-use gpui_kit::component::notification::Notification;
 use gpui_kit::component::scroll::ScrollableElement;
 use gpui_kit::component::switch::Switch;
-use gpui_kit::component::{Disableable, Sizable, WindowExt};
+use gpui_kit::component::{Disableable, Sizable};
 use gpui_kit::prelude::*;
 use gpui_kit::*;
 use overlook_core::*;
@@ -81,6 +80,7 @@ impl MailWindow {
             tracing::warn!("could not save preferences: {e}");
         }
         overlook_core::tz::set_clock_24h(self.prefs.clock_24h);
+        crate::notify::set_mirror(self.prefs.omarchy_notifications);
         self.reminders_enabled = self.prefs.event_reminders;
         self.reload(cx);
     }
@@ -644,6 +644,16 @@ impl MailWindow {
                 }),
             ))
             .child(section("Notifications", None))
+            .when(crate::notify::omarchy_available(), |d| {
+                d.child(setting_row(
+                    "Show in Omarchy notifications",
+                    "Messages such as Sent, sync errors and warnings also appear in Omarchy’s notification center; clicking one brings Overlook forward.",
+                    Switch::new("pref-omarchy-notify").checked(prefs.omarchy_notifications).on_click(cx.listener(|this, checked: &bool, _w, cx| {
+                        this.prefs.omarchy_notifications = *checked;
+                        this.save_prefs(cx);
+                    })).into_any_element(),
+                ))
+            })
             .child(setting_row(
                 "New mail",
                 "Desktop notification when new mail arrives.",
@@ -897,8 +907,8 @@ impl MailWindow {
             let _ = this.update_in(cx, |this, window, cx| {
                 this.backing_up = false;
                 match result {
-                    Ok(files) => window.push_notification(Notification::success(format!("Backed up {files} files to {}.", shown.display())), cx),
-                    Err(e) => window.push_notification(Notification::error(format!("The backup did not finish: {e}")), cx),
+                    Ok(files) => crate::ui::toast(window, cx, crate::notify::Level::Success, format!("Backed up {files} files to {}.", shown.display())),
+                    Err(e) => crate::ui::toast(window, cx, crate::notify::Level::Error, format!("The backup did not finish: {e}")),
                 }
                 cx.notify();
             });

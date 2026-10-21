@@ -47,6 +47,8 @@ pub struct Prefs {
     pub clock_24h: bool,
     pub week_starts_monday: bool,
     pub new_mail_notifications: NewMailNotifications,
+    /// On Omarchy, also show Overlook's messages (sent, errors, warnings) as desktop notifications.
+    pub omarchy_notifications: bool,
     pub event_reminders: bool,
     pub sync_interval_secs: u32,
     // Mail
@@ -79,6 +81,7 @@ impl Default for Prefs {
             clock_24h: false,
             week_starts_monday: true,
             new_mail_notifications: NewMailNotifications::FocusedOnly,
+            omarchy_notifications: true,
             event_reminders: true,
             sync_interval_secs: 30,
             show_avatars: true,
