@@ -40,6 +40,13 @@ pub fn set_inbox_limit(limit: usize) {
 }
 pub const SETTING_APPEARANCE: &str = "appearance";
 
+/// When the process started, for the startup timings logged at info level.
+pub static STARTED: std::sync::OnceLock<std::time::Instant> = std::sync::OnceLock::new();
+
+pub fn since_start_ms() -> u128 {
+    STARTED.get().map(|t| t.elapsed().as_millis()).unwrap_or(0)
+}
+
 fn data_dir() -> PathBuf {
     if let Ok(dir) = std::env::var("OVERLOOK_DATA_DIR") {
         return PathBuf::from(dir);
@@ -83,6 +90,7 @@ fn open_store() -> anyhow::Result<(Arc<Store>, Vec<Account>)> {
 }
 
 fn main() {
+    STARTED.get_or_init(std::time::Instant::now);
     // Plain command-line conveniences; anything else starts the app.
     let args: Vec<String> = std::env::args().skip(1).collect();
     let mailto = args.iter().find(|a| a.to_ascii_lowercase().starts_with("mailto:")).cloned();
@@ -111,6 +119,7 @@ fn main() {
             std::process::exit(1);
         }
     };
+    tracing::debug!("startup: store open after {} ms", since_start_ms());
     single_instance::listen();
     if let Some(link) = mailto {
         single_instance::push(link);
@@ -123,12 +132,14 @@ fn main() {
     }
 
     gpui_kit::application().with_assets(assets::Assets).run(move |cx| {
+        tracing::debug!("startup: app running after {} ms", since_start_ms());
         gpui_kit::init(cx);
         let mut fonts: Vec<Cow<'static, [u8]>> = assets::INTER_FACES.iter().map(|f| Cow::Borrowed(*f)).collect();
         fonts.push(Cow::Borrowed(assets::SOURCE_SERIF_DISPLAY));
         if let Err(e) = cx.text_system().add_fonts(fonts) {
             tracing::warn!("bundled fonts could not be loaded: {e}");
         }
+        tracing::debug!("startup: fonts loaded after {} ms", since_start_ms());
 
         if let Ok(Some(prefs)) = store.setting::<overlook_core::Prefs>("prefs") {
             set_inbox_limit(prefs.inbox_messages as usize);
@@ -141,6 +152,7 @@ fn main() {
             .unwrap_or_default();
         theme::apply_preference(preference, theme::system_appearance(cx.window_appearance()), cx);
         ui::init(cx);
+        tracing::debug!("startup: theme and keys ready after {} ms", since_start_ms());
 
         let bounds = Bounds::centered(None, size(px(1320.), px(920.)), cx);
         let options = WindowOptions {

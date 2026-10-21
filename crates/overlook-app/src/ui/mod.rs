@@ -314,6 +314,7 @@ pub struct MailWindow {
     prerender: Option<Task<()>>,
     /// Background download of attachments the reader would fetch on open.
     prefetching: bool,
+    first_frame_logged: bool,
     /// The message list draws only the rows in view; it keeps the rows it was last given
     /// so a change re-measures just the rows that differ.
     list_state: ListState,
@@ -418,6 +419,7 @@ impl MailWindow {
         window: &mut Window,
         cx: &mut Context<Self>,
     ) -> Self {
+        tracing::debug!("startup: window opening after {} ms", crate::since_start_ms());
         let account = accounts.iter().find(|a| a.id == active).cloned().unwrap_or_else(|| accounts[0].clone());
         let mut providers: HashMap<AccountId, providers::AccountProviders> = HashMap::new();
         let mut provider_issues = HashMap::new();
@@ -435,6 +437,7 @@ impl MailWindow {
         let search_input = cx.new(|cx| InputState::new(window, cx).placeholder("Search mail"));
         let contact_search = cx.new(|cx| InputState::new(window, cx).placeholder("Search contacts"));
         let mut subs = Vec::new();
+        tracing::debug!("startup: accounts and sign-ins loaded after {} ms", crate::since_start_ms());
         let (idle_tx, idle_rx) = tokio::sync::mpsc::unbounded_channel::<AccountId>();
         subs.push(cx.subscribe_in(&contact_search, window, |this, state, event: &InputEvent, _window, cx| {
             if matches!(event, InputEvent::Change) {
@@ -514,6 +517,7 @@ impl MailWindow {
             local_in_flight: Vec::new(),
             prerender: None,
             prefetching: false,
+            first_frame_logged: false,
             list_state: ListState::new(0, ListAlignment::Top, px(600.)),
             shown_rows: Default::default(),
             drafts: Vec::new(),
@@ -2969,6 +2973,10 @@ impl Focusable for MailWindow {
 
 impl Render for MailWindow {
     fn render(&mut self, _window: &mut Window, cx: &mut Context<Self>) -> impl IntoElement {
+        if !self.first_frame_logged {
+            self.first_frame_logged = true;
+            tracing::info!("startup: first frame after {} ms", crate::since_start_ms());
+        }
         let p: Palette = *cx.palette();
         v_flex()
             .id("mail-window")
