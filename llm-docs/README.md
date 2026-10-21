@@ -7,6 +7,7 @@ Overlook is a native Linux mail client in Rust, with an Outlook-inspired workflo
 - [Native app guide](overlook-native-app.md): building, running, testing, architecture, keyboard shortcuts, and known gaps of the GPUI application in `crates/`.
 - [Product and implementation plan](native-linux-mail-client-plan.md): phased provider support, architecture, offline synchronization, Light/Dark theming, and release criteria.
 - [IMAP and POP3 implementation plan](imap-pop3-implementation-plan.md): phase 2 and 3 design fitted to the current provider trait, sync engine, store, and settings UI; milestones M0 to M5.
+- [Google data flow review](google-data-flow-review.md): source evidence, privacy qualifications, test results, and architecture wording for the CASA applicability discussion.
 - [Brand system](overlook-brand.md): the selected identity, positioning, logo usage, colors, typography, voice, and product design guidance.
 - [Brand asset guide](overlook-brand-assets.md): the asset inventory, implementation handoff, regeneration instructions, and archive packaging.
 - [Art direction](overlook-art-direction.md): original landscape artwork provenance and exact generation prompt.
