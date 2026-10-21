@@ -267,7 +267,7 @@ Reference captures from this run are in `branding/previews/overlook-native-*.png
 
 ### Keyboard
 
-Window: `Ctrl N` new message, `Ctrl E` / `Ctrl K` search, `Ctrl R` reply, `Ctrl Shift R` reply all, `Ctrl F` forward, `Ctrl U` toggle read, `Ctrl Enter` send (from any composer field), `Esc` save and close composer / clear search, `F5` sync.
+Window: `Ctrl N` new message, `Ctrl E` search, `Ctrl K` (or `Ctrl Shift P`) command palette: every action, mailbox and label by typing, `Move to <label>` for the open conversation, Settings pages and accounts, `Ctrl R` reply, `Ctrl Shift R` reply all, `Ctrl F` forward, `Ctrl U` toggle read, `Ctrl Enter` send (from any composer field), `Esc` save and close composer / clear search, `F5` sync.
 Message list: `J`/`↓` next, `K`/`↑` previous, `E`/`Backspace` archive, `Delete` trash, `S` star, `U` toggle read, `Enter` expand latest message.
 Composer header fields: `Enter` moves to the next field.
 

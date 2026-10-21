@@ -5,6 +5,7 @@ mod calendar;
 mod composer;
 mod contacts;
 mod mail_highlight;
+mod palette;
 mod list;
 mod settings;
 mod reader;
@@ -50,6 +51,7 @@ actions!(
     [
         Compose,
         FocusSearch,
+        OpenCommandPalette,
         Escape,
         SendMessage,
         Reply,
@@ -100,7 +102,8 @@ pub fn init(cx: &mut App) {
     cx.bind_keys([
         KeyBinding::new("ctrl-n", Compose, Some(WINDOW_CONTEXT)),
         KeyBinding::new("ctrl-e", FocusSearch, Some(WINDOW_CONTEXT)),
-        KeyBinding::new("ctrl-k", FocusSearch, Some(WINDOW_CONTEXT)),
+        KeyBinding::new("ctrl-k", OpenCommandPalette, Some(WINDOW_CONTEXT)),
+        KeyBinding::new("ctrl-shift-p", OpenCommandPalette, Some(WINDOW_CONTEXT)),
         KeyBinding::new("escape", Escape, Some(WINDOW_CONTEXT)),
         KeyBinding::new("ctrl-enter", SendMessage, Some(WINDOW_CONTEXT)),
         KeyBinding::new("ctrl-r", Reply, Some(WINDOW_CONTEXT)),
@@ -317,6 +320,7 @@ pub struct MailWindow {
     /// Background download of attachments the reader would fetch on open.
     prefetching: bool,
     first_frame_logged: bool,
+    palette: Option<palette::CommandPalette>,
     /// The message list draws only the rows in view; it keeps the rows it was last given
     /// so a change re-measures just the rows that differ.
     list_state: ListState,
@@ -521,6 +525,7 @@ impl MailWindow {
             prerender: None,
             prefetching: false,
             first_frame_logged: false,
+            palette: None,
             list_state: ListState::new(0, ListAlignment::Top, px(600.)),
             shown_rows: Default::default(),
             drafts: Vec::new(),
@@ -2300,8 +2305,22 @@ impl MailWindow {
             s.select_all(window, cx);
         });
     }
+    fn on_command_palette(&mut self, _: &OpenCommandPalette, window: &mut Window, cx: &mut Context<Self>) {
+        // Ctrl+K in the composer body inserts a link, as in Gmail and Outlook.
+        if self.composer_body_focused(window, cx) {
+            self.format_link(window, cx);
+            return;
+        }
+        if self.palette.is_some() {
+            self.close_palette(window, cx);
+        } else {
+            self.open_palette(window, cx);
+        }
+    }
     fn on_escape(&mut self, _: &Escape, window: &mut Window, cx: &mut Context<Self>) {
-        if self.account_setup.is_some() {
+        if self.palette.is_some() {
+            self.close_palette(window, cx);
+        } else if self.account_setup.is_some() {
             self.close_account_setup(window, cx);
         } else if self.quick_look.is_some() {
             self.quick_look = None;
@@ -3002,6 +3021,7 @@ impl Render for MailWindow {
             .track_focus(&self.focus_handle)
             .on_action(cx.listener(Self::on_compose))
             .on_action(cx.listener(Self::on_focus_search))
+            .on_action(cx.listener(Self::on_command_palette))
             .on_action(cx.listener(Self::on_format_bold))
             .on_action(cx.listener(Self::on_format_italic))
             .on_action(cx.listener(Self::on_format_strike))
@@ -3051,5 +3071,6 @@ impl Render for MailWindow {
             .when(self.settings.is_some(), |d| d.child(self.render_settings(cx)))
             .when(self.account_setup.is_some(), |d| d.child(self.render_account_setup(cx)))
             .when(self.quick_look.is_some(), |d| d.child(self.render_quick_look(cx)))
+            .when(self.palette.is_some(), |d| d.child(self.render_palette(cx)))
     }
 }

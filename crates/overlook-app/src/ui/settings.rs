@@ -29,9 +29,9 @@ pub enum SettingsPage {
 }
 
 impl SettingsPage {
-    const ALL: [SettingsPage; 5] = [SettingsPage::Accounts, SettingsPage::General, SettingsPage::Mail, SettingsPage::Calendar, SettingsPage::About];
+    pub(crate) const ALL: [SettingsPage; 5] = [SettingsPage::Accounts, SettingsPage::General, SettingsPage::Mail, SettingsPage::Calendar, SettingsPage::About];
 
-    fn label(self) -> &'static str {
+    pub(crate) fn label(self) -> &'static str {
         match self {
             SettingsPage::Accounts => "Accounts",
             SettingsPage::General => "General",
