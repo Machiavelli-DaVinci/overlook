@@ -312,6 +312,8 @@ pub struct MailWindow {
     /// Off-screen renders of the conversations next to the open one; replaced (and so
     /// cancelled) whenever the selection moves.
     prerender: Option<Task<()>>,
+    /// Background download of attachments the reader would fetch on open.
+    prefetching: bool,
     /// The message list draws only the rows in view; it keeps the rows it was last given
     /// so a change re-measures just the rows that differ.
     list_state: ListState,
@@ -511,6 +513,7 @@ impl MailWindow {
             local_writes: VecDeque::new(),
             local_in_flight: Vec::new(),
             prerender: None,
+            prefetching: false,
             list_state: ListState::new(0, ListAlignment::Top, px(600.)),
             shown_rows: Default::default(),
             drafts: Vec::new(),
@@ -1410,9 +1413,7 @@ impl MailWindow {
             return;
         };
         let account = self.account.clone();
-        let safe_name: String = attachment.filename.chars().map(|c| if matches!(c, '/' | '\\' | '\0') { '_' } else { c }).collect();
-        let dir = self.attachments_dir.join(account.id.as_str().replace([':', '/'], "_")).join(message.id.as_str().replace([':', '/'], "_"));
-        let dest = dir.join(if safe_name.trim().is_empty() || safe_name.starts_with('.') { format!("attachment{}", safe_name) } else { safe_name });
+        let (dir, dest) = self.attachment_path(&account.id, &attachment);
         self.downloading.insert(attachment.id.clone());
         cx.notify();
         let att = attachment.clone();
@@ -1445,6 +1446,80 @@ impl MailWindow {
                     Err(e) => window.push_notification(Notification::error(format!("Couldn’t download {}: {e}", attachment.filename)), cx),
                 }
                 cx.notify();
+            });
+        })
+        .detach();
+    }
+
+    /// Where a downloaded attachment lives: one folder per account and message.
+    fn attachment_path(&self, account: &AccountId, attachment: &Attachment) -> (PathBuf, PathBuf) {
+        let safe_name: String = attachment.filename.chars().map(|c| if matches!(c, '/' | '\\' | '\0') { '_' } else { c }).collect();
+        let dir = self.attachments_dir.join(account.as_str().replace([':', '/'], "_")).join(attachment.message_id.as_str().replace([':', '/'], "_"));
+        let dest = dir.join(if safe_name.trim().is_empty() || safe_name.starts_with('.') { format!("attachment{}", safe_name) } else { safe_name });
+        (dir, dest)
+    }
+
+    /// Downloads, one at a time in list order, the images and PDFs the reader would fetch
+    /// when a message opens: Inbox conversations first, then unread mail elsewhere. They
+    /// come from the user's own mail provider; nothing else is contacted.
+    fn prefetch_attachments(&mut self, cx: &mut Context<Self>) {
+        const INLINE_LIMIT: u64 = 4 * 1024 * 1024;
+        const MESSAGES: usize = 80;
+        if self.prefetching {
+            return;
+        }
+        let Some(provider) = self.providers.get(&self.account.id).map(|p| p.mail.clone()) else { return };
+        let owner = self.account.email.clone();
+        let mut convs = self.mail_index.conversations(&owner, &MailboxView::Kind(LabelKind::Inbox), ListFilter::All, None);
+        let unread = self.mail_index.conversations(&owner, &MailboxView::Kind(LabelKind::Archive), ListFilter::Unread, None);
+        convs.extend(unread);
+        let mut wanted: Vec<(Attachment, PathBuf, PathBuf)> = Vec::new();
+        for c in convs.iter().take(MESSAGES) {
+            for id in self.mail_index.message_ids_in(&c.id) {
+                let Some(m) = self.mail_index.message(&id) else { continue };
+                for a in &m.attachments {
+                    let wanted_kind = a.is_inline_image() || a.is_image() || a.is_pdf();
+                    let small = a.size_bytes <= if a.is_pdf() { 2 * INLINE_LIMIT } else { INLINE_LIMIT };
+                    let missing = !a.local_path.as_deref().map(PathBuf::from).is_some_and(|p| p.exists());
+                    if wanted_kind && small && missing && a.provider_id.is_some() && !self.downloading.contains(&a.id) {
+                        let (dir, dest) = self.attachment_path(&self.account.id, a);
+                        wanted.push((a.clone(), dir, dest));
+                    }
+                }
+            }
+        }
+        if wanted.is_empty() {
+            return;
+        }
+        self.prefetching = true;
+        let store = self.store.clone();
+        let account = self.account.clone();
+        cx.spawn(async move |this, cx| {
+            let fetched = cx
+                .background_spawn(async move {
+                    let mut fetched = 0;
+                    for (att, dir, dest) in wanted {
+                        let Some(message) = store.message(&att.message_id).ok().flatten() else { continue };
+                        let Ok(bytes) = provider.fetch_attachment(&account, &message, &att).await else {
+                            // Offline or rate limited: stop and try again after the next sync.
+                            break;
+                        };
+                        if std::fs::create_dir_all(&dir).is_ok() && std::fs::write(&dest, &bytes).is_ok() {
+                            let _ = store.set_attachment_local_path(&att.id, Some(&dest.to_string_lossy()));
+                            fetched += 1;
+                        }
+                    }
+                    fetched
+                })
+                .await;
+            let _ = this.update(cx, |this, cx| {
+                this.prefetching = false;
+                if fetched > 0 {
+                    // The open conversation may have gained images; the index sees new paths.
+                    this.load_thread();
+                    this.rebuild_mail_index(cx);
+                    cx.notify();
+                }
             });
         })
         .detach();
@@ -2153,6 +2228,9 @@ impl MailWindow {
                     this.provider_issues.insert(account.id.clone(), wording.into());
                 }
                 this.reload(cx);
+                if matches!(outcome.state, Some(SyncState::UpToDate)) && account.id == this.account.id {
+                    this.prefetch_attachments(cx);
+                }
                 if first_download && outcome.downloaded > 0 {
                     window.push_notification(Notification::success(format!("Downloaded {} recent messages for {}.", outcome.downloaded, account.email)), cx);
                 }
