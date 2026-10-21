@@ -96,6 +96,10 @@ impl LocalChange {
 
 pub struct Store {
     conn: Mutex<Connection>,
+    /// A second connection for the reads the window does on every action (the mail index,
+    /// the open conversation). With WAL it reads the last committed state while a sync
+    /// holds `conn` for a write, so the UI never waits for a download. `None` in memory.
+    reader: Option<Mutex<Connection>>,
 }
 
 impl Store {
@@ -103,8 +107,11 @@ impl Store {
         if let Some(parent) = path.parent() {
             let _ = std::fs::create_dir_all(parent);
         }
-        let conn = Connection::open(path)?;
-        Self::init(conn)
+        let mut store = Self::init(Connection::open(path)?)?;
+        let reader = Connection::open_with_flags(path, rusqlite::OpenFlags::SQLITE_OPEN_READ_ONLY | rusqlite::OpenFlags::SQLITE_OPEN_NO_MUTEX)?;
+        reader.busy_timeout(std::time::Duration::from_secs(5))?;
+        store.reader = Some(Mutex::new(reader));
+        Ok(store)
     }
 
     pub fn open_in_memory() -> Result<Self> {
@@ -117,7 +124,7 @@ impl Store {
         conn.pragma_update(None, "foreign_keys", "ON")?;
         conn.busy_timeout(std::time::Duration::from_secs(5))?;
         schema::migrate(&conn)?;
-        Ok(Self { conn: Mutex::new(conn) })
+        Ok(Self { conn: Mutex::new(conn), reader: None })
     }
 
     fn with_tx<T>(&self, f: impl FnOnce(&Transaction) -> Result<T>) -> Result<T> {
@@ -131,6 +138,14 @@ impl Store {
     fn with_conn<T>(&self, f: impl FnOnce(&Connection) -> Result<T>) -> Result<T> {
         let conn = self.conn.lock().expect("store mutex poisoned");
         f(&conn)
+    }
+
+    /// Runs a read-only query on the reader connection when there is one.
+    fn with_read<T>(&self, f: impl FnOnce(&Connection) -> Result<T>) -> Result<T> {
+        match &self.reader {
+            Some(reader) => f(&reader.lock().expect("store reader mutex poisoned")),
+            None => self.with_conn(f),
+        }
     }
 
     // ----------------------------------------------------------------- accounts
@@ -319,14 +334,14 @@ impl Store {
     }
 
     pub fn message(&self, id: &MessageId) -> Result<Option<Message>> {
-        self.with_conn(|c| {
+        self.with_read(|c| {
             let mut found = load_messages(c, "WHERE m.id=?1", params![id.0])?;
             Ok(found.pop())
         })
     }
 
     pub fn messages_in_conversation(&self, account: &AccountId, conversation: &ConversationId) -> Result<Vec<Message>> {
-        self.with_conn(|c| {
+        self.with_read(|c| {
             let mut msgs = load_messages(c, "WHERE m.account_id=?1 AND m.conversation_id=?2", params![account.0, conversation.0])?;
             msgs.sort_by_key(|m| m.date);
             Ok(msgs)
@@ -338,13 +353,17 @@ impl Store {
         self.with_conn(|c| load_messages(c, "WHERE m.account_id=?1", params![account.0]))
     }
 
-    /// Conversation summaries for a mailbox view, newest first. `focus` splits the Inbox
-    /// into Focused and Other; `None` shows everything.
+    /// Every message of an account without bodies: enough for lists, counts and address
+    /// lookups, at a fraction of the cost of [`Store::messages_for_account`].
+    pub fn message_headers_for_account(&self, account: &AccountId) -> Result<Vec<Message>> {
+        self.with_read(|c| load_messages_with(c, "WHERE m.account_id=?1", params![account.0], false))
+    }
+
     /// Every message of an account without its body, with labels, pending changes and
     /// Focused Inbox rules: enough to build any conversation list or count in memory.
     pub fn mail_index(&self, account: &AccountId) -> Result<MailIndex> {
         let labels = self.labels(account)?;
-        let messages = self.with_conn(|c| load_messages_with(c, "WHERE m.account_id=?1", params![account.0], false))?;
+        let messages = self.message_headers_for_account(account)?;
         let pending = self.pending_message_ids(account)?;
         let rules = self.focus_rule_map(account)?;
         Ok(MailIndex::new(labels, messages, pending, rules))
@@ -414,7 +433,7 @@ impl Store {
     /// Lowercase addresses the account owner has sent mail to.
     pub fn sent_recipients(&self, account: &AccountId) -> Result<HashSet<String>> {
         let mut out = HashSet::new();
-        for m in self.messages_for_account(account)? {
+        for m in self.message_headers_for_account(account)? {
             if m.is_outgoing {
                 for a in m.to.iter().chain(m.cc.iter()) {
                     out.insert(a.email.to_ascii_lowercase());
@@ -1290,7 +1309,7 @@ impl Store {
     /// Addresses the user has corresponded with, most frequent first, for recipient
     /// autocomplete.
     pub fn known_recipients(&self, account: &AccountId, prefix: &str, limit: usize) -> Result<Vec<Address>> {
-        let msgs = self.messages_for_account(account)?;
+        let msgs = self.message_headers_for_account(account)?;
         let needle = prefix.trim().to_ascii_lowercase();
         let mut counts: BTreeMap<String, (Address, usize)> = BTreeMap::new();
         for m in msgs {
@@ -1562,13 +1581,13 @@ fn search_text(m: &Message) -> String {
     format!("{}\n{}", people.join(" "), body)
 }
 
-fn load_messages(c: &Connection, where_clause: &str, args: impl rusqlite::Params) -> Result<Vec<Message>> {
+fn load_messages(c: &Connection, where_clause: &str, args: &[&dyn rusqlite::ToSql]) -> Result<Vec<Message>> {
     load_messages_with(c, where_clause, args, true)
 }
 
 /// Loads messages with labels and attachments; `bodies: false` leaves the bodies empty,
 /// which is all a list or count needs and far less to read.
-fn load_messages_with(c: &Connection, where_clause: &str, args: impl rusqlite::Params, bodies: bool) -> Result<Vec<Message>> {
+fn load_messages_with(c: &Connection, where_clause: &str, args: &[&dyn rusqlite::ToSql], bodies: bool) -> Result<Vec<Message>> {
     let body_columns = if bodies { "m.body_text, m.body_html" } else { "NULL, NULL" };
     let sql = format!(
         "SELECT m.id, m.account_id, m.conversation_id, m.provider_id, m.from_json, m.to_json, m.cc_json, m.bcc_json, m.reply_to_json,
@@ -1620,15 +1639,19 @@ fn load_messages_with(c: &Connection, where_clause: &str, args: impl rusqlite::P
     for (i, m) in messages.iter().enumerate() {
         by_id.insert(m.id.0.clone(), i);
     }
-    let mut stmt = c.prepare("SELECT message_id, label_id FROM message_labels")?;
-    for row in stmt.query_map([], |r| Ok((r.get::<_, String>(0)?, r.get::<_, String>(1)?)))? {
+    // Labels and attachments of the same messages only, not of the whole database.
+    let mut stmt = c.prepare(&format!("SELECT ml.message_id, ml.label_id FROM message_labels ml JOIN messages m ON m.id = ml.message_id {where_clause}"))?;
+    for row in stmt.query_map(args, |r| Ok((r.get::<_, String>(0)?, r.get::<_, String>(1)?)))? {
         let (mid, lid) = row?;
         if let Some(&i) = by_id.get(&mid) {
             messages[i].label_ids.insert(LabelId(lid));
         }
     }
-    let mut stmt = c.prepare("SELECT id, message_id, filename, mime_type, size_bytes, local_path, provider_id, content_id FROM attachments ORDER BY rowid")?;
-    for row in stmt.query_map([], |r| {
+    let mut stmt = c.prepare(&format!(
+        "SELECT a.id, a.message_id, a.filename, a.mime_type, a.size_bytes, a.local_path, a.provider_id, a.content_id
+         FROM attachments a JOIN messages m ON m.id = a.message_id {where_clause} ORDER BY a.rowid"
+    ))?;
+    for row in stmt.query_map(args, |r| {
         Ok(Attachment {
             id: AttachmentId(r.get(0)?),
             message_id: MessageId(r.get(1)?),

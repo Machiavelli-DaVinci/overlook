@@ -445,46 +445,22 @@ fn download(store: &Store, provider: &dyn MailProvider, account: &Account, outco
     }
 }
 
-pub async fn run_sync(store: Arc<Store>, provider: Arc<dyn MailProvider>, calendar: Option<Arc<dyn CalendarProvider>>, account: Account) -> SyncOutcome {
-    let mut outcome = SyncOutcome::default();
+/// Sends pending local changes (sends, label changes, calendar and contact edits) to the
+/// provider in order, and returns the state to report.
+async fn replay_operations(
+    store: &Arc<Store>,
+    provider: &Arc<dyn MailProvider>,
+    calendar: &Option<Arc<dyn CalendarProvider>>,
+    account: &Account,
+    outcome: &mut SyncOutcome,
+) -> SyncState {
     let acct = account.id.clone();
-
-    if let Err(err) = provider.probe().await {
-        let state = state_for(&err);
-        let _ = store.set_sync_state(&acct, &state, None);
-        outcome.state = Some(state);
-        outcome.stopped_offline = true;
-        return outcome;
-    }
-    let _ = store.set_sync_state(&acct, &SyncState::Syncing, None);
-
-    let mut deferred: Vec<(MessageId, ProviderId)> = Vec::new();
-    if let Err(err) = download(&store, provider.as_ref(), &account, &mut outcome, &mut deferred) {
-        warn!("download paused for {}: {err}", account.email);
-        outcome.rate_limited = matches!(err, ProviderError::RateLimited(_));
-        let state = state_for(&err);
-        let _ = store.set_sync_state(&acct, &state, None);
-        outcome.state = Some(state);
-        outcome.stopped_offline = matches!(err, ProviderError::Offline);
-        return outcome;
-    }
-
-    if let Some(cal) = &calendar {
-        sync_calendar(&store, cal.as_ref(), &account, &mut outcome);
-    }
-    sync_contacts(&store, provider.as_ref(), &account).await;
-
     let labels = store.labels(&acct).unwrap_or_default();
     let sent_label = labels.iter().find(|l| l.kind == LabelKind::Sent).map(|l| l.id.clone());
     let calendars = store.calendars(&acct).unwrap_or_default();
     let ops = match store.pending_operations(&acct) {
         Ok(ops) => ops,
-        Err(e) => {
-            let state = SyncState::SyncFailed(e.to_string());
-            let _ = store.set_sync_state(&acct, &state, None);
-            outcome.state = Some(state);
-            return outcome;
-        }
+        Err(e) => return SyncState::SyncFailed(e.to_string()),
     };
 
     let mut final_state = SyncState::UpToDate;
@@ -680,6 +656,56 @@ pub async fn run_sync(store: Arc<Store>, provider: Arc<dyn MailProvider>, calend
             }
         }
     }
+    final_state
+}
+
+pub async fn run_sync(store: Arc<Store>, provider: Arc<dyn MailProvider>, calendar: Option<Arc<dyn CalendarProvider>>, account: Account) -> SyncOutcome {
+    let mut outcome = SyncOutcome::default();
+    let acct = account.id.clone();
+
+    if let Err(err) = provider.probe().await {
+        let state = state_for(&err);
+        let _ = store.set_sync_state(&acct, &state, None);
+        outcome.state = Some(state);
+        outcome.stopped_offline = true;
+        return outcome;
+    }
+    let _ = store.set_sync_state(&acct, &SyncState::Syncing, None);
+
+    // What the user already did goes to the server first, so an archive or a send does not
+    // wait behind a download. Anything queued meanwhile goes in the pass after it.
+    let pre_state = if store.pending_count(&acct).unwrap_or(0) > 0 {
+        replay_operations(&store, &provider, &calendar, &account, &mut outcome).await
+    } else {
+        SyncState::UpToDate
+    };
+    if outcome.stopped_offline || outcome.rate_limited {
+        let _ = store.set_sync_state(&acct, &pre_state, None);
+        outcome.state = Some(pre_state);
+        return outcome;
+    }
+
+    let mut deferred: Vec<(MessageId, ProviderId)> = Vec::new();
+    if let Err(err) = download(&store, provider.as_ref(), &account, &mut outcome, &mut deferred) {
+        warn!("download paused for {}: {err}", account.email);
+        outcome.rate_limited = matches!(err, ProviderError::RateLimited(_));
+        let state = state_for(&err);
+        let _ = store.set_sync_state(&acct, &state, None);
+        outcome.state = Some(state);
+        outcome.stopped_offline = matches!(err, ProviderError::Offline);
+        return outcome;
+    }
+
+    if let Some(cal) = &calendar {
+        sync_calendar(&store, cal.as_ref(), &account, &mut outcome);
+    }
+    sync_contacts(&store, provider.as_ref(), &account).await;
+
+    let final_state = if pre_state == SyncState::UpToDate {
+        replay_operations(&store, &provider, &calendar, &account, &mut outcome).await
+    } else {
+        pre_state
+    };
 
     // Held-back deletions: a move that found its message gave it a new provider id; one
     // that did not means the message really is gone.

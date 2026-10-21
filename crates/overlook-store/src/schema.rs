@@ -2,7 +2,7 @@
 
 use rusqlite::Connection;
 
-const MIGRATIONS: &[&str] = &[V1, V2, V3, V4, V5, V6, V7, V8, V9, V10, V11];
+const MIGRATIONS: &[&str] = &[V1, V2, V3, V4, V5, V6, V7, V8, V9, V10, V11, V12];
 
 pub fn migrate(conn: &Connection) -> rusqlite::Result<()> {
     let current: i64 = conn.query_row("PRAGMA user_version", [], |r| r.get(0))?;
@@ -314,5 +314,12 @@ CREATE TABLE pop3_seen (
 );
 ALTER TABLE messages ADD COLUMN references_json TEXT;
 CREATE INDEX messages_rfc_id ON messages(account_id, rfc_message_id);
+COMMIT;
+"#;
+
+/// Loading a message's attachments looks them up by message.
+const V12: &str = r#"
+BEGIN;
+CREATE INDEX attachments_message ON attachments(message_id);
 COMMIT;
 "#;
