@@ -49,6 +49,18 @@ impl MailIndex {
         self.by_conv.get(conv)?.iter().find(|m| &m.id == id)
     }
 
+    /// Addresses the account has corresponded with matching `prefix`, most frequent first.
+    pub fn known_recipients(&self, prefix: &str, limit: usize) -> Vec<Address> {
+        crate::known_recipients(self.by_conv.values().flatten(), prefix, limit)
+    }
+
+    /// The ids of a conversation's messages, oldest first.
+    pub fn message_ids_in(&self, conversation: &ConversationId) -> Vec<MessageId> {
+        let mut msgs: Vec<&Message> = self.by_conv.get(conversation).map(|m| m.iter().collect()).unwrap_or_default();
+        msgs.sort_by_key(|m| m.date);
+        msgs.into_iter().map(|m| m.id.clone()).collect()
+    }
+
     fn label_of_kind(&self, kind: LabelKind) -> Option<LabelId> {
         self.labels.iter().find(|l| l.kind == kind).map(|l| l.id.clone())
     }

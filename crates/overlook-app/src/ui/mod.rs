@@ -225,6 +225,7 @@ impl Render for DragPreview {
     }
 }
 
+#[derive(Clone, PartialEq)]
 pub enum ListRow {
     Group(SharedString, usize),
     Conversation(ConversationSummary),
@@ -311,6 +312,10 @@ pub struct MailWindow {
     /// Off-screen renders of the conversations next to the open one; replaced (and so
     /// cancelled) whenever the selection moves.
     prerender: Option<Task<()>>,
+    /// The message list draws only the rows in view; it keeps the rows it was last given
+    /// so a change re-measures just the rows that differ.
+    list_state: ListState,
+    shown_rows: std::rc::Rc<std::cell::RefCell<Vec<ListRow>>>,
     drafts: Vec<Draft>,
     outbox: Vec<Draft>,
     status: AccountStatus,
@@ -506,6 +511,8 @@ impl MailWindow {
             local_writes: VecDeque::new(),
             local_in_flight: Vec::new(),
             prerender: None,
+            list_state: ListState::new(0, ListAlignment::Top, px(600.)),
+            shown_rows: Default::default(),
             drafts: Vec::new(),
             outbox: Vec::new(),
             status: AccountStatus::default(),
@@ -1665,7 +1672,12 @@ impl MailWindow {
         };
         let id = self.conversations[next].id.clone();
         if Some(&id) != self.selected.as_ref() {
-            self.select_conversation(Some(id), window, cx);
+            self.select_conversation(Some(id.clone()), window, cx);
+        }
+        // Keep the selected row in view in the virtual list.
+        let ix = self.shown_rows.borrow().iter().position(|r| matches!(r, ListRow::Conversation(c) if c.id == id));
+        if let Some(ix) = ix {
+            self.list_state.scroll_to_reveal_item(ix);
         }
     }
 

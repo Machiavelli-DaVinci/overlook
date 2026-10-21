@@ -236,8 +236,9 @@ impl MailWindow {
         c.suggestions = if focused && last_token.len() >= 1 {
             // Address book first, then people written to before, without duplicates.
             let mut seen: std::collections::HashSet<String> = std::collections::HashSet::new();
-            let contacts = self.store.contacts_matching(&self.account.id, &last_token, 5).unwrap_or_default().into_iter().filter(|c| !c.email.is_empty()).map(|c| c.address());
-            let known = self.store.known_recipients(&self.account.id, &last_token, 5).unwrap_or_default().into_iter();
+            // Both from memory: no database read per keystroke.
+            let contacts = overlook_store::contacts_matching(&self.contacts, &last_token, 5).into_iter().filter(|c| !c.email.is_empty()).map(|c| c.address());
+            let known = self.mail_index.known_recipients(&last_token, 5).into_iter();
             contacts
                 .chain(known)
                 .filter(|a| !a.email.eq_ignore_ascii_case(&self.account.email))

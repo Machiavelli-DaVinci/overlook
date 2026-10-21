@@ -1216,23 +1216,7 @@ impl Store {
     /// Contacts whose name or address starts with `prefix` (any word of the name), address
     /// book entries first.
     pub fn contacts_matching(&self, account: &AccountId, prefix: &str, limit: usize) -> Result<Vec<Contact>> {
-        let needle = prefix.trim().to_ascii_lowercase();
-        if needle.is_empty() {
-            return Ok(Vec::new());
-        }
-        let mut hits: Vec<Contact> = self
-            .contacts_where(account, "", &[])?
-            .into_iter()
-            .filter(|c| {
-                c.emails.iter().any(|e| e.to_ascii_lowercase().starts_with(&needle))
-                    || c.email.to_ascii_lowercase().starts_with(&needle)
-                    || c.display_name().to_lowercase().split_whitespace().any(|w| w.starts_with(&needle))
-                    || c.display_name().to_lowercase().starts_with(&needle)
-            })
-            .collect();
-        hits.sort_by(|a, b| b.in_address_book.cmp(&a.in_address_book).then_with(|| a.name.is_none().cmp(&b.name.is_none())).then_with(|| a.display_name().cmp(&b.display_name())));
-        hits.truncate(limit);
-        Ok(hits)
+        Ok(contacts_matching(&self.contacts_where(account, "", &[])?, prefix, limit))
     }
 
     /// Saves a contact changed on this device and queues the push.
@@ -1309,30 +1293,56 @@ impl Store {
     /// Addresses the user has corresponded with, most frequent first, for recipient
     /// autocomplete.
     pub fn known_recipients(&self, account: &AccountId, prefix: &str, limit: usize) -> Result<Vec<Address>> {
-        let msgs = self.message_headers_for_account(account)?;
-        let needle = prefix.trim().to_ascii_lowercase();
-        let mut counts: BTreeMap<String, (Address, usize)> = BTreeMap::new();
-        for m in msgs {
-            for a in std::iter::once(&m.from).chain(m.to.iter()).chain(m.cc.iter()) {
-                let key = a.email.to_ascii_lowercase();
-                let entry = counts.entry(key).or_insert_with(|| (a.clone(), 0));
-                entry.1 += 1;
-                if entry.0.name.is_none() && a.name.is_some() {
-                    entry.0 = a.clone();
-                }
+        Ok(known_recipients(&self.message_headers_for_account(account)?, prefix, limit))
+    }
+}
+
+/// Contacts whose address or name starts with `prefix`, address book first. The window
+/// runs this on the contacts it already holds; the store on a fresh read.
+pub fn contacts_matching(contacts: &[Contact], prefix: &str, limit: usize) -> Vec<Contact> {
+    let needle = prefix.trim().to_ascii_lowercase();
+    if needle.is_empty() {
+        return Vec::new();
+    }
+    let mut hits: Vec<Contact> = contacts
+        .iter()
+        .filter(|c| {
+            c.emails.iter().any(|e| e.to_ascii_lowercase().starts_with(&needle))
+                || c.email.to_ascii_lowercase().starts_with(&needle)
+                || c.display_name().to_lowercase().split_whitespace().any(|w| w.starts_with(&needle))
+                || c.display_name().to_lowercase().starts_with(&needle)
+        })
+        .cloned()
+        .collect();
+    hits.sort_by(|a, b| b.in_address_book.cmp(&a.in_address_book).then_with(|| a.name.is_none().cmp(&b.name.is_none())).then_with(|| a.display_name().cmp(&b.display_name())));
+    hits.truncate(limit);
+    hits
+}
+
+/// Addresses seen in `msgs` matching `prefix`, most frequent first.
+pub fn known_recipients<'a>(msgs: impl IntoIterator<Item = &'a Message>, prefix: &str, limit: usize) -> Vec<Address> {
+    let needle = prefix.trim().to_ascii_lowercase();
+    let mut counts: BTreeMap<String, (Address, usize)> = BTreeMap::new();
+    for m in msgs {
+        for a in std::iter::once(&m.from).chain(m.to.iter()).chain(m.cc.iter()) {
+            let key = a.email.to_ascii_lowercase();
+            let entry = counts.entry(key).or_insert_with(|| (a.clone(), 0));
+            entry.1 += 1;
+            if entry.0.name.is_none() && a.name.is_some() {
+                entry.0 = a.clone();
             }
         }
-        let mut list: Vec<(Address, usize)> = counts
-            .into_values()
-            .filter(|(a, _)| {
-                needle.is_empty()
-                    || a.email.to_ascii_lowercase().contains(&needle)
-                    || a.name.as_deref().is_some_and(|n| n.to_ascii_lowercase().contains(&needle))
-            })
-            .collect();
-        list.sort_by(|a, b| b.1.cmp(&a.1).then_with(|| a.0.email.cmp(&b.0.email)));
-        Ok(list.into_iter().take(limit).map(|(a, _)| a).collect())
     }
+    let mut list: Vec<(Address, usize)> = counts
+        .into_values()
+        .filter(|(a, _)| {
+            needle.is_empty()
+                || a.email.to_ascii_lowercase().contains(&needle)
+                || a.name.as_deref().is_some_and(|n| n.to_ascii_lowercase().contains(&needle))
+        })
+        .collect();
+    list.sort_by(|a, b| b.1.cmp(&a.1).then_with(|| a.0.email.cmp(&b.0.email)));
+    list.into_iter().take(limit).map(|(a, _)| a).collect()
 }
 
 // ---------------------------------------------------------------------- helpers
@@ -2060,6 +2070,19 @@ mod tests {
                 assert_eq!(index.view_count(owner, view, None), fresh.view_count(owner, view, None));
             }
         }
+    }
+
+    #[test]
+    fn index_answers_recipients_and_thread_members_like_the_store() {
+        let store = Store::open_in_memory().unwrap();
+        seeded(&store);
+        let acct = AccountId::from("acct-1");
+        let index = store.mail_index(&acct).unwrap();
+        for prefix in ["", "ma", "jason", "nobody"] {
+            assert_eq!(index.known_recipients(prefix, 5), store.known_recipients(&acct, prefix, 5).unwrap(), "{prefix}");
+        }
+        assert_eq!(index.message_ids_in(&ConversationId::from("conv-m1")), vec![MessageId::from("m1")]);
+        assert!(index.message_ids_in(&ConversationId::from("missing")).is_empty());
     }
 
     #[test]

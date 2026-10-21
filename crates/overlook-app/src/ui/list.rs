@@ -27,6 +27,7 @@ impl MailWindow {
         };
         let rows = self.list_rows();
         let total = rows.iter().filter(|r| !matches!(r, ListRow::Group(..))).count();
+        self.sync_list_state(&rows);
         let focus_split = self.inbox_focus().is_some();
         let inbox_tab = self.inbox_tab;
         let filter = self.filter;
@@ -160,25 +161,21 @@ impl MailWindow {
                 .child(div().text_size(px(12.)).child(hint))
                 .into_any_element()
         } else {
-            let mut list = v_flex().id("message-rows").pb(px(12.)).px(px(8.)).flex_1().min_h_0();
-            for row in rows {
-                list = list.child(match row {
-                    ListRow::Group(label, n) => h_flex()
-                        .items_center()
-                        .justify_between()
-                        .px(px(11.))
-                        .pt(px(13.))
-                        .pb(px(5.))
-                        .text_size(px(11.))
-                        .text_color(p.muted)
-                        .child(label)
-                        .child(n.to_string())
-                        .into_any_element(),
-                    ListRow::Conversation(summary) => self.render_conversation_row(&summary, compact, cx).into_any_element(),
-                    ListRow::Draft(draft) => self.render_draft_row(&draft, cx).into_any_element(),
-                });
-            }
-            list.overflow_y_scrollbar().into_any_element()
+            let view = cx.entity();
+            let shown = self.shown_rows.clone();
+            div()
+                .flex_1()
+                .min_h_0()
+                .px(px(8.))
+                .child(
+                    list(self.list_state.clone(), move |ix, _window, cx| {
+                        let Some(row) = shown.borrow().get(ix).cloned() else { return div().into_any_element() };
+                        view.update(cx, |this, cx| this.render_list_row(row, compact, cx))
+                    })
+                    .size_full(),
+                )
+                .vertical_scrollbar(&self.list_state)
+                .into_any_element()
         };
 
         v_flex()
@@ -194,6 +191,38 @@ impl MailWindow {
             .child(body)
     }
 
+    /// Tells the virtual list which rows changed since the last frame. Rows that are the
+    /// same at the start and the end keep their measured heights and the scroll position.
+    fn sync_list_state(&self, rows: &[ListRow]) {
+        let mut old = self.shown_rows.borrow_mut();
+        if old.as_slice() == rows {
+            return;
+        }
+        let prefix = old.iter().zip(rows).take_while(|(a, b)| a == b).count();
+        let suffix = old[prefix..].iter().rev().zip(rows[prefix..].iter().rev()).take_while(|(a, b)| a == b).count();
+        self.list_state.splice(prefix..old.len() - suffix, rows.len() - prefix - suffix);
+        *old = rows.to_vec();
+    }
+
+    fn render_list_row(&mut self, row: ListRow, compact: bool, cx: &mut Context<Self>) -> AnyElement {
+        let p = *cx.palette();
+        match row {
+            ListRow::Group(label, n) => h_flex()
+                .items_center()
+                .justify_between()
+                .px(px(11.))
+                .pt(px(13.))
+                .pb(px(5.))
+                .text_size(px(11.))
+                .text_color(p.muted)
+                .child(label)
+                .child(n.to_string())
+                .into_any_element(),
+            ListRow::Conversation(summary) => self.render_conversation_row(&summary, compact, cx).into_any_element(),
+            ListRow::Draft(draft) => self.render_draft_row(&draft, cx).into_any_element(),
+        }
+    }
+
     pub(super) fn list_rows(&self) -> Vec<ListRow> {
         let mut rows = Vec::new();
         match &self.view {
@@ -205,15 +234,12 @@ impl MailWindow {
             }
             _ => {
                 let now = overlook_core::time::now();
-                let mut current: Option<DayGroup> = None;
-                for c in &self.conversations {
-                    let group = day_group(c.latest, now, self.utc_offset);
-                    if current.as_ref() != Some(&group) {
-                        let n = self
-                            .conversations
-                            .iter()
-                            .filter(|x| day_group(x.latest, now, self.utc_offset) == group)
-                            .count();
+                let groups: Vec<DayGroup> = self.conversations.iter().map(|c| day_group(c.latest, now, self.utc_offset)).collect();
+                let mut current: Option<&DayGroup> = None;
+                for (i, c) in self.conversations.iter().enumerate() {
+                    let group = &groups[i];
+                    if current != Some(group) {
+                        let n = groups[i..].iter().take_while(|g| *g == group).count();
                         rows.push(ListRow::Group(group.label().to_owned().into(), n));
                         current = Some(group);
                     }
@@ -242,7 +268,7 @@ impl MailWindow {
         let starred = c.starred;
         let pending = c.pending;
         let drag = super::ConversationDrag {
-            message_ids: self.store.messages_in_conversation(&self.account.id, &c.id).unwrap_or_default().into_iter().map(|m| m.id).collect(),
+            message_ids: self.mail_index.message_ids_in(&c.id),
             title: c.subject.clone(),
             count: c.message_count,
         };
