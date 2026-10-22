@@ -76,9 +76,7 @@ pub struct SettingsState {
 
 impl MailWindow {
     pub(crate) fn save_prefs(&mut self, cx: &mut Context<Self>) {
-        if let Err(e) = self.store.set_setting("prefs", &self.prefs) {
-            tracing::warn!("could not save preferences: {e}");
-        }
+        self.save_setting("prefs", &self.prefs);
         overlook_core::tz::set_clock_24h(self.prefs.clock_24h);
         crate::notify::set_mirror(self.prefs.omarchy_notifications);
         self.reminders_enabled = self.prefs.event_reminders;
@@ -237,9 +235,7 @@ impl MailWindow {
     }
 
     pub(crate) fn save_account_prefs(&mut self, id: &AccountId, prefs: AccountPrefs) {
-        if let Err(e) = self.store.set_setting(&format!("account_prefs:{}", id.0), &prefs) {
-            tracing::warn!("could not save account preferences: {e}");
-        }
+        self.save_setting(&format!("account_prefs:{}", id.0), &prefs);
         self.account_prefs.insert(id.clone(), prefs);
     }
 
@@ -609,7 +605,7 @@ impl MailWindow {
                 "Compact fits more messages on screen.",
                 choice(&[("Comfortable", Density::Comfortable), ("Compact", Density::Compact)], self.density, cx, |this, v, _w, cx| {
                     this.density = v;
-                    let _ = this.store.set_setting("density", &v);
+                    this.save_setting("density", &v);
                     cx.notify();
                 }),
             ))

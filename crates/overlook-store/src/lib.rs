@@ -162,7 +162,7 @@ impl Store {
     }
 
     pub fn accounts(&self) -> Result<Vec<Account>> {
-        self.with_conn(|c| {
+        self.with_read(|c| {
             let mut stmt = c.prepare("SELECT id, provider, display_name, email, created_at FROM accounts ORDER BY created_at")?;
             let rows = stmt.query_map([], |r| {
                 Ok(Account {
@@ -227,7 +227,7 @@ impl Store {
     }
 
     pub fn labels(&self, account: &AccountId) -> Result<Vec<Label>> {
-        self.with_conn(|c| {
+        self.with_read(|c| {
             let mut stmt = c.prepare("SELECT id, account_id, kind, name, provider_id, color, sort_order FROM labels WHERE account_id=?1 ORDER BY sort_order, name")?;
             let rows = stmt.query_map([&account.0], row_to_label)?;
             Ok(rows.collect::<std::result::Result<Vec<_>, _>>()?)
@@ -235,7 +235,7 @@ impl Store {
     }
 
     pub fn label_by_kind(&self, account: &AccountId, kind: LabelKind) -> Result<Option<Label>> {
-        self.with_conn(|c| {
+        self.with_read(|c| {
             Ok(c.query_row(
                 "SELECT id, account_id, kind, name, provider_id, color, sort_order FROM labels WHERE account_id=?1 AND kind=?2 LIMIT 1",
                 params![account.0, kind.as_key()],
@@ -330,7 +330,7 @@ impl Store {
     }
 
     pub fn message_count(&self, account: &AccountId) -> Result<usize> {
-        self.with_conn(|c| Ok(c.query_row("SELECT COUNT(*) FROM messages WHERE account_id=?1", [&account.0], |r| r.get::<_, i64>(0))? as usize))
+        self.with_read(|c| Ok(c.query_row("SELECT COUNT(*) FROM messages WHERE account_id=?1", [&account.0], |r| r.get::<_, i64>(0))? as usize))
     }
 
     pub fn message(&self, id: &MessageId) -> Result<Option<Message>> {
@@ -350,7 +350,7 @@ impl Store {
 
     /// All messages of an account (prototype scale). Used to compute conversation lists.
     pub fn messages_for_account(&self, account: &AccountId) -> Result<Vec<Message>> {
-        self.with_conn(|c| load_messages(c, "WHERE m.account_id=?1", params![account.0]))
+        self.with_read(|c| load_messages(c, "WHERE m.account_id=?1", params![account.0]))
     }
 
     /// Every message of an account without bodies: enough for lists, counts and address
@@ -390,7 +390,7 @@ impl Store {
     // ------------------------------------------------------------ focused inbox
 
     pub fn focus_rules(&self, account: &AccountId) -> Result<Vec<FocusRule>> {
-        self.with_conn(|c| {
+        self.with_read(|c| {
             let mut stmt = c.prepare("SELECT email, focused FROM focus_rules WHERE account_id=?1 ORDER BY email")?;
             let rows = stmt.query_map([&account.0], |r| Ok(FocusRule { email: r.get(0)?, focused: r.get(1)? }))?;
             Ok(rows.collect::<std::result::Result<Vec<_>, _>>()?)
@@ -472,7 +472,7 @@ impl Store {
     }
 
     pub fn calendars(&self, account: &AccountId) -> Result<Vec<Calendar>> {
-        self.with_conn(|c| {
+        self.with_read(|c| {
             let mut stmt = c.prepare("SELECT id, account_id, provider_id, name, color, is_primary, can_edit, visible, sort_order, default_reminders_json FROM calendars WHERE account_id=?1 ORDER BY is_primary DESC, sort_order, name")?;
             let rows = stmt.query_map([&account.0], |r| {
                 Ok(Calendar {
@@ -519,7 +519,7 @@ impl Store {
     }
 
     pub fn event_by_ical_uid(&self, account: &AccountId, uid: &str) -> Result<Option<Event>> {
-        self.with_conn(|c| {
+        self.with_read(|c| {
             let mut found = load_events(c, "WHERE e.account_id=?1 AND e.ical_uid=?2 AND e.status != 'cancelled' ORDER BY e.start", params![account.0, uid])?;
             // Prefer the next upcoming instance for recurring series.
             let now_ms = now();
@@ -533,7 +533,7 @@ impl Store {
 
     /// Events (visible calendars) starting within `[from, to)`, for reminders.
     pub fn events_starting_between(&self, account: &AccountId, from: Timestamp, to: Timestamp) -> Result<Vec<Event>> {
-        self.with_conn(|c| {
+        self.with_read(|c| {
             load_events(
                 c,
                 "JOIN calendars cal ON cal.id = e.calendar_id WHERE e.account_id=?1 AND cal.visible=1 AND e.start >= ?2 AND e.start < ?3 AND e.status != 'cancelled' AND e.all_day = 0",
@@ -543,7 +543,7 @@ impl Store {
     }
 
     pub fn event(&self, id: &EventId) -> Result<Option<Event>> {
-        self.with_conn(|c| Ok(load_events(c, "WHERE e.id=?1", params![id.0])?.pop()))
+        self.with_read(|c| Ok(load_events(c, "WHERE e.id=?1", params![id.0])?.pop()))
     }
 
     /// Events of visible calendars overlapping `[from, to)`, cancelled ones excluded, with
@@ -554,7 +554,7 @@ impl Store {
             .iter()
             .filter_map(|op| op.kind.event_id().cloned())
             .collect();
-        self.with_conn(|c| {
+        self.with_read(|c| {
             let mut events = load_events(
                 c,
                 "JOIN calendars cal ON cal.id = e.calendar_id WHERE e.account_id=?1 AND cal.visible=1 AND e.start < ?3 AND e.end > ?2 AND e.status != 'cancelled'",
@@ -657,7 +657,7 @@ impl Store {
     /// Provider ids of messages whose HTML embeds `cid:` images but whose attachments were
     /// stored before `Content-ID` was recorded.
     pub fn messages_needing_inline_parse(&self, account: &AccountId) -> Result<Vec<ProviderId>> {
-        self.with_conn(|c| {
+        self.with_read(|c| {
             let mut stmt = c.prepare(
                 "SELECT DISTINCT m.provider_id FROM messages m
                  WHERE m.account_id=?1 AND m.provider_id IS NOT NULL AND m.body_html LIKE '%cid:%'
@@ -669,7 +669,7 @@ impl Store {
     }
 
     pub fn messages_needing_invitation_parse(&self, account: &AccountId) -> Result<Vec<ProviderId>> {
-        self.with_conn(|c| {
+        self.with_read(|c| {
             let mut stmt = c.prepare(
                 "SELECT DISTINCT m.provider_id FROM messages m JOIN attachments a ON a.message_id = m.id
                  WHERE m.account_id=?1 AND m.invitation_json IS NULL AND m.provider_id IS NOT NULL
@@ -702,7 +702,7 @@ impl Store {
     }
 
     pub fn pending_operations(&self, account: &AccountId) -> Result<Vec<PendingOperation>> {
-        self.with_conn(|c| {
+        self.with_read(|c| {
             let mut stmt = c.prepare(
                 "SELECT id, account_id, seq, kind_json, state, attempts, last_error, created_at, updated_at FROM pending_operations
                  WHERE account_id=?1 AND state != 'applied' ORDER BY seq",
@@ -713,7 +713,7 @@ impl Store {
     }
 
     pub fn pending_count(&self, account: &AccountId) -> Result<usize> {
-        self.with_conn(|c| {
+        self.with_read(|c| {
             Ok(c.query_row(
                 "SELECT COUNT(*) FROM pending_operations WHERE account_id=?1 AND state != 'applied'",
                 [&account.0],
@@ -776,7 +776,7 @@ impl Store {
     }
 
     pub fn draft(&self, id: &DraftId) -> Result<Option<Draft>> {
-        self.with_conn(|c| {
+        self.with_read(|c| {
             let mut found = load_drafts(c, "WHERE d.id=?1", params![id.0])?;
             Ok(found.pop())
         })
@@ -784,7 +784,7 @@ impl Store {
 
     /// Drafts of an account. `outbox` selects Outbox states instead of editing drafts.
     pub fn drafts(&self, account: &AccountId, outbox: bool) -> Result<Vec<Draft>> {
-        self.with_conn(|c| {
+        self.with_read(|c| {
             let mut all = load_drafts(c, "WHERE d.account_id=?1", params![account.0])?;
             all.retain(|d| d.state.is_outbox() == outbox);
             all.sort_by_key(|d| std::cmp::Reverse(d.updated_at));
@@ -904,7 +904,7 @@ impl Store {
     // --------------------------------------------------------------- sync state
 
     pub fn account_status(&self, account: &AccountId) -> Result<AccountStatus> {
-        let (state, last) = self.with_conn(|c| {
+        let (state, last) = self.with_read(|c| {
             Ok(c.query_row(
                 "SELECT state_json, last_successful_sync FROM sync_state WHERE account_id=?1",
                 [&account.0],
@@ -937,7 +937,7 @@ impl Store {
     /// Provider sync checkpoint (for Gmail, the history id). Saved transactionally with
     /// the downloaded changes by callers that use `with_tx` through [`Store::upsert_messages`].
     pub fn checkpoint(&self, account: &AccountId) -> Result<Option<String>> {
-        self.with_conn(|c| {
+        self.with_read(|c| {
             Ok(c.query_row("SELECT checkpoint FROM sync_state WHERE account_id=?1", [&account.0], |r| r.get::<_, Option<String>>(0))
                 .optional()?
                 .flatten())
@@ -960,7 +960,7 @@ impl Store {
     /// IMAP/POP3/SMTP server settings for an account. `None` for Gmail and Sample accounts,
     /// or before setup finished. Passwords are in the keyring, never here.
     pub fn servers(&self, account: &AccountId) -> Result<Option<MailServers>> {
-        self.with_conn(|c| {
+        self.with_read(|c| {
             let raw: Option<String> = c.query_row("SELECT servers_json FROM account_servers WHERE account_id=?1", [&account.0], |r| r.get(0)).optional()?;
             Ok(match raw {
                 Some(json) => Some(serde_json::from_str(&json)?),
@@ -983,7 +983,7 @@ impl Store {
     /// never touch such accounts, and [`Store::merge_remote_messages`] keeps their local
     /// flags and labels, which the provider cannot know.
     pub fn is_local_primary(&self, account: &AccountId) -> Result<bool> {
-        self.with_conn(|c| {
+        self.with_read(|c| {
             let provider: Option<String> = c.query_row("SELECT provider FROM accounts WHERE id=?1", [&account.0], |r| r.get(0)).optional()?;
             Ok(provider.as_deref().and_then(ProviderKind::from_key) == Some(ProviderKind::Pop3))
         })
@@ -994,7 +994,7 @@ impl Store {
     /// All messages of the account with this Message-ID, newest first. Several can exist
     /// legitimately (a Sent copy and a received copy; a message mid-move seen in two folders).
     pub fn messages_by_rfc_id(&self, account: &AccountId, rfc_id: &str) -> Result<Vec<Message>> {
-        self.with_conn(|c| load_messages(c, "WHERE m.account_id=?1 AND m.rfc_message_id=?2", params![account.0, rfc_id]))
+        self.with_read(|c| load_messages(c, "WHERE m.account_id=?1 AND m.rfc_message_id=?2", params![account.0, rfc_id]))
     }
 
     /// The newest message of the account with this Message-ID.
@@ -1004,7 +1004,7 @@ impl Store {
 
     /// The local id of the message the provider knows by `provider_id`, if any.
     pub fn message_id_for_provider_id(&self, account: &AccountId, provider_id: &ProviderId) -> Result<Option<MessageId>> {
-        self.with_conn(|c| {
+        self.with_read(|c| {
             Ok(c.query_row("SELECT id FROM messages WHERE account_id=?1 AND provider_id=?2", params![account.0, provider_id.0], |r| r.get::<_, String>(0))
                 .optional()?
                 .map(MessageId))
@@ -1016,7 +1016,7 @@ impl Store {
     /// lookup `overlook_core::threading::assign_conversations` needs, and the second clause
     /// is what lets a parent downloaded after its reply join the reply's conversation.
     pub fn conversation_for_rfc_id(&self, account: &AccountId, rfc_id: &str) -> Result<Option<ConversationId>> {
-        self.with_conn(|c| {
+        self.with_read(|c| {
             let direct: Option<String> = c
                 .query_row(
                     "SELECT conversation_id FROM messages WHERE account_id=?1 AND (rfc_message_id=?2 OR in_reply_to=?2) ORDER BY date DESC LIMIT 1",
@@ -1043,7 +1043,7 @@ impl Store {
     /// Provider ids of every message carrying `label`. For IMAP this is the local view of a
     /// folder, diffed against the server's UID list to find deletions.
     pub fn provider_ids_for_label(&self, label: &LabelId) -> Result<Vec<ProviderId>> {
-        self.with_conn(|c| {
+        self.with_read(|c| {
             let mut stmt = c.prepare("SELECT m.provider_id FROM messages m JOIN message_labels ml ON ml.message_id = m.id WHERE ml.label_id=?1 AND m.provider_id IS NOT NULL ORDER BY m.date DESC")?;
             let rows = stmt.query_map([&label.0], |r| Ok(ProviderId(r.get(0)?)))?;
             Ok(rows.collect::<std::result::Result<Vec<_>, _>>()?)
@@ -1075,7 +1075,7 @@ impl Store {
     /// The account's IMAP folder rows, mirrored from the provider's checkpoint after each
     /// cycle. Diagnostic and settings-dialog reading only: the checkpoint is authoritative.
     pub fn imap_folders(&self, account: &AccountId) -> Result<Vec<ImapFolder>> {
-        self.with_conn(|c| {
+        self.with_read(|c| {
             let mut stmt = c.prepare("SELECT path, uidvalidity, highest_uid, highest_modseq, delimiter, special_use, subscribed FROM imap_folders WHERE account_id=?1 ORDER BY path")?;
             let rows = stmt.query_map([&account.0], |r| {
                 Ok(ImapFolder {
@@ -1108,7 +1108,7 @@ impl Store {
 
     /// The POP3 ledger rows mirrored from the provider's checkpoint (see [`Pop3Seen`]).
     pub fn pop3_seen(&self, account: &AccountId) -> Result<Vec<Pop3Seen>> {
-        self.with_conn(|c| {
+        self.with_read(|c| {
             let mut stmt = c.prepare("SELECT uidl, seen_at, deleted_on_server FROM pop3_seen WHERE account_id=?1 ORDER BY seen_at, uidl")?;
             let rows = stmt.query_map([&account.0], |r| Ok(Pop3Seen { uidl: r.get(0)?, seen_at: r.get(1)?, deleted_on_server: r.get::<_, i64>(2)? != 0 }))?;
             Ok(rows.collect::<std::result::Result<Vec<_>, _>>()?)
@@ -1141,7 +1141,7 @@ impl Store {
     // ----------------------------------------------------------------- settings
 
     pub fn setting<T: serde::de::DeserializeOwned>(&self, key: &str) -> Result<Option<T>> {
-        self.with_conn(|c| {
+        self.with_read(|c| {
             let raw: Option<String> = c.query_row("SELECT value FROM settings WHERE key=?1", [key], |r| r.get(0)).optional()?;
             Ok(match raw {
                 Some(s) => serde_json::from_str(&s).ok(),
@@ -1168,7 +1168,7 @@ impl Store {
         if fts.is_empty() {
             return Ok(Vec::new());
         }
-        self.with_conn(|c| {
+        self.with_read(|c| {
             let mut stmt = c.prepare(
                 "SELECT m.id FROM messages_fts f JOIN messages m ON m.rowid = f.rowid
                  WHERE messages_fts MATCH ?1 AND m.account_id = ?2 ORDER BY rank LIMIT 500",
@@ -1179,7 +1179,7 @@ impl Store {
     }
 
     pub fn search_coverage(&self, account: &AccountId) -> Result<SearchCoverage> {
-        self.with_conn(|c| {
+        self.with_read(|c| {
             let total: i64 = c.query_row("SELECT COUNT(*) FROM messages WHERE account_id=?1", [&account.0], |r| r.get(0))?;
             let cached: i64 = c.query_row(
                 "SELECT COUNT(*) FROM messages WHERE account_id=?1 AND (body_text IS NOT NULL OR body_html IS NOT NULL)",
@@ -1206,7 +1206,7 @@ impl Store {
     }
 
     pub fn contact_count(&self, account: &AccountId) -> Result<usize> {
-        self.with_conn(|c| Ok(c.query_row("SELECT COUNT(*) FROM people WHERE account_id=?1", [&account.0], |r| r.get::<_, i64>(0))? as usize))
+        self.with_read(|c| Ok(c.query_row("SELECT COUNT(*) FROM people WHERE account_id=?1", [&account.0], |r| r.get::<_, i64>(0))? as usize))
     }
 
     pub fn contacts(&self, account: &AccountId) -> Result<Vec<Contact>> {
@@ -1269,7 +1269,7 @@ impl Store {
     }
 
     fn contacts_where(&self, account: &AccountId, clause: &str, args: &[&str]) -> Result<Vec<Contact>> {
-        self.with_conn(|c| {
+        self.with_read(|c| {
             let sql = format!(
                 "SELECT id, account_id, email, emails_json, name, given_name, family_name, phone, organization, title, notes, photo_url, in_address_book, etag, updated, pending
                  FROM people WHERE account_id=?1 {clause}"

@@ -155,7 +155,7 @@ impl MailWindow {
             return;
         }
         self.module = module;
-        let _ = self.store.set_setting("last_module", &match module { Module::Calendar => "calendar", Module::Contacts => "contacts", Module::Mail => "mail" });
+        self.save_setting("last_module", &match module { Module::Calendar => "calendar", Module::Contacts => "contacts", Module::Mail => "mail" });
         match module {
             Module::Calendar => {
                 self.reload_calendar();

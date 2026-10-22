@@ -7,6 +7,8 @@ mod browser_body;
 mod credentials;
 mod google_signin;
 mod notify;
+mod persist;
+mod watchdog;
 mod pdf_preview;
 mod single_instance;
 mod updater;
@@ -89,6 +91,28 @@ fn open_store() -> anyhow::Result<(Arc<Store>, Vec<Account>)> {
     Ok((Arc::new(store), accounts))
 }
 
+/// Logs to stderr and to `overlook.log` in the data folder (the previous log is kept as
+/// `overlook.log.old` once it passes 4 MiB), so problems can be traced after the fact.
+fn init_logging() {
+    use tracing_subscriber::layer::SubscriberExt;
+    use tracing_subscriber::util::SubscriberInitExt;
+    use tracing_subscriber::Layer;
+    let filter = || tracing_subscriber::EnvFilter::from_default_env().add_directive("overlook=info".parse().unwrap());
+    let path = data_dir().join("overlook.log");
+    let _ = std::fs::create_dir_all(data_dir());
+    if std::fs::metadata(&path).is_ok_and(|m| m.len() > 4 * 1024 * 1024) {
+        let _ = std::fs::rename(&path, path.with_extension("log.old"));
+    }
+    let file = std::fs::OpenOptions::new().create(true).append(true).open(&path).ok();
+    let registry = tracing_subscriber::registry().with(tracing_subscriber::fmt::layer().with_filter(filter()));
+    match file {
+        Some(file) => registry
+            .with(tracing_subscriber::fmt::layer().with_ansi(false).with_writer(std::sync::Mutex::new(file)).with_filter(filter()))
+            .init(),
+        None => registry.init(),
+    }
+}
+
 fn main() {
     STARTED.get_or_init(std::time::Instant::now);
     // Plain command-line conveniences; anything else starts the app.
@@ -108,9 +132,7 @@ fn main() {
         println!("Overlook {} — a clear view of what matters.\n\nUsage: overlook [mailto:…] [--version] [--help]\n\nEnvironment:\n  OVERLOOK_DATA_DIR      profile directory (default ~/.local/share/overlook)\n  OVERLOOK_CONFIG_DIR    directory holding google-oauth-client.json (default ~/.config/overlook)\n  OVERLOOK_SIGN_IN=gmail start the Google sign-in at launch (imap / pop3: open that account setup)\n  OVERLOOK_BROWSER_BIN  compatible Chromium executable (default PATH discovery)\n  RUST_LOG=overlook=debug tracing output", env!("CARGO_PKG_VERSION"));
         return;
     }
-    tracing_subscriber::fmt()
-        .with_env_filter(tracing_subscriber::EnvFilter::from_default_env().add_directive("overlook=info".parse().unwrap()))
-        .init();
+    init_logging();
 
     let (store, accounts) = match open_store() {
         Ok(v) => v,

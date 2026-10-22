@@ -531,6 +531,7 @@ impl BrowserBody {
     }
 
     fn poll(&mut self, cx: &mut Context<Self>) {
+        crate::watchdog::mark("message body update");
         if self.error.is_some() { return; }
         // Wait for real layout rather than starting a throwaway 160px render.
         if self.bounds.get().size.width <= px(0.) { return; }

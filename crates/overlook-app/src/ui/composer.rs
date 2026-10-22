@@ -59,6 +59,7 @@ pub struct Composer {
 impl MailWindow {
     /// Opens the composer for `draft`, creating the input entities and autosave wiring.
     pub(super) fn open_composer(&mut self, draft: Draft, window: &mut Window, cx: &mut Context<Self>) {
+        crate::watchdog::mark("open composer");
         self.close_composer(window, cx);
         let join = |list: &[Address]| list.iter().map(Address::to_header).collect::<Vec<_>>().join(", ");
         let to = cx.new(|cx| InputState::new(window, cx).placeholder("Recipients").default_value(join(&draft.to)));
@@ -348,6 +349,7 @@ impl MailWindow {
     }
 
     pub(super) fn send_composer(&mut self, window: &mut Window, cx: &mut Context<Self>) {
+        crate::watchdog::mark("send");
         self.sync_composer_fields(cx);
         let Some(c) = self.composer.as_mut() else { return };
         if let Err(e) = c.draft.validate_for_send() {

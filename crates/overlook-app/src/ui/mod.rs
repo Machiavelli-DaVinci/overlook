@@ -652,6 +652,13 @@ impl MailWindow {
             retry_attempts: HashMap::new(),
             _subscriptions: subs,
         };
+        // The watchdog reports any stall of this thread (see `watchdog.rs`).
+        crate::watchdog::start();
+        cx.spawn(async move |_, cx| loop {
+            cx.background_executor().timer(Duration::from_millis(200)).await;
+            crate::watchdog::beat();
+        })
+        .detach();
         // Keep a Chromium started so the first message opens without its launch.
         crate::browser_engine::prewarm();
         // A fresh process has not reached any provider yet: say so until a probe succeeds.
@@ -804,7 +811,7 @@ impl MailWindow {
             self.close_composer(window, cx);
         }
         self.account = account;
-        let _ = self.store.set_setting("active_account", &id);
+        self.save_setting("active_account", &id);
         self.view = MailboxView::Kind(LabelKind::Inbox);
         self.filter = ListFilter::All;
         self.selected = None;
@@ -863,7 +870,7 @@ impl MailWindow {
         }
         self.update.phase = UpdatePhase::Checking;
         self.update.last_check = now();
-        let _ = self.store.set_setting("update.last_check", &self.update.last_check);
+        self.save_setting("update.last_check", &self.update.last_check);
         cx.notify();
         cx.spawn_in(window, async move |this, cx| {
             let result = cx.background_spawn(async move { updater::check_latest() }).await;
@@ -900,7 +907,7 @@ impl MailWindow {
     pub(crate) fn dismiss_update(&mut self, cx: &mut Context<Self>) {
         if let Some(r) = &self.update.latest {
             self.update.dismissed = Some(r.version.clone());
-            let _ = self.store.set_setting("update.dismissed", &r.version);
+            self.save_setting("update.dismissed", &r.version);
         }
         cx.notify();
     }
@@ -1109,6 +1116,7 @@ impl MailWindow {
     /// and counts come from the in-memory index at once; a fresh index is read on a
     /// background thread and shown when it arrives.
     pub(crate) fn reload(&mut self, cx: &mut Context<Self>) {
+        crate::watchdog::mark("reload");
         let acct = self.account.id.clone();
         if self.mail_index_account.as_ref() != Some(&acct) {
             // Another account (or the first load): show its last index if there is one and
@@ -1171,6 +1179,20 @@ impl MailWindow {
                 self.thread.clear();
             }
         }
+    }
+
+    /// Saves a setting on the background writer: the UI never waits for the disk.
+    pub(crate) fn save_setting<T: serde::Serialize>(&self, key: &str, value: &T) {
+        let value = match serde_json::to_value(value) {
+            Ok(v) => v,
+            Err(e) => return tracing::warn!("could not encode setting {key}: {e}"),
+        };
+        let (store, key) = (self.store.clone(), key.to_owned());
+        crate::persist::later(move || {
+            if let Err(e) = store.set_setting(&key, &value) {
+                tracing::warn!("could not save setting {key}: {e}");
+            }
+        });
     }
 
     /// Takes a freshly read index and announces mail that arrived since the last one.
@@ -1282,7 +1304,7 @@ impl MailWindow {
 
     pub(crate) fn toggle_focused_inbox(&mut self, cx: &mut Context<Self>) {
         self.focused_enabled = !self.focused_enabled;
-        let _ = self.store.set_setting("focused_inbox", &self.focused_enabled);
+        self.save_setting("focused_inbox", &self.focused_enabled);
         self.inbox_tab = FocusTab::Focused;
         self.reload(cx);
     }
@@ -1513,12 +1535,15 @@ impl MailWindow {
         self.downloading.insert(attachment.id.clone());
         cx.notify();
         let att = attachment.clone();
+        let store = self.store.clone();
         cx.spawn_in(window, async move |this, cx| {
             let result = cx
                 .background_spawn(async move {
                     let bytes = provider.fetch_attachment(&account, &message, &att).await?;
                     std::fs::create_dir_all(&dir).map_err(|e| overlook_provider::ProviderError::Rejected(e.to_string()))?;
                     std::fs::write(&dest, &bytes).map_err(|e| overlook_provider::ProviderError::Rejected(e.to_string()))?;
+                    // Recorded here, off the UI thread, before the reader reloads the thread.
+                    let _ = store.set_attachment_local_path(&att.id, Some(&dest.to_string_lossy()));
                     Ok::<PathBuf, overlook_provider::ProviderError>(dest)
                 })
                 .await;
@@ -1526,7 +1551,6 @@ impl MailWindow {
                 this.downloading.remove(&attachment.id);
                 match result {
                     Ok(path) => {
-                        let _ = this.store.set_attachment_local_path(&attachment.id, Some(&path.to_string_lossy()));
                         this.load_thread();
                         match after {
                             AfterDownload::Open => cx.open_with_system(&path),
@@ -1751,6 +1775,7 @@ impl MailWindow {
     }
 
     fn select_conversation(&mut self, id: Option<ConversationId>, window: &mut Window, cx: &mut Context<Self>) {
+        crate::watchdog::mark("open conversation");
         if self.composer.is_some() {
             self.close_composer(window, cx);
         }
@@ -2231,9 +2256,7 @@ impl MailWindow {
     fn set_appearance(&mut self, pref: AppearancePreference, window: &mut Window, cx: &mut Context<Self>) {
         self.appearance = pref;
         cx.set_global(AppearanceGlobal(pref));
-        if let Err(e) = self.store.set_setting(SETTING_APPEARANCE, &pref) {
-            tracing::warn!("could not persist appearance: {e}");
-        }
+        self.save_setting(SETTING_APPEARANCE, &pref);
         theme::apply_preference(pref, theme::system_appearance(window.appearance()), cx);
         cx.notify();
     }
@@ -2243,7 +2266,7 @@ impl MailWindow {
             self.collapsed_sections.insert(key.to_owned());
         }
         let list: Vec<&String> = self.collapsed_sections.iter().collect();
-        let _ = self.store.set_setting("sidebar.collapsed", &list);
+        self.save_setting("sidebar.collapsed", &list);
         cx.notify();
     }
 
@@ -2252,13 +2275,13 @@ impl MailWindow {
             Density::Comfortable => Density::Compact,
             Density::Compact => Density::Comfortable,
         };
-        let _ = self.store.set_setting("density", &self.density);
+        self.save_setting("density", &self.density);
         cx.notify();
     }
 
     fn set_reading_pane(&mut self, placement: ReadingPane, cx: &mut Context<Self>) {
         self.reading_pane = placement;
-        let _ = self.store.set_setting("reading_pane", &placement);
+        self.save_setting("reading_pane", &placement);
         cx.notify();
     }
 
@@ -2319,6 +2342,7 @@ impl MailWindow {
         cx.spawn_in(window, async move |this, cx| {
             let outcome: SyncOutcome = cx.background_spawn(run_sync(store, bundle.mail, bundle.calendar, account.clone())).await;
             let _ = this.update_in(cx, |this, window, cx| {
+                crate::watchdog::mark("sync finished");
                 this.syncing.remove(&account.id);
                 match &outcome.state {
                     Some(SyncState::UpToDate) => {
@@ -2804,7 +2828,7 @@ impl MailWindow {
                                     .item(PopupMenuItem::new("Event reminders").checked(reminders_enabled).on_click(move |_, _w, cx| {
                                         let _ = r.update(cx, |this, cx| {
                                             this.reminders_enabled = !this.reminders_enabled;
-                                            let _ = this.store.set_setting("reminders", &this.reminders_enabled);
+                                            this.save_setting("reminders", &this.reminders_enabled);
                                             cx.notify();
                                         });
                                     }))
@@ -3028,7 +3052,7 @@ impl MailWindow {
                 .on_resize(cx.listener(|this, state: &Entity<ResizableState>, _window, cx| {
                     if let Some(w) = state.read(cx).sizes().first() {
                         this.list_width = f32::from(*w);
-                        let _ = this.store.set_setting("panes.list", &this.list_width);
+                        this.save_setting("panes.list", &this.list_width);
                     }
                 })),
             ReadingPane::Bottom => v_resizable("content-v")
@@ -3038,7 +3062,7 @@ impl MailWindow {
                 .on_resize(cx.listener(|this, state: &Entity<ResizableState>, _window, cx| {
                     if let Some(h) = state.read(cx).sizes().first() {
                         this.list_height = f32::from(*h);
-                        let _ = this.store.set_setting("panes.list_height", &this.list_height);
+                        this.save_setting("panes.list_height", &this.list_height);
                     }
                 })),
         };
@@ -3050,7 +3074,7 @@ impl MailWindow {
             .on_resize(cx.listener(|this, state: &Entity<ResizableState>, _window, cx| {
                 if let Some(w) = state.read(cx).sizes().first() {
                     this.sidebar_width = f32::from(*w);
-                    let _ = this.store.set_setting("panes.sidebar", &this.sidebar_width);
+                    this.save_setting("panes.sidebar", &this.sidebar_width);
                 }
             }))
             .into_any_element()
@@ -3098,6 +3122,7 @@ impl Focusable for MailWindow {
 
 impl Render for MailWindow {
     fn render(&mut self, _window: &mut Window, cx: &mut Context<Self>) -> impl IntoElement {
+        crate::watchdog::mark("render");
         if !self.first_frame_logged {
             self.first_frame_logged = true;
             tracing::info!("startup: first frame after {} ms", crate::since_start_ms());
