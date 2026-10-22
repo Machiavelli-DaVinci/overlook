@@ -143,6 +143,7 @@ pub fn is_newer(candidate: &str, current: &str) -> bool {
 fn agent() -> ureq::Agent {
     ureq::Agent::config_builder()
         .http_status_as_error(false)
+        .https_only(true)
         .timeout_global(Some(Duration::from_secs(30)))
         .user_agent(format!("Overlook/{CURRENT_VERSION} (+https://github.com/{REPO})"))
         .build()
@@ -319,11 +320,8 @@ pub fn apply_pacman_update(package: &Path) -> Result<PacmanOutcome, String> {
         tracing::warn!("pkexec failed ({:?}): {}", output.status.code(), stderr.trim());
     }
     // No polkit agent: hand the step to a terminal so the user can type their password.
-    let script = format!(
-        "echo 'Overlook update: installing {}'; sudo pacman -U --noconfirm '{}' && echo && echo 'Done. Restart Overlook to finish.' || echo 'The update did not install.'; echo; read -r -p 'Press Enter to close this window.' _",
-        package.display(),
-        package.display()
-    );
+    // Pass the path as an argument, never interpolate it into shell program text.
+    let script = "printf 'Overlook update: installing %s\\n' \"$1\"; sudo pacman -U --noconfirm -- \"$1\" && echo && echo 'Done. Restart Overlook to finish.' || echo 'The update did not install.'; echo; read -r -p 'Press Enter to close this window.' _";
     let terminals: Vec<Vec<String>> = {
         let mut t: Vec<Vec<String>> = vec![vec!["xdg-terminal-exec".into(), "--".into()]];
         if let Ok(term) = std::env::var("TERMINAL") {
@@ -336,7 +334,7 @@ pub fn apply_pacman_update(package: &Path) -> Result<PacmanOutcome, String> {
     };
     for cmd in terminals {
         let Some((program, args)) = cmd.split_first() else { continue };
-        let ok = Command::new(program).args(args).arg("bash").arg("-c").arg(&script).spawn().is_ok();
+        let ok = Command::new(program).args(args).arg("bash").arg("-c").arg(script).arg("overlook-update").arg(package).spawn().is_ok();
         if ok {
             return Ok(PacmanOutcome::TerminalOpened);
         }

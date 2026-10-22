@@ -34,3 +34,4 @@ tokio = { version = "1", features = ["rt-multi-thread", "sync"] }
 
 [dev-dependencies]
 overlook-provider = { workspace = true, features = ["fake-servers"] }
+rustls = { version = "0.23", default-features = false, features = ["ring", "std", "tls12"] }

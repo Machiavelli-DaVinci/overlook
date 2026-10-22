@@ -668,6 +668,8 @@ impl MailWindow {
             .id("account-setup-overlay")
             .absolute()
             .inset_0()
+            // Nothing underneath (a message body) may see the clicks meant for this.
+            .occlude()
             .bg(gpui_kit::black().opacity(if p.is_dark() { 0.55 } else { 0.3 }))
             .flex()
             .items_center()

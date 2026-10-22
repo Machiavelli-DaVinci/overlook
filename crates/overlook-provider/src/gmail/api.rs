@@ -3,6 +3,7 @@
 use super::oauth::{self, url_encode, AuthError, ClientConfig, OAuthTokens};
 use crate::ProviderError;
 use std::sync::Mutex;
+use std::sync::atomic::{AtomicBool, Ordering};
 use std::time::{Duration, Instant};
 
 pub const API_BASE: &str = "https://gmail.googleapis.com/gmail/v1/users/me";
@@ -49,6 +50,9 @@ pub struct GmailClient {
     on_tokens: TokenSink,
     agent: ureq::Agent,
     last_request: Mutex<Option<Instant>>,
+    /// Serializes request/refresh persistence with grant revocation.
+    session_lock: Mutex<()>,
+    active: AtomicBool,
 }
 
 impl GmailClient {
@@ -56,10 +60,30 @@ impl GmailClient {
     pub fn new(config: ClientConfig, tokens: OAuthTokens, on_tokens: TokenSink) -> Self {
         let agent: ureq::Agent = ureq::Agent::config_builder()
             .http_status_as_error(false)
+            .https_only(true)
+            .max_redirects(0)
             .timeout_global(Some(Duration::from_secs(40)))
             .build()
             .into();
-        Self { config, tokens: Mutex::new(tokens), on_tokens, agent, last_request: Mutex::new(None) }
+        Self { config, tokens: Mutex::new(tokens), on_tokens, agent, last_request: Mutex::new(None), session_lock: Mutex::new(()), active: AtomicBool::new(true) }
+    }
+
+    /// Blocks future use (including cloned providers), drains an in-flight request, then
+    /// revokes the remote grant. On failure the keyring entry is retained for an explicit retry.
+    pub fn disconnect(&self) -> Result<(), AuthError> {
+        self.disconnect_with(oauth::revoke)
+    }
+
+    fn disconnect_with(&self, revoke: impl FnOnce(&OAuthTokens) -> Result<(), AuthError>) -> Result<(), AuthError> {
+        self.active.store(false, Ordering::SeqCst);
+        let _session = self.session_lock.lock().unwrap();
+        let tokens = self.tokens();
+        revoke(&tokens)?;
+        let mut tokens = self.tokens.lock().unwrap();
+        tokens.access_token.clear();
+        tokens.refresh_token = None;
+        tokens.expires_at = 0;
+        Ok(())
     }
 
     fn throttle(&self) {
@@ -78,6 +102,7 @@ impl GmailClient {
     }
 
     fn access_token(&self, force_refresh: bool) -> Result<String, ApiError> {
+        if !self.active.load(Ordering::SeqCst) { return Err(ApiError::Unauthorized); }
         let current = self.tokens();
         if !force_refresh && !current.is_expired(overlook_core::time::now()) {
             return Ok(current.access_token);
@@ -182,6 +207,7 @@ impl GmailClient {
         &self,
         request: impl Fn(&str) -> Result<ureq::http::Response<ureq::Body>, ApiError>,
     ) -> Result<serde_json::Value, ApiError> {
+        let _session = self.session_lock.lock().unwrap();
         let mut token = self.access_token(false)?;
         for attempt in 0..2 {
             self.throttle();
@@ -226,6 +252,7 @@ impl GmailClient {
     /// relative to `users/me` (for example `messages/abc?format=full`). The outer result is the
     /// request itself; each inner result is that call's own outcome, in the order given.
     pub fn batch_get(&self, paths: &[String]) -> Result<Vec<Result<serde_json::Value, ApiError>>, ApiError> {
+        let _session = self.session_lock.lock().unwrap();
         if paths.is_empty() {
             return Ok(Vec::new());
         }
@@ -346,6 +373,20 @@ fn api_message(text: &str) -> String {
 #[cfg(test)]
 mod batch_tests {
     use super::*;
+
+    #[test]
+    fn disconnect_blocks_cloned_client_and_retains_retry_on_failure() {
+        let client = std::sync::Arc::new(GmailClient::new(ClientConfig { client_id: "synthetic".into(), client_secret: None }, OAuthTokens { access_token: "synthetic-access".into(), refresh_token: Some("synthetic-refresh".into()), expires_at: i64::MAX, scope: None }, Box::new(|_| panic!("no refresh may persist after disconnect"))));
+        let clone = client.clone();
+        assert!(client.disconnect_with(|_| Err(AuthError::Network("synthetic offline".into()))).is_err());
+        assert_eq!(clone.get("messages", &[]), Err(ApiError::Unauthorized));
+        assert_eq!(clone.batch_get(&["messages/test".into()]), Err(ApiError::Unauthorized));
+        assert_eq!(clone.tokens().refresh_token.as_deref(), Some("synthetic-refresh"));
+        client.disconnect_with(|tokens| { assert_eq!(tokens.refresh_token.as_deref(), Some("synthetic-refresh")); Ok(()) }).unwrap();
+        assert!(clone.tokens().access_token.is_empty());
+        assert!(clone.tokens().refresh_token.is_none());
+        assert_eq!(clone.get("messages", &[]), Err(ApiError::Unauthorized));
+    }
 
     #[test]
     fn parses_a_batch_reply_in_content_id_order() {

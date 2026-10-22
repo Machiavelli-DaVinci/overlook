@@ -410,6 +410,8 @@ impl MailWindow {
             .id("settings-overlay")
             .absolute()
             .inset_0()
+            // Nothing underneath (a message body) may see the clicks meant for this.
+            .occlude()
             .bg(gpui_kit::black().opacity(if p.is_dark() { 0.55 } else { 0.3 }))
             .flex()
             .items_center()
@@ -575,7 +577,7 @@ impl MailWindow {
             .child(section("Remove", None))
             .child(setting_row(
                 "Remove this account from this device",
-                "Deletes downloaded mail, events, drafts, and stored sign-in for this account. Nothing is deleted at the provider.",
+                if is_gmail { "Removes local mail and sign-in, and revokes this Google account’s access for this app’s Google project on all devices. Requires internet; mail at Google is kept." } else { "Deletes downloaded mail, events, drafts, and stored sign-in for this account. Nothing is deleted at the provider." },
                 Button::new("settings-remove").danger().small().label("Remove account").on_click(cx.listener(move |this, _, window, cx| {
                     this.close_settings(window, cx);
                     this.remove_account(remove_id.clone(), window, cx);

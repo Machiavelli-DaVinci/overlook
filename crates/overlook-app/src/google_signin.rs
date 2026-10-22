@@ -70,6 +70,7 @@ impl PendingSignIn {
         let cancel = Arc::new(AtomicBool::new(false));
         let (sender, receiver) = mpsc::channel();
         let flag = cancel.clone();
+        let expected_request = request.clone();
         std::thread::Builder::new()
             .name("overlook-oauth-callback".into())
             .spawn(move || {
@@ -85,7 +86,7 @@ impl PendingSignIn {
                     }
                     match listener.accept() {
                         Ok((stream, _)) => {
-                            if let Some(query) = handle_connection(stream) {
+                            if let Some(query) = handle_connection(stream, &expected_request) {
                                 let _ = sender.send(Ok(query));
                                 return;
                             }
@@ -122,23 +123,19 @@ impl PendingSignIn {
 
 /// Reads one HTTP request, answers with the completion page, and returns the query string
 /// of a `/callback` request. Other paths (favicon) get a 404 and `None`.
-fn handle_connection(mut stream: TcpStream) -> Option<String> {
+fn handle_connection(mut stream: TcpStream, expected: &AuthorizationRequest) -> Option<String> {
     let _ = stream.set_read_timeout(Some(Duration::from_secs(5)));
     let mut buf = [0u8; 4096];
     let n = stream.read(&mut buf).ok()?;
     let request = String::from_utf8_lossy(&buf[..n]);
-    let first_line = request.lines().next()?;
-    let target = first_line.split_whitespace().nth(1)?;
-    let (path, query) = target.split_once('?').unwrap_or((target, ""));
-    if path != "/callback" {
-        let _ = stream.write_all(b"HTTP/1.1 404 Not Found\r\nContent-Length: 0\r\nConnection: close\r\n\r\n");
+    let Some((query, denied)) = validated_callback(&request, expected) else {
+        let _ = stream.write_all(b"HTTP/1.1 400 Bad Request\r\nContent-Length: 0\r\nConnection: close\r\nCache-Control: no-store\r\n\r\n");
         return None;
-    }
-    let denied = query.contains("error=");
+    };
     let body = completion_page(denied);
     let _ = stream.write_all(
         format!(
-            "HTTP/1.1 200 OK\r\nContent-Type: text/html; charset=utf-8\r\nContent-Length: {}\r\nConnection: close\r\nCache-Control: no-store\r\n\r\n{}",
+            "HTTP/1.1 200 OK\r\nContent-Type: text/html; charset=utf-8\r\nContent-Length: {}\r\nConnection: close\r\nCache-Control: no-store\r\nReferrer-Policy: no-referrer\r\nX-Content-Type-Options: nosniff\r\nContent-Security-Policy: default-src 'none'; style-src 'unsafe-inline'; frame-ancestors 'none'; base-uri 'none'; form-action 'none'\r\n\r\n{}",
             body.len(),
             body
         )
@@ -146,6 +143,25 @@ fn handle_connection(mut stream: TcpStream) -> Option<String> {
     );
     let _ = stream.flush();
     Some(query.to_owned())
+}
+
+fn validated_callback<'a>(request: &'a str, expected: &AuthorizationRequest) -> Option<(&'a str, bool)> {
+    use overlook_provider::gmail::oauth::CallbackError;
+    let mut words = request.lines().next()?.split_whitespace();
+    if words.next()? != "GET" { return None; }
+    let (path, query) = words.next()?.split_once('?')?;
+    if path != "/callback" || words.next()? != "HTTP/1.1" || words.next().is_some() { return None; }
+    let authority = expected.redirect_uri.strip_prefix("http://")?.strip_suffix("/callback")?;
+    let hosts: Vec<_> = request.lines().skip(1).take_while(|line| !line.is_empty()).filter_map(|line| {
+        let (name, value) = line.split_once(':')?;
+        name.eq_ignore_ascii_case("host").then_some(value.trim())
+    }).collect();
+    if hosts != [authority] { return None; }
+    match expected.parse_callback(query) {
+        Ok(_) => Some((query, false)),
+        Err(CallbackError::Denied(_)) => Some((query, true)),
+        Err(_) => None,
+    }
 }
 
 fn completion_page(denied: bool) -> String {
@@ -178,5 +194,15 @@ mod tests {
     fn completion_page_mentions_overlook() {
         assert!(completion_page(false).contains("You’re signed in"));
         assert!(completion_page(true).contains("cancelled"));
+    }
+
+    #[test]
+    fn callback_rejects_forgery_pollution_and_wrong_origin() {
+        let expected = AuthorizationRequest { client_id: "synthetic".into(), redirect_uri: "http://127.0.0.1:43123/callback".into(), state: "synthetic-state".into(), pkce: Pkce::from_random(&[7; 48]), login_hint: None };
+        let valid = "GET /callback?code=synthetic-code&state=synthetic-state HTTP/1.1\r\nHost: 127.0.0.1:43123\r\n\r\n";
+        assert!(validated_callback(valid, &expected).is_some());
+        for invalid in [valid.replace("GET", "POST"), valid.replace("Host: 127.0.0.1:43123", "Host: attacker.example"), valid.replace("state=synthetic-state", "state=wrong"), valid.replace("state=synthetic-state", "state=wrong&state=synthetic-state"), valid.replace("/callback?", "/other?"), valid.replace("\r\n\r\n", "\r\nHost: 127.0.0.1:43123\r\n\r\n")] {
+            assert!(validated_callback(&invalid, &expected).is_none());
+        }
     }
 }

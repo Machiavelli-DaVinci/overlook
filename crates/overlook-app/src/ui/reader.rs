@@ -847,6 +847,8 @@ impl MailWindow {
             .id("quick-look")
             .absolute()
             .inset_0()
+            // Nothing underneath (a message body) may see the clicks meant for this.
+            .occlude()
             .bg(backdrop)
             .flex()
             .flex_col()

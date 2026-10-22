@@ -27,11 +27,13 @@ pub struct AccountProviders {
     pub calendar: Option<Arc<dyn CalendarProvider>>,
     /// The same provider as `mail` when it is an IMAP one, for the `IDLE` watcher.
     pub imap: Option<Arc<ImapProvider>>,
+    /// Shared lifecycle handle so removing an account disables every cloned provider.
+    pub gmail: Option<Arc<GmailClient>>,
 }
 
 impl AccountProviders {
     pub fn new(mail: Arc<dyn MailProvider>, calendar: Option<Arc<dyn CalendarProvider>>) -> Self {
-        Self { mail, calendar, imap: None }
+        Self { mail, calendar, imap: None, gmail: None }
     }
 }
 
@@ -48,7 +50,9 @@ pub fn gmail_providers(account: &Account, tokens: OAuthTokens) -> Result<Account
         }),
     ));
     let inbox_limit = crate::store_prefs_inbox_limit();
-    Ok(AccountProviders::new(Arc::new(GmailProvider::new(client.clone()).with_inbox_limit(inbox_limit)), Some(Arc::new(GoogleCalendarProvider::new(client)))))
+    let mut providers = AccountProviders::new(Arc::new(GmailProvider::new(client.clone()).with_inbox_limit(inbox_limit)), Some(Arc::new(GoogleCalendarProvider::new(client.clone()))));
+    providers.gmail = Some(client);
+    Ok(providers)
 }
 
 /// An IMAP account: one connection for mail, SMTP for sending, no calendar. The outgoing
@@ -56,7 +60,7 @@ pub fn gmail_providers(account: &Account, tokens: OAuthTokens) -> Result<Account
 pub fn imap_providers(servers: MailServers, password: String, outgoing_password: Option<String>) -> AccountProviders {
     let inbox_limit = crate::store_prefs_inbox_limit();
     let provider = Arc::new(ImapProvider::new(servers, password).with_outgoing_password(outgoing_password).with_inbox_limit(inbox_limit));
-    AccountProviders { mail: provider.clone(), calendar: None, imap: Some(provider) }
+    AccountProviders { mail: provider.clone(), calendar: None, imap: Some(provider), gmail: None }
 }
 
 /// Where a POP3 account's downloaded messages live: `<data dir>/raw/<account>/`, one `.eml`
@@ -79,8 +83,8 @@ fn stored_passwords(account: &Account) -> Result<(String, Option<String>), Provi
             let outgoing = match credentials::load_password(&account.id, credentials::KIND_PASSWORD_OUTGOING) {
                 Ok(found) => found,
                 Err(e) => {
-                    warn!("could not read the outgoing password for {}: {e}; using the incoming one", account.email);
-                    None
+                    // A failed vault read is not the user's "same as incoming" choice.
+                    return Err(ProviderIssue::SignInRequired(e.to_string()));
                 }
             };
             Ok((password, outgoing))

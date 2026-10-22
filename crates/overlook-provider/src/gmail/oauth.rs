@@ -8,7 +8,7 @@ use std::collections::BTreeMap;
 use std::time::Duration;
 
 /// The OAuth client created in Google Cloud ("Desktop app" type).
-#[derive(Clone, Debug, PartialEq, Eq, Serialize, Deserialize)]
+#[derive(Clone, PartialEq, Eq, Serialize, Deserialize)]
 pub struct ClientConfig {
     pub client_id: String,
     /// Google issues a "secret" for desktop clients but treats it as non-confidential.
@@ -32,13 +32,25 @@ impl ClientConfig {
 }
 
 /// Tokens for one account. Stored in the system keyring, never in ordinary configuration.
-#[derive(Clone, Debug, PartialEq, Eq, Serialize, Deserialize)]
+#[derive(Clone, PartialEq, Eq, Serialize, Deserialize)]
 pub struct OAuthTokens {
     pub access_token: String,
     pub refresh_token: Option<String>,
     /// Unix milliseconds.
     pub expires_at: i64,
     pub scope: Option<String>,
+}
+
+impl std::fmt::Debug for ClientConfig {
+    fn fmt(&self, f: &mut std::fmt::Formatter<'_>) -> std::fmt::Result {
+        f.debug_struct("ClientConfig").field("client_id", &self.client_id).field("client_secret", &"[REDACTED]").finish()
+    }
+}
+
+impl std::fmt::Debug for OAuthTokens {
+    fn fmt(&self, f: &mut std::fmt::Formatter<'_>) -> std::fmt::Result {
+        f.debug_struct("OAuthTokens").field("access_token", &"[REDACTED]").field("refresh_token", &"[REDACTED]").field("expires_at", &self.expires_at).field("scope", &self.scope).finish()
+    }
 }
 
 impl OAuthTokens {
@@ -70,6 +82,8 @@ pub const USERINFO_ENDPOINT: &str = "https://openidconnect.googleapis.com/v1/use
 fn agent() -> ureq::Agent {
     ureq::Agent::config_builder()
         .http_status_as_error(false)
+        .https_only(true)
+        .max_redirects(0)
         .timeout_global(Some(Duration::from_secs(30)))
         .build()
         .into()
@@ -146,6 +160,18 @@ pub fn refresh(config: &ClientConfig, refresh_token: &str) -> Result<OAuthTokens
     token_response(post_form(TOKEN_ENDPOINT, &body)?, Some(refresh_token))
 }
 
+/// Revoke the Google grant before discarding the refresh token. No secret in the URL.
+pub fn revoke(tokens: &OAuthTokens) -> Result<(), AuthError> {
+    let token = tokens.refresh_token.as_deref().unwrap_or(&tokens.access_token);
+    if token.is_empty() { return Ok(()); }
+    let mut response = post_form("https://oauth2.googleapis.com/revoke", &format!("token={}", url_encode(token)))?;
+    let status = response.status().as_u16();
+    if status == 200 { return Ok(()); }
+    let body: serde_json::Value = response.body_mut().read_json().unwrap_or_default();
+    if status == 400 && body.get("error").and_then(|v| v.as_str()) == Some("invalid_token") { return Ok(()); }
+    Err(AuthError::Protocol(format!("token revocation returned HTTP {status}; reconnect and retry account removal")))
+}
+
 /// Fetches the signed-in user's email and name (blocking).
 pub fn fetch_userinfo(access_token: &str) -> Result<UserInfo, AuthError> {
     let mut response = agent()
@@ -191,10 +217,16 @@ pub const AUTH_ENDPOINT: &str = "https://accounts.google.com/o/oauth2/v2/auth";
 pub const TOKEN_ENDPOINT: &str = "https://oauth2.googleapis.com/token";
 
 /// PKCE verifier/challenge pair (RFC 7636, S256).
-#[derive(Debug, Clone, PartialEq, Eq)]
+#[derive(Clone, PartialEq, Eq)]
 pub struct Pkce {
     pub verifier: String,
     pub challenge: String,
+}
+
+impl std::fmt::Debug for Pkce {
+    fn fmt(&self, f: &mut std::fmt::Formatter<'_>) -> std::fmt::Result {
+        f.debug_struct("Pkce").field("verifier", &"[REDACTED]").field("challenge", &self.challenge).finish()
+    }
 }
 
 impl Pkce {
@@ -258,18 +290,23 @@ impl AuthorizationRequest {
         for pair in query.trim_start_matches('?').split('&') {
             let (k, v) = pair.split_once('=').unwrap_or((pair, ""));
             let v = url_decode(v);
-            match k {
-                "code" => code = Some(v),
-                "state" => state = Some(v),
-                "error" => error = Some(v),
+            match url_decode(k).as_str() {
+                "code" if code.is_none() => code = Some(v),
+                "state" if state.is_none() => state = Some(v),
+                "error" if error.is_none() => error = Some(v),
+                "code" | "state" | "error" => return Err(CallbackError::Ambiguous),
                 _ => {}
             }
         }
-        if let Some(e) = error {
-            return Err(CallbackError::Denied(e));
-        }
         if state.as_deref() != Some(self.state.as_str()) {
             return Err(CallbackError::StateMismatch);
+        }
+        if code.is_some() && error.is_some() {
+            return Err(CallbackError::Ambiguous);
+        }
+        if error.is_some() {
+            // Never reflect an untrusted callback value into UI or logs.
+            return Err(CallbackError::Denied("access_denied".into()));
         }
         code.filter(|c| !c.is_empty()).ok_or(CallbackError::MissingCode)
     }
@@ -277,6 +314,8 @@ impl AuthorizationRequest {
 
 #[derive(Debug, Clone, PartialEq, Eq, thiserror::Error)]
 pub enum CallbackError {
+    #[error("the sign-in response contained ambiguous parameters")]
+    Ambiguous,
     #[error("sign-in was cancelled or denied: {0}")]
     Denied(String),
     #[error("the sign-in response did not match this request")]
@@ -317,8 +356,10 @@ pub fn url_decode(s: &str) -> String {
     let mut i = 0;
     while i < bytes.len() {
         match bytes[i] {
-            b'%' if i + 2 < bytes.len() + 0 && i + 2 <= bytes.len() - 1 => {
-                if let Ok(v) = u8::from_str_radix(&s[i + 1..i + 3], 16) {
+            b'%' if i + 2 < bytes.len() => {
+                let hex = |b: u8| (b as char).to_digit(16).map(|v| v as u8);
+                if let (Some(high), Some(low)) = (hex(bytes[i + 1]), hex(bytes[i + 2])) {
+                    let v = high * 16 + low;
                     out.push(v);
                     i += 3;
                     continue;
@@ -466,5 +507,29 @@ mod tests {
         assert_eq!(req.parse_callback("?code=4%2Fabc&state=s%20t%40te"), Ok("4/abc".into()));
         assert_eq!(req.parse_callback("code=x&state=other"), Err(CallbackError::StateMismatch));
         assert_eq!(req.parse_callback("error=access_denied&state=s%20t%40te"), Err(CallbackError::Denied("access_denied".into())));
+        for query in [
+            "code=x&state=s%20t%40te&state=other",
+            "code=x&state=other&state=s%20t%40te",
+            "code=x&code=y&state=s%20t%40te",
+            "code=x&%63ode=y&state=s%20t%40te",
+            "code=x&error=denied&state=s%20t%40te",
+            "error=a&error=b&state=s%20t%40te",
+        ] {
+            assert_eq!(req.parse_callback(query), Err(CallbackError::Ambiguous));
+        }
+        assert_eq!(req.parse_callback("error=untrusted-secret"), Err(CallbackError::StateMismatch));
+        assert_eq!(url_decode("%é"), "%é");
+    }
+
+    #[test]
+    fn secret_debug_output_is_redacted() {
+        let tokens = OAuthTokens { access_token: "synthetic-access-secret".into(), refresh_token: Some("synthetic-refresh-secret".into()), expires_at: 123, scope: None };
+        let config = ClientConfig { client_id: "public-client".into(), client_secret: Some("synthetic-client-secret".into()) };
+        let pkce = Pkce::from_random(&[7; 48]);
+        let output = format!("{tokens:?} {config:?} {pkce:?}");
+        for secret in [tokens.access_token.as_str(), tokens.refresh_token.as_deref().unwrap(), config.client_secret.as_deref().unwrap(), &pkce.verifier] {
+            assert!(!output.contains(secret));
+        }
+        assert!(output.contains("[REDACTED]"));
     }
 }

@@ -108,7 +108,7 @@ fn ispdb(protocol: ServerProtocol, domain: &str, email: &str) -> Option<Suggesti
     if domain.is_empty() || !domain.contains('.') {
         return None;
     }
-    let agent = ureq::Agent::config_builder().timeout_global(Some(Duration::from_secs(8))).build().new_agent();
+    let agent = ureq::Agent::config_builder().https_only(true).timeout_global(Some(Duration::from_secs(8))).build().new_agent();
     let mut response = agent.get(format!("{ISPDB_BASE}{domain}")).call().ok()?;
     if response.status() != 200 {
         return None;

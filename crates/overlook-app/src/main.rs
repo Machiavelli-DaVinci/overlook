@@ -104,12 +104,51 @@ fn init_logging() {
         let _ = std::fs::rename(&path, path.with_extension("log.old"));
     }
     let file = std::fs::OpenOptions::new().create(true).append(true).open(&path).ok();
-    let registry = tracing_subscriber::registry().with(tracing_subscriber::fmt::layer().with_filter(filter()));
+    let registry = tracing_subscriber::registry().with(tracing_subscriber::fmt::layer().with_filter(tracing_subscriber::filter::filter_fn(safe_log_metadata)).with_filter(filter()));
     match file {
         Some(file) => registry
-            .with(tracing_subscriber::fmt::layer().with_ansi(false).with_writer(std::sync::Mutex::new(file)).with_filter(filter()))
+            .with(tracing_subscriber::fmt::layer().with_ansi(false).with_writer(std::sync::Mutex::new(file)).with_filter(tracing_subscriber::filter::filter_fn(safe_log_metadata)).with_filter(filter()))
             .init(),
         None => registry.init(),
+    }
+}
+
+/// Protocol and vault diagnostics can contain wire bytes or secrets. An RUST_LOG
+/// override must never enable them in either the file log or stderr.
+fn safe_log_metadata(metadata: &tracing::Metadata<'_>) -> bool {
+    !["ureq", "rustls", "lettre", "imap", "oo7", "zbus", "zvariant"].iter().any(|prefix| metadata.target().starts_with(prefix))
+}
+
+#[cfg(test)]
+mod security_tests {
+    use super::safe_log_metadata;
+    use std::io::Write;
+    use std::sync::{Arc, Mutex};
+    use tracing_subscriber::{layer::SubscriberExt, Layer};
+
+    #[derive(Clone)]
+    struct Capture(Arc<Mutex<Vec<u8>>>);
+    impl Write for Capture {
+        fn write(&mut self, bytes: &[u8]) -> std::io::Result<usize> { self.0.lock().unwrap().extend_from_slice(bytes); Ok(bytes.len()) }
+        fn flush(&mut self) -> std::io::Result<()> { Ok(()) }
+    }
+
+    #[test]
+    fn synthetic_login_logs_redact_credentials_even_with_trace_enabled() {
+        let captured = Capture(Arc::new(Mutex::new(Vec::new())));
+        let writer = captured.clone();
+        let subscriber = tracing_subscriber::registry().with(tracing_subscriber::fmt::layer().without_time().with_ansi(false).with_writer(move || writer.clone()).with_filter(tracing_subscriber::filter::filter_fn(safe_log_metadata)).with_filter(tracing_subscriber::EnvFilter::new("trace")));
+        tracing::subscriber::with_default(subscriber, || {
+            tracing::trace!(target: "ureq_proto::client", "synthetic-wire-secret");
+            tracing::trace!(target: "lettre::smtp", "synthetic-smtp-secret");
+            tracing::trace!(target: "oo7::dbus", "synthetic-vault-secret");
+            let tokens = overlook_provider::gmail::OAuthTokens { access_token: "synthetic-access-secret".into(), refresh_token: Some("synthetic-refresh-secret".into()), expires_at: 3600000, scope: None };
+            tracing::info!(target: "overlook::synthetic_login", ?tokens, "Synthetic login credential diagnostic (not a live Google login)");
+        });
+        let output = String::from_utf8(captured.0.lock().unwrap().clone()).unwrap();
+        assert!(output.contains("[REDACTED]"));
+        assert!(!output.contains("-secret"));
+        println!("{output}");
     }
 }
 

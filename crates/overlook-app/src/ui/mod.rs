@@ -321,6 +321,7 @@ pub struct MailWindow {
     providers: HashMap<AccountId, providers::AccountProviders>,
     /// Why an account has no provider (shown as “Sign-in required”).
     provider_issues: HashMap<AccountId, String>,
+    removing_accounts: HashSet<AccountId>,
     /// The `IDLE` thread per IMAP account (see `overlook_provider::imap::idle`); each one
     /// reports Inbox changes through `idle_events`, which `watch_idle_events` turns into a
     /// sync of that account. Rebuilt by `refresh_idle_watchers` whenever `providers` change.
@@ -550,6 +551,7 @@ impl MailWindow {
             idle_watchers: HashMap::new(),
             idle_events: idle_tx,
             provider_issues,
+            removing_accounts: HashSet::new(),
             signin: None,
             account,
             utc_offset: overlook_core::time::local_utc_offset_minutes(),
@@ -831,17 +833,42 @@ impl MailWindow {
     }
 
     pub(crate) fn remove_account(&mut self, id: AccountId, window: &mut Window, cx: &mut Context<Self>) {
+        let Some(account) = self.accounts.iter().find(|a| a.id == id).cloned() else { return };
+        if !self.removing_accounts.insert(id.clone()) { return; }
+        let gmail = self.providers.get(&id).and_then(|p| p.gmail.clone());
+        let background_id = id.clone();
+        crate::ui::toast(window, cx, crate::notify::Level::Info, "Removing account and disconnecting access…");
+        cx.spawn_in(window, async move |this, cx| {
+            let result = cx.background_spawn(async move {
+                if account.provider == ProviderKind::Gmail {
+                    if let Some(client) = gmail {
+                        client.disconnect().map_err(|e| e.to_string())?;
+                    } else if let Some(tokens) = credentials::load_tokens(&background_id).map_err(|e| e.to_string())? {
+                        overlook_provider::gmail::oauth::revoke(&tokens).map_err(|e| e.to_string())?;
+                    }
+                }
+                if account.provider != ProviderKind::Sample {
+                    credentials::delete_all_secrets(&background_id).map_err(|e| e.to_string())?;
+                }
+                Ok::<(), String>(())
+            }).await;
+            let _ = this.update_in(cx, |this, window, cx| {
+                this.removing_accounts.remove(&id);
+                match result {
+                    Ok(()) => this.finish_remove_account(id, window, cx),
+                    Err(e) => crate::ui::toast(window, cx, crate::notify::Level::Error, format!("Account removal is incomplete: {e}. Reconnect and try again.")),
+                }
+                cx.notify();
+            });
+        }).detach();
+    }
+
+    fn finish_remove_account(&mut self, id: AccountId, window: &mut Window, cx: &mut Context<Self>) {
         self.other_indexes.remove(&id);
         if self.composer.is_some() {
             self.close_composer(window, cx);
         }
         let Some(account) = self.accounts.iter().find(|a| a.id == id).cloned() else { return };
-        if account.provider != ProviderKind::Sample {
-            // Tokens or passwords, whichever kinds this account stored.
-            if let Err(e) = credentials::delete_all_secrets(&id) {
-                tracing::warn!("could not remove stored credentials: {e}");
-            }
-        }
         if let Err(e) = self.store.delete_account(&id) {
             crate::ui::toast(window, cx, crate::notify::Level::Error, format!("Couldn’t remove the account: {e}"));
             return;

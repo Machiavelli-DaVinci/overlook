@@ -201,6 +201,8 @@ impl MailWindow {
             .id("palette-backdrop")
             .absolute()
             .inset_0()
+            // Nothing underneath (a message body) may see the clicks meant for this.
+            .occlude()
             .flex()
             .justify_center()
             .pt(px(90.))

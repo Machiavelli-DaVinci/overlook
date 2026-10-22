@@ -1379,7 +1379,7 @@ fn fetch_resource(agent: &ureq::Agent, url: &str, kind: &str) -> Result<(String,
     let mut response = loop {
         url.set_fragment(None);
         if url.as_str().len() > 8192
-            || !matches!(url.scheme(), "http" | "https")
+            || url.scheme() != "https"
             || !url.username().is_empty()
             || url.password().is_some()
             || url.port().is_some_and(|p| p != 80 && p != 443)
@@ -1516,6 +1516,20 @@ mod cancelled_resource_tests {
 #[cfg(test)]
 mod tests {
     use super::*;
+
+    // Synthetic TLS only: this key and trust anchor are never used by production.
+    fn test_tls_config() -> ureq::tls::TlsConfig {
+        ureq::tls::TlsConfig::builder()
+            .root_certs(ureq::tls::RootCerts::Specific(vec![ureq::tls::Certificate::from_der(include_bytes!("../tests/fixtures/resource-test-cert.der"))].into()))
+            .build()
+    }
+
+    fn tls_test_stream(socket: std::net::TcpStream) -> rustls::StreamOwned<rustls::ServerConnection, std::net::TcpStream> {
+        let cert = rustls::pki_types::CertificateDer::from(include_bytes!("../tests/fixtures/resource-test-cert.der").to_vec());
+        let key = rustls::pki_types::PrivatePkcs8KeyDer::from(include_bytes!("../tests/fixtures/resource-test-key.der").to_vec());
+        let config = rustls::ServerConfig::builder().with_no_client_auth().with_single_cert(vec![cert], key.into()).unwrap();
+        rustls::StreamOwned::new(rustls::ServerConnection::new(Arc::new(config)).unwrap(), socket)
+    }
 
     const REPRO_HEIGHTS: &[u32] = &[1, 511, 512, 513, 514, 900, 1023, 1024, 1025];
     const REPRO_SCALES: &[f64] = &[1.25, 1.5, 0.5, 2.0];
@@ -1949,6 +1963,7 @@ mod tests {
                 socket
                     .set_read_timeout(Some(Duration::from_secs(1)))
                     .unwrap();
+                let mut socket = tls_test_stream(socket);
                 let mut request = Vec::new();
                 while !request.ends_with(b"\r\n\r\n") {
                     let mut byte = [0];
@@ -1996,6 +2011,7 @@ mod tests {
             let mut actor = Actor::start(stop.clone(), allowed).unwrap();
             let config = ureq::Agent::config_builder()
                 .proxy(None)
+                .tls_config(test_tls_config())
                 .max_redirects(0)
                 .max_idle_connections(0)
                 .timeout_global(Some(Duration::from_secs(4)))
@@ -2007,7 +2023,7 @@ mod tests {
             );
             actor.resources = ResourceWorkers::new(agent, stop);
             let started = Instant::now();
-            actor.load("<img id=public src='http://synthetic.example/public'><img id=private src='http://synthetic.example/private'>", false).unwrap();
+            actor.load("<img id=public src='https://synthetic.example/public'><img id=private src='https://synthetic.example/private'>", false).unwrap();
             actor.cdp.poll().unwrap();
             actor.pump().unwrap();
             assert_eq!(actor.cdp.eval("document.images.length".into()).unwrap(), 2);
@@ -2108,19 +2124,20 @@ mod tests {
                     "/image?synthetic=1",
                     "302 Found",
                     "image/png",
-                    "Location: http://user:pass@synthetic.example/never\r\n",
+                    "Location: https://user:pass@synthetic.example/never\r\n",
                 ),
                 (
                     "/image?synthetic=1",
                     "302 Found",
                     "image/png",
-                    "Location: http://synthetic.example:8080/never\r\n",
+                    "Location: https://synthetic.example:8080/never\r\n",
                 ),
             ] {
-                let (mut socket, _) = server.accept().unwrap();
+                let (socket, _) = server.accept().unwrap();
                 socket
                     .set_read_timeout(Some(Duration::from_secs(4)))
                     .unwrap();
+                let mut socket = tls_test_stream(socket);
                 let mut request = Vec::new();
                 while !request.ends_with(b"\r\n\r\n") {
                     let mut byte = [0];
@@ -2142,6 +2159,7 @@ mod tests {
         });
         let config = ureq::Agent::config_builder()
             .proxy(None)
+                .tls_config(test_tls_config())
             .max_redirects(0)
             .max_idle_connections(0)
             .timeout_global(Some(Duration::from_secs(4)))
@@ -2151,7 +2169,7 @@ mod tests {
             ureq::unversioned::transport::DefaultConnector::default(),
             ControlledResolver(address),
         );
-        let url = "http://synthetic.example/image?synthetic=1";
+        let url = "https://synthetic.example/image?synthetic=1";
         for _ in 0..2 {
             assert_eq!(
                 fetch_resource(&agent, url, "Image").unwrap(),
@@ -2163,8 +2181,9 @@ mod tests {
         }
         for url in [
             "file:///tmp/image",
-            "http://user:pass@synthetic.example/image",
-            "http://synthetic.example:8080/image",
+            "http://synthetic.example/plaintext",
+            "https://user:pass@synthetic.example/image",
+            "https://synthetic.example:8080/image",
             "http://10.0.0.1/image",
             "http://[::1]/image",
         ] {
