@@ -10,6 +10,7 @@ use gpui_kit::component::input::{Editor, EditorState, Input, InputEvent, InputHi
 use gpui_kit::component::menu::{DropdownMenu, PopupMenuItem};
 use gpui_kit::component::{Disableable, Sizable};
 use overlook_core::compose::render_markdown;
+use overlook_core::recipients::{RecipientField, RecipientQuery};
 use std::rc::Rc;
 use gpui_kit::prelude::*;
 use gpui_kit::*;
@@ -51,9 +52,20 @@ pub struct Composer {
     pub last_saved: Option<i64>,
     pub save_generation: u64,
     pub suggestions: Vec<Address>,
+    recipient_query: Option<RecipientQuery>,
     pub error: Option<String>,
     pub _subscriptions: Vec<Subscription>,
     reveal: Option<ComposerReveal>,
+}
+
+impl Composer {
+    fn recipient_input(&self, field: RecipientField) -> &Entity<InputState> {
+        match field {
+            RecipientField::To => &self.to,
+            RecipientField::Cc => &self.cc,
+            RecipientField::Bcc => &self.bcc,
+        }
+    }
 }
 
 impl MailWindow {
@@ -95,13 +107,24 @@ impl MailWindow {
                 // Ctrl+Enter sends from any field; plain Enter in a header field moves on.
                 InputEvent::PressEnter { secondary: true, .. } => this.send_composer(window, cx),
                 InputEvent::PressEnter { .. } => this.focus_next_composer_field(window, cx),
+                InputEvent::Focus => this.refresh_recipient_suggestions(window, cx),
                 _ => {}
+            }));
+        }
+        // Caret movement and selecting existing reply recipients do not emit
+        // Change. Observe them too, without dirtying/autosaving the draft.
+        for state in [&to, &cc, &bcc] {
+            subs.push(cx.observe_in(state, window, |this, state, window, cx| {
+                if state.read(cx).focus_handle(cx).is_focused(window) {
+                    this.refresh_recipient_suggestions(window, cx);
+                }
             }));
         }
         subs.push(cx.subscribe_in(&body, window, |this, _state, event: &InputEvent, window, cx| match event {
             InputEvent::Change => this.composer_changed(window, cx),
             InputEvent::PressEnter { secondary: true, .. } => this.send_composer(window, cx),
             InputEvent::PressEnter { .. } => this.continue_list(window, cx),
+            InputEvent::Focus => this.refresh_recipient_suggestions(window, cx),
             _ => {}
         }));
 
@@ -129,6 +152,7 @@ impl MailWindow {
             last_saved: None,
             save_generation: 0,
             suggestions: Vec::new(),
+            recipient_query: None,
             error: None,
             _subscriptions: subs,
             reveal,
@@ -229,26 +253,7 @@ impl MailWindow {
         c.save_generation += 1;
         let generation = c.save_generation;
 
-        // Recipient suggestions from previous correspondents, keyed on the last token.
-        let to_value = c.to.read(cx).value().to_string();
-        let focused = c.to.read(cx).focus_handle(cx).is_focused(window);
-        let last_token = to_value.rsplit([',', ';']).next().unwrap_or("").trim().to_owned();
-        c.suggestions = if focused && last_token.len() >= 1 {
-            // Address book first, then people written to before, without duplicates.
-            let mut seen: std::collections::HashSet<String> = std::collections::HashSet::new();
-            // Both from memory: no database read per keystroke.
-            let contacts = overlook_store::contacts_matching(&self.contacts, &last_token, 5).into_iter().filter(|c| !c.email.is_empty()).map(|c| c.address());
-            let known = self.mail_index.known_recipients(&last_token, 5).into_iter();
-            contacts
-                .chain(known)
-                .filter(|a| !a.email.eq_ignore_ascii_case(&self.account.email))
-                .filter(|a| !last_token.eq_ignore_ascii_case(&a.email) && !last_token.eq_ignore_ascii_case(&a.to_header()))
-                .filter(|a| seen.insert(a.email.to_ascii_lowercase()))
-                .take(6)
-                .collect()
-        } else {
-            Vec::new()
-        };
+        self.refresh_recipient_suggestions(window, cx);
         cx.notify();
 
         // Debounced durable autosave.
@@ -261,6 +266,48 @@ impl MailWindow {
             });
         })
         .detach();
+    }
+
+    fn refresh_recipient_suggestions(&mut self, window: &mut Window, cx: &mut Context<Self>) {
+        let Some(c) = self.composer.as_ref() else { return };
+        let query = [RecipientField::To, RecipientField::Cc, RecipientField::Bcc]
+            .into_iter()
+            .filter(|field| match field {
+                RecipientField::To => true,
+                RecipientField::Cc => c.show_cc,
+                RecipientField::Bcc => c.show_bcc,
+            })
+            .find_map(|field| {
+                c.recipient_input(field).update(cx, |input, cx| {
+                    (input.focus_handle(cx).is_focused(window) && input.marked_text_range(window, cx).is_none())
+                        .then(|| RecipientQuery::new(field, &input.value(), input.selected_range()))
+                        .flatten()
+                })
+            });
+        // Input notifications include cursor blinking. Only search again when
+        // the field, text or selection actually changes.
+        if query == c.recipient_query { return; }
+        let suggestions = if let Some(query) = &query {
+            let token = query.text();
+            // Address book first, then people written to before, without duplicates.
+            let mut seen: std::collections::HashSet<String> = std::collections::HashSet::new();
+            // Both from memory: no database read per keystroke.
+            let contacts = overlook_store::contacts_matching(&self.contacts, token, 5).into_iter().filter(|c| !c.email.is_empty()).map(|c| c.address());
+            let known = self.mail_index.known_recipients(token, 5).into_iter();
+            contacts
+                .chain(known)
+                .filter(|a| !a.email.eq_ignore_ascii_case(&self.account.email))
+                .filter(|a| !token.eq_ignore_ascii_case(&a.email) && !token.eq_ignore_ascii_case(&a.to_header()))
+                .filter(|a| seen.insert(a.email.to_ascii_lowercase()))
+                .take(6)
+                .collect()
+        } else {
+            Vec::new()
+        };
+        let c = self.composer.as_mut().unwrap();
+        c.recipient_query = query;
+        c.suggestions = suggestions;
+        cx.notify();
     }
 
     /// The idle autosave: the write (a durable transaction that may wait for a sync's
@@ -488,7 +535,7 @@ impl MailWindow {
                 .child(div().flex_1().min_w_0().child(input))
         };
 
-        let suggestions: Option<Div> = (!c.suggestions.is_empty()).then(|| {
+        let mut suggestions: Option<Div> = c.recipient_query.as_ref().filter(|_| !c.suggestions.is_empty()).map(|query| {
             h_flex()
                 .flex_wrap()
                 .gap(px(6.))
@@ -497,13 +544,15 @@ impl MailWindow {
                 .border_b_1()
                 .border_color(p.divider)
                 .children(c.suggestions.iter().cloned().map(|a| {
-                    let header = a.to_header();
+                    let query = query.clone();
+                    let draft_id = c.draft.id.clone();
                     Button::new(SharedString::from(format!("suggest-{}", a.email)))
                         .xsmall()
                         .label(if a.name.is_some() { format!("{} · {}", a.display_name(), a.email) } else { a.email.clone() })
-                        .on_click(cx.listener(move |this, _, window, cx| this.accept_suggestion(header.clone(), window, cx)))
+                        .on_click(cx.listener(move |this, _, window, cx| this.accept_suggestion(&draft_id, &query, &a, window, cx)))
                 }))
         });
+        let suggestion_field = c.recipient_query.as_ref().map(|q| q.field);
 
         let attachments: Option<Div> = (!c.draft.attachments.is_empty()).then(|| {
             h_flex()
@@ -608,9 +657,11 @@ impl MailWindow {
                         })))
                     }),
             )
-            .children(suggestions)
-            .when(c.show_cc, |d| d.child(field_row("Cc", Input::new(&c.cc).appearance(false).into_any_element())))
-            .when(c.show_bcc, |d| d.child(field_row("Bcc", Input::new(&c.bcc).appearance(false).into_any_element())))
+            .when(suggestion_field == Some(RecipientField::To), |d| d.children(suggestions.take()))
+            .when(c.show_cc, |d| d.child(field_row("Cc", Input::new(&c.cc).appearance(false).into_any_element()))
+                .when(suggestion_field == Some(RecipientField::Cc), |d| d.children(suggestions.take())))
+            .when(c.show_bcc, |d| d.child(field_row("Bcc", Input::new(&c.bcc).appearance(false).into_any_element()))
+                .when(suggestion_field == Some(RecipientField::Bcc), |d| d.children(suggestions.take())))
             .child(field_row("Subject", Input::new(&c.subject).appearance(false).into_any_element()))
             .child(self.render_format_toolbar(c, &p, cx))
             .child(if c.preview {
@@ -989,22 +1040,25 @@ impl MailWindow {
         }
     }
 
-    fn accept_suggestion(&mut self, header: String, window: &mut Window, cx: &mut Context<Self>) {
+    fn accept_suggestion(&mut self, draft_id: &DraftId, query: &RecipientQuery, address: &Address, window: &mut Window, cx: &mut Context<Self>) {
         let Some(c) = self.composer.as_ref() else { return };
-        let current = c.to.read(cx).value().to_string();
-        let mut parts: Vec<String> = current.split([',', ';']).map(|s| s.trim().to_owned()).filter(|s| !s.is_empty()).collect();
-        // The last token is the partial text being completed.
-        if !current.trim_end().ends_with([',', ';']) {
-            parts.pop();
-        }
-        parts.push(header);
-        let value = format!("{}, ", parts.join(", "));
-        let to = c.to.clone();
-        to.update(cx, |s, cx| {
-            s.set_value(value, window, cx);
+        if &c.draft.id != draft_id || c.recipient_query.as_ref() != Some(query) { return; }
+        // Use the suggestion's field, not whichever control has focus after a
+        // click or keyboard activation. Refuse stale text/selection snapshots.
+        let input = c.recipient_input(query.field).clone();
+        let state = input.read(cx);
+        let Some((range, text)) = query.replacement(&state.value(), state.selected_range(), address) else { return };
+        let applied = input.update(cx, |s, cx| {
+            if s.marked_text_range(window, cx).is_some() { return false; }
+            s.set_selected_range(range, cx);
+            // Atomic replacement retains undo/redo history; set_value clears it.
+            s.replace(text, window, cx);
             s.focus(window, cx);
+            true
         });
+        if !applied { return; }
         if let Some(c) = self.composer.as_mut() {
+            c.recipient_query = None;
             c.suggestions.clear();
         }
         self.composer_changed(window, cx);

@@ -100,21 +100,42 @@ impl Address {
     /// `Name <email>` or just the address.
     pub fn to_header(&self) -> String {
         match &self.name {
-            Some(n) if !n.trim().is_empty() => format!("{} <{}>", n.trim(), self.email),
+            Some(n) if !n.trim().is_empty() => {
+                let name = n.trim();
+                // Composer text must round-trip through parse_list, including
+                // display names such as Doe, Jane or names containing quotes.
+                let name = if name.contains([',', ';', '"', '\\', '<', '>', '(', ')', ':', '@', '[', ']']) {
+                    format!("\"{}\"", name.replace('\\', "\\\\").replace('"', "\\\""))
+                } else {
+                    name.to_owned()
+                };
+                format!("{name} <{}>", self.email)
+            }
             _ => self.email.clone(),
         }
     }
 
     /// Parses a comma-separated recipient field. Accepts `Name <a@b>` and bare addresses.
     pub fn parse_list(input: &str) -> Vec<Address> {
-        input
-            .split([',', ';'])
+        crate::recipients::recipient_ranges(input)
+            .into_iter()
+            .map(|range| &input[range])
             .map(str::trim)
             .filter(|s| !s.is_empty())
             .map(|part| {
-                if let (Some(open), Some(close)) = (part.find('<'), part.rfind('>')) {
+                if let (Some(open), Some(close)) = (part.rfind('<'), part.rfind('>')) {
                     if open < close {
-                        let name = part[..open].trim().trim_matches('"').to_owned();
+                        let raw_name = part[..open].trim();
+                        let name = if let Some(quoted) = raw_name.strip_prefix('"').and_then(|s| s.strip_suffix('"')) {
+                            let mut name = String::new();
+                            let mut chars = quoted.chars();
+                            while let Some(ch) = chars.next() {
+                                name.push(if ch == '\\' { chars.next().unwrap_or(ch) } else { ch });
+                            }
+                            name
+                        } else {
+                            raw_name.to_owned()
+                        };
                         let email = part[open + 1..close].trim().to_owned();
                         return Address {
                             name: if name.is_empty() { None } else { Some(name) },

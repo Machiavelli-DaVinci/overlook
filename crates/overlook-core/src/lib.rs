@@ -20,6 +20,7 @@ pub mod ids;
 pub mod model;
 pub mod ops;
 pub mod prefs;
+pub mod recipients;
 pub mod prepass;
 pub mod sanitize;
 pub mod servers;
