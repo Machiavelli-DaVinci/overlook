@@ -13,6 +13,9 @@
 //! evict their messages. Any eviction routine must check [`Store::is_local_primary`] first.
 
 mod index;
+mod calendar_connections;
+mod caldav;
+mod caldav_outbox;
 mod schema;
 
 pub use index::{apply_to_message, MailIndex};
@@ -119,6 +122,7 @@ impl Store {
     }
 
     fn init(conn: Connection) -> Result<Self> {
+        schema::ensure_supported(&conn)?;
         conn.pragma_update(None, "journal_mode", "WAL")?;
         conn.pragma_update(None, "synchronous", "FULL")?;
         conn.pragma_update(None, "foreign_keys", "ON")?;
@@ -561,7 +565,7 @@ impl Store {
                 params![account.0, from, to],
             )?;
             for e in &mut events {
-                e.pending = pending.contains(&e.id);
+                e.pending |= pending.contains(&e.id);
             }
             events.sort_by_key(|e| (e.start, e.end));
             Ok(events)
@@ -572,6 +576,7 @@ impl Store {
     pub fn apply_event_change(&self, account: &AccountId, event: &Event, kind: OperationKind) -> Result<PendingOperation> {
         let ts = now();
         self.with_tx(|tx| {
+            caldav::reject_caldav_write(tx, &event.calendar_id)?;
             upsert_event_tx(tx, event)?;
             insert_operation_tx(tx, account, kind, ts)
         })
@@ -600,6 +605,7 @@ impl Store {
     pub fn delete_event_locally_scoped(&self, account: &AccountId, event: &Event, scope: RecurrenceScope) -> Result<PendingOperation> {
         let ts = now();
         self.with_tx(|tx| {
+            caldav::reject_caldav_write(tx, &event.calendar_id)?;
             for member in Self::series_members_tx(tx, account, event, scope)? {
                 tx.execute("DELETE FROM events WHERE id=?1", [&member.id.0])?;
             }
@@ -628,6 +634,7 @@ impl Store {
         let delta = before.as_ref().map(|b| event.start - b.start).unwrap_or(0);
         let duration = event.end - event.start;
         self.with_tx(|tx| {
+            caldav::reject_caldav_write(tx, &event.calendar_id)?;
             let members = before.as_ref().map(|b| Self::series_members_tx(tx, account, b, scope)).transpose()?.unwrap_or_default();
             for member in members {
                 if member.id == event.id {
@@ -1529,7 +1536,9 @@ fn load_events(c: &Connection, clause: &str, args: impl rusqlite::Params) -> Res
     let sql = format!(
         "SELECT e.id, e.account_id, e.calendar_id, e.provider_id, e.ical_uid, e.summary, e.description, e.location, e.start, e.end, e.all_day, e.status,
                 e.organizer_json, e.attendees_json, e.html_link, e.conference_url, e.recurring_event_id, e.updated, e.event_type, e.color, e.reminders_json,
-                e.original_start, e.wants_conference FROM events e {clause}"
+                e.original_start, e.wants_conference,
+                EXISTS(SELECT 1 FROM caldav_event_resources m JOIN caldav_outbox o ON o.calendar_id=m.calendar_id AND o.href=m.href WHERE m.event_id=e.id)
+                FROM events e {clause}"
     );
     let mut stmt = c.prepare(&sql)?;
     let rows = stmt.query_map(args, |r| {
@@ -1555,12 +1564,12 @@ fn load_events(c: &Connection, clause: &str, args: impl rusqlite::Params) -> Res
             r.get::<_, Option<String>>(18)?,
             r.get::<_, Option<String>>(19)?,
             r.get::<_, Option<String>>(20)?,
-            (r.get::<_, Option<i64>>(21)?, r.get::<_, i64>(22)? != 0),
+            (r.get::<_, Option<i64>>(21)?, r.get::<_, i64>(22)? != 0, r.get::<_, bool>(23)?),
         ))
     })?;
     let mut out = Vec::new();
     for row in rows {
-        let (id, account, calendar, provider, ical, summary, description, location, start, end, all_day, status, organizer, attendees, link, conf, recurring, updated, event_type, color, reminders, (original_start, wants_conference)) = row?;
+        let (id, account, calendar, provider, ical, summary, description, location, start, end, all_day, status, organizer, attendees, link, conf, recurring, updated, event_type, color, reminders, (original_start, wants_conference, pending)) = row?;
         out.push(Event {
             id: EventId(id),
             account_id: AccountId(account),
@@ -1585,7 +1594,7 @@ fn load_events(c: &Connection, clause: &str, args: impl rusqlite::Params) -> Res
             reminders: reminders.as_deref().map(serde_json::from_str).transpose()?,
             original_start,
             wants_conference,
-            pending: false,
+            pending,
         });
     }
     Ok(out)

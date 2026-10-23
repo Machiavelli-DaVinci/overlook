@@ -1,0 +1,31 @@
+{
+  "base_commit": "b80893a5927d3d6d65592f845409b7b5984b351d",
+  "date": "2026-10-22",
+  "version": "1.5.5",
+  "state": "Unreleased local assessment candidate",
+  "files": {
+    ".github/workflows/release.yml": "ba988e4af4305258a9e50cca4543b0cf7067e93b9f9f912aa42769b2bc0afb86",
+    "Cargo.lock": "1af23de08e85966328e49e6769f9dcd431be010165a7e5891d795aa90d97b289",
+    "Cargo.toml": "b9f0a921a13af5498c0df683f2fbf25ae74e06fc65b4d3719dfcea78b34ea5e3",
+    "crates/overlook-app/Cargo.toml": "657658791c724ca2d2e152c2e1091e66d25ecd27a59fed89b3c5bd4447d713dc",
+    "crates/overlook-app/src/browser_engine.rs": "cca8d598e97b0d7ad5e0d0b11108e24fe22a07e21d219c1bbcba6bc21b1e3320",
+    "crates/overlook-app/src/credentials.rs": "a1fa0f2a6b65a10569459e05ed9086187a1f73a3a0b2b212d1ef34797bde3ca2",
+    "crates/overlook-app/src/google_signin.rs": "7ba74b46bb288dcf1d875650626cb1b302d907861bf82610bbcabf282a2ab35c",
+    "crates/overlook-app/src/main.rs": "3cdb75d64d3f9172ebe32876d632f76d87ab5487c7e3df16825006403fd34491",
+    "crates/overlook-app/src/providers.rs": "8fb91370479f84de398907f6ccfc26edba1310ca5238b2adc51886c1f0544fd9",
+    "crates/overlook-app/src/ui/mod.rs": "4248b15cd00628f01ed70f5a21df8f3773874dadbd20e069351bb90cc6227308",
+    "crates/overlook-app/src/updater.rs": "5f86f4c7411e817b6c170b641095ad71a546ccf74818341fe9b679a3bdfdca66",
+    "crates/overlook-core/src/browser.rs": "6388dba3c0248a74741cc80c5993ecdf272c8b8c1c2774edca2bd1da946d7c22",
+    "crates/overlook-core/src/sanitize.rs": "5554fa0470595e96e7988c3682d5ee0a9e08d0a5e2dc3db2a687b4c1e74b6e10",
+    "crates/overlook-provider/src/autoconfig.rs": "3a91abc60a69624d4b28de3831d896f0043e13f6857633e0443ef44f49a0242a",
+    "crates/overlook-provider/src/gmail/api.rs": "added62a164172d1e00218b60f261d92f293b88919e50ad65b751e8b252cb3e2",
+    "crates/overlook-provider/src/gmail/oauth.rs": "4d3e0688ae58bf5175c5bf8ba60ec6e53987f4e677efc1539dc0c355fc459b4c",
+    "crates/overlook-provider/src/imap/connection.rs": "84a6b5012416f2750e2f332f7726e2e1fd8d4c3583a7439605b8560de3e97976",
+    "crates/overlook-provider/src/smtp.rs": "e57fc57446c8c3d80ece8841fe95eb83a3df977a5f0c0b2bbc926d8ce9db74e8",
+    "crates/overlook-store/src/lib.rs": "c638b3548fb6b73c52e48cd2c47bbfe0f2b62c6b46ab6801ea2da5a35af041d6",
+    "llm-docs/casa/logs/dependency-summary.txt": "1d4cccaf26e4f20049df67dd725ceacbf7723e4db0863ea49d10f11348537ea2",
+    "llm-docs/casa/logs/public-dns.txt": "f99ccff085c3d77139587d788ca0784314f097a4c5b6ddf8b44aeb8f6c473a0d",
+    "llm-docs/casa/logs/synthetic-login.txt": "c78a9465532a68d0aa761615e5eaeff7b33ac60d0a50b6e798e070f543203d5b"
+  },
+  "digest": "4f128399b50d1753a8c7731e434e197019cc4e64347a080b017ae43d128233b7"
+}

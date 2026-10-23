@@ -2,6 +2,8 @@
 
 Status as of 15 October 2026: foundation milestones 2 to 5 implemented (see the [foundation plan](foundation-implementation-plan.md)), plus the three daily-use features the user asked for: Focused Inbox, attachments, and Google Calendar, and the IMAP/SMTP and POP3 providers through milestone M5 of the [IMAP and POP3 plan](imap-pop3-implementation-plan.md) (verified against scripted servers and, on screen, in the app; no real IMAP, SMTP or POP3 account has been synced yet). This is a native Rust + GPUI application with a durable local store, a sample provider, and working Gmail accounts (sign-in, download, incremental sync, mailbox actions, send).
 
+Calendar update, 23 October 2026: existing IMAP/POP accounts can attach Fastmail or a manually configured CalDAV service through **Settings → Accounts → Calendars**. New Fastmail accounts can opt in during setup. Personal creation/editing/deletion, offline changes, explicit conflicts and supported recurrence edits use the shared calendar views. Unchanged calendars now reuse cached data through collection sync tokens; Settings includes a persistent default writable calendar. The final workspace suite, independent Radicale round trips, DST checks, Clippy and release build passed. Hosted Fastmail setup and online edits were observed previously; fresh native visual/accessibility and broader hosted qualification remain incomplete. Meeting invitations/RSVP, new recurrence rules and series-wide editing remain disabled. See [current completion and verification](fastmail-calendar-completion.md), [write behavior](fastmail-calendar-write-sync.md), [connection instructions](fastmail-calendar-read-sync.md) and the [provider roadmap](calendar-provider-roadmap.md).
+
 ## Install
 
 End users: `curl -fsSL https://raw.githubusercontent.com/last-refuge/overlook/main/install.sh | bash` (see the README). Developers: read on.
@@ -221,7 +223,7 @@ Environment switches for development:
 | `OVERLOOK_CONFIG_DIR` | Directory holding `google-oauth-client.json` (default `~/.config/overlook`) |
 | `OVERLOOK_SIGN_IN=gmail` | Start the Google sign-in at launch |
 
-Keyboard additions: `Ctrl 1` Mail, `Ctrl 2` Calendar, `Ctrl Shift A` new event; in the calendar `←`/`→` move by period, `T` today, `D`/`W`/`M`/`A` views.
+Keyboard additions: `Ctrl 1` Mail, `Ctrl 2` Calendar, `Ctrl Shift A` new event, `Ctrl S` save the event editor; with the calendar focused, `↑`/`↓` select an event, `Enter` edits it, `Delete` removes it, `←`/`→` move by period, `T` goes to today, and `D`/`W`/`M`/`A` choose views. Text inputs and focused buttons retain their normal keys.
 | `OVERLOOK_SAMPLE_ONLINE=1` | Start the sample connection connected, so queued work syncs at launch |
 | `OVERLOOK_UTC_OFFSET_MINUTES` | Override the local time zone offset used for day groups |
 | `RUST_LOG=overlook=debug` | Tracing output |

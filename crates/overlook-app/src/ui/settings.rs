@@ -53,6 +53,8 @@ impl SettingsPage {
 
 pub struct SettingsState {
     pub page: SettingsPage,
+    pub focus: FocusHandle,
+    pub scroll: ScrollHandle,
     /// Account shown on the Accounts page.
     pub account: AccountId,
     pub name_input: Entity<InputState>,
@@ -71,6 +73,7 @@ pub struct SettingsState {
     pub attachments_dir: Entity<InputState>,
     pub work_start: Entity<InputState>,
     pub work_end: Entity<InputState>,
+    pub caldav: Option<super::calendar_setup::CalendarSetup>,
     pub _subscriptions: Vec<Subscription>,
 }
 
@@ -245,6 +248,7 @@ impl MailWindow {
     }
 
     fn build_settings(&mut self, page: SettingsPage, account: AccountId, window: &mut Window, cx: &mut Context<Self>) {
+        self.cancel_calendar_setup_dialog();
         let acct = self.accounts.iter().find(|a| a.id == account).cloned().unwrap_or_else(|| self.account.clone());
         let ap = self.account_prefs_for(&acct.id);
         let name_input = cx.new(|cx| InputState::new(window, cx).placeholder("Your name").default_value(acct.display_name.clone()));
@@ -317,8 +321,13 @@ impl MailWindow {
             }
         }));
 
+        let caldav = self.build_calendar_setup(&acct, window, cx);
+        let focus = cx.focus_handle();
+        focus.focus(window, cx);
         self.settings = Some(SettingsState {
             page,
+            focus,
+            scroll: ScrollHandle::new(),
             account: acct.id.clone(),
             name_input,
             signature,
@@ -334,6 +343,7 @@ impl MailWindow {
             attachments_dir,
             work_start,
             work_end,
+            caldav,
             _subscriptions: subs,
         });
         self.load_vacation(acct.id, window, cx);
@@ -341,14 +351,16 @@ impl MailWindow {
     }
 
     pub(crate) fn close_settings(&mut self, window: &mut Window, cx: &mut Context<Self>) {
+        self.cancel_calendar_setup_dialog();
         self.settings = None;
-        self.list_focus.focus(window, cx);
+        self.focus_current_module(window, cx);
         cx.notify();
     }
 
     fn set_settings_page(&mut self, page: SettingsPage, cx: &mut Context<Self>) {
         if let Some(s) = self.settings.as_mut() {
             s.page = page;
+            s.scroll.set_offset(point(px(0.), px(0.)));
         }
         cx.notify();
     }
@@ -381,6 +393,10 @@ impl MailWindow {
                 let active = pg == page;
                 h_flex()
                     .id(SharedString::from(format!("settings-nav-{}", pg.label())))
+                    .focusable()
+                    .tab_stop(true)
+                    .role(gpui::Role::Button)
+                    .aria_label(pg.label())
                     .items_center()
                     .gap(px(10.))
                     .px(px(10.))
@@ -392,9 +408,16 @@ impl MailWindow {
                     .font_weight(if active { FontWeight::SEMIBOLD } else { FontWeight::NORMAL })
                     .when(active, |d| d.bg(p.selection))
                     .when(!active, |d| d.hover(|d| d.bg(p.hover)))
+                    .focus_visible(|d| d.bg(p.selection).border_1().border_color(p.accent))
                     .child(icon(pg.icon()).size(px(16.)).text_color(if active { p.accent } else { p.muted }))
                     .child(pg.label())
                     .on_click(cx.listener(move |this, _, _w, cx| this.set_settings_page(pg, cx)))
+                    .on_key_down(cx.listener(move |this, event: &KeyDownEvent, _, cx| {
+                        if matches!(event.keystroke.key.as_str(), "enter" | "space") && !event.keystroke.modifiers.control && !event.keystroke.modifiers.alt && !event.keystroke.modifiers.platform {
+                            this.set_settings_page(pg, cx);
+                            cx.stop_propagation();
+                        }
+                    }))
             }))
         };
 
@@ -420,6 +443,25 @@ impl MailWindow {
             .child(
                 h_flex()
                     .id("settings-dialog")
+                    .track_focus(&state.focus)
+                    .tab_group()
+                    .role(gpui::Role::Dialog)
+                    .aria_label("Settings")
+                    .on_key_down(cx.listener(|this, event: &KeyDownEvent, window, cx| {
+                        if event.keystroke.modifiers.control || event.keystroke.modifiers.alt || event.keystroke.modifiers.platform { return; }
+                        let Some(state) = this.settings.as_ref() else { return };
+                        let old = state.scroll.offset();
+                        let page = state.scroll.bounds().size.height * 0.85;
+                        let next = match event.keystroke.key.as_str() {
+                            "pageup" => old.y + page,
+                            "pagedown" => old.y - page,
+                            _ => return,
+                        };
+                        state.scroll.set_offset(point(old.x, next.min(px(0.)).max(-state.scroll.max_offset().y)));
+                        window.prevent_default();
+                        cx.stop_propagation();
+                        cx.notify();
+                    }))
                     .w(px(960.))
                     .h(px(640.))
                     .max_w(relative(0.94))
@@ -448,7 +490,8 @@ impl MailWindow {
                                     .child(kbd("Esc", &p))
                                     .child(Button::new("settings-close").ghost().small().icon(icon("x").size(px(16.))).ml(px(8.)).on_click(cx.listener(|this, _, window, cx| this.close_settings(window, cx)))),
                             )
-                            .child(v_flex().id("settings-content").flex_1().min_h_0().p(px(24.)).gap(px(22.)).child(content).overflow_y_scrollbar()),
+                            .child(v_flex().id("settings-content").flex_1().min_h_0().p(px(24.)).gap(px(22.))
+                                .child(div().flex_none().child(content)).overflow_y_scroll().track_scroll(&state.scroll).vertical_scrollbar(&state.scroll)),
                     ),
             )
             .into_any_element()
@@ -517,9 +560,17 @@ impl MailWindow {
                         let kind = account.provider;
                         r.child(Button::new("settings-servers").small().icon(icon("server").size(px(14.))).label("Server settings…").on_click(cx.listener(move |this, _, window, cx| this.open_account_setup(kind, super::SetupMode::Edit(id.clone()), window, cx))))
                     })
-                    .child(Button::new("settings-sync").ghost().small().icon(icon("refresh-cw").size(px(14.))).label("Sync now").on_click(cx.listener(|this, _, window, cx| this.sync_now(window, cx))))
+                    .child(Button::new("settings-sync").ghost().small().icon(icon("refresh-cw").size(px(14.))).label("Sync now").on_click(cx.listener({
+                        let id = account.id.clone();
+                        move |this, _, window, cx| {
+                            this.next_retry.remove(&id);
+                            this.sync_caldav_account(id.clone(), true, cx);
+                            this.sync_account(id.clone(), window, cx);
+                        }
+                    })))
                     .into_any_element(),
             ))
+            .children(state.caldav.as_ref().map(|form| self.render_calendar_setup(form, cx)))
             .child(section("Signatures", Some("Added to the end of your messages. Written like the composer: **bold**, *italic*, links.")))
             .child({
                 let acct_id = account.id.clone();

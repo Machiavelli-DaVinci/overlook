@@ -1,0 +1,793 @@
+diff --git i/Cargo.lock w/Cargo.lock
+index 8755755..cda7384 100644
+--- i/Cargo.lock
++++ w/Cargo.lock
+@@ -163,9 +163,9 @@ checksum = "683d7910e743518b0e34f1186f92494becacb047c7b6bf616c96772180fef923"
+ 
+ [[package]]
+ name = "ammonia"
+-version = "4.2.3"
++version = "4.2.4"
+ source = "registry+https://github.com/rust-lang/crates.io-index"
+-checksum = "061e83b03c2681c18a6787d956e355c74e0b98ba7ba3d69b0822ade1e6f1d716"
++checksum = "1f45dfa685e1ec33b1bf1a3b93b8047cbdbef41b6040deebbe6bea7720a45574"
+ dependencies = [
+  "cssparser",
+  "html5ever 0.40.1",
+@@ -4868,6 +4868,7 @@ dependencies = [
+  "overlook-core",
+  "overlook-provider",
+  "overlook-store",
++ "rustls",
+  "serde",
+  "serde_json",
+  "sha2 0.10.9",
+@@ -6006,9 +6007,9 @@ dependencies = [
+ 
+ [[package]]
+ name = "rustls"
+-version = "0.23.45"
++version = "0.23.46"
+ source = "registry+https://github.com/rust-lang/crates.io-index"
+-checksum = "0d41d731c7d2f962d1ccc364cec258de3c0e93b38c2fb3ba97ac74513048d634"
++checksum = "48e13bd8c0e9365c43cfa5c9e8f9ad49d3c8444926c9aac819e0e4dc503c8fdf"
+ dependencies = [
+  "log",
+  "once_cell",
+@@ -6052,9 +6053,9 @@ dependencies = [
+ 
+ [[package]]
+ name = "rustls-webpki"
+-version = "0.103.15"
++version = "0.103.16"
+ source = "registry+https://github.com/rust-lang/crates.io-index"
+-checksum = "f3c3cf1d8b1e7d4927e2d154c3fcb02979afb9939629c62cd9048d4f07b60ac2"
++checksum = "4443b1b6d39d7c663139942cc4558262562d2c84123bb6282ef177009ca8b281"
+ dependencies = [
+  "ring",
+  "rustls-pki-types",
+@@ -6831,7 +6832,7 @@ source = "registry+https://github.com/rust-lang/crates.io-index"
+ checksum = "32497e9a4c7b38532efcdebeef879707aa9f794296a4f0244f6f69e9bc8574bd"
+ dependencies = [
+  "fastrand",
+- "getrandom 0.4.3",
++ "getrandom 0.3.4",
+  "once_cell",
+  "rustix",
+  "windows-sys 0.61.2",
+@@ -7797,9 +7798,9 @@ dependencies = [
+ 
+ [[package]]
+ name = "webpki-roots"
+-version = "1.0.9"
++version = "1.0.10"
+ source = "registry+https://github.com/rust-lang/crates.io-index"
+-checksum = "7dcd9d09a39985f5344844e66b0c530a33843579125f23e21e9f0f220850f22a"
++checksum = "1c1c8e20c8a38fc7d65abfe74eb7280e4aa667e8eec8bc84996d2874810748d9"
+ dependencies = [
+  "rustls-pki-types",
+ ]
+diff --git i/crates/overlook-app/Cargo.toml w/crates/overlook-app/Cargo.toml
+index 8370ec6..49d307f 100644
+--- i/crates/overlook-app/Cargo.toml
++++ w/crates/overlook-app/Cargo.toml
+@@ -34,3 +34,4 @@ tokio = { version = "1", features = ["rt-multi-thread", "sync"] }
+ 
+ [dev-dependencies]
+ overlook-provider = { workspace = true, features = ["fake-servers"] }
++rustls = { version = "0.23", default-features = false, features = ["ring", "std", "tls12"] }
+diff --git i/crates/overlook-app/src/browser_engine.rs w/crates/overlook-app/src/browser_engine.rs
+index 0518110..a4b519e 100644
+--- i/crates/overlook-app/src/browser_engine.rs
++++ w/crates/overlook-app/src/browser_engine.rs
+@@ -1379,7 +1379,7 @@ fn fetch_resource(agent: &ureq::Agent, url: &str, kind: &str) -> Result<(String,
+     let mut response = loop {
+         url.set_fragment(None);
+         if url.as_str().len() > 8192
+-            || !matches!(url.scheme(), "http" | "https")
++            || url.scheme() != "https"
+             || !url.username().is_empty()
+             || url.password().is_some()
+             || url.port().is_some_and(|p| p != 80 && p != 443)
+@@ -1517,6 +1517,20 @@ mod cancelled_resource_tests {
+ mod tests {
+     use super::*;
+ 
++    // Synthetic TLS only: this key and trust anchor are never used by production.
++    fn test_tls_config() -> ureq::tls::TlsConfig {
++        ureq::tls::TlsConfig::builder()
++            .root_certs(ureq::tls::RootCerts::Specific(vec![ureq::tls::Certificate::from_der(include_bytes!("../tests/fixtures/resource-test-cert.der"))].into()))
++            .build()
++    }
++
++    fn tls_test_stream(socket: std::net::TcpStream) -> rustls::StreamOwned<rustls::ServerConnection, std::net::TcpStream> {
++        let cert = rustls::pki_types::CertificateDer::from(include_bytes!("../tests/fixtures/resource-test-cert.der").to_vec());
++        let key = rustls::pki_types::PrivatePkcs8KeyDer::from(include_bytes!("../tests/fixtures/resource-test-key.der").to_vec());
++        let config = rustls::ServerConfig::builder().with_no_client_auth().with_single_cert(vec![cert], key.into()).unwrap();
++        rustls::StreamOwned::new(rustls::ServerConnection::new(Arc::new(config)).unwrap(), socket)
++    }
++
+     const REPRO_HEIGHTS: &[u32] = &[1, 511, 512, 513, 514, 900, 1023, 1024, 1025];
+     const REPRO_SCALES: &[f64] = &[1.25, 1.5, 0.5, 2.0];
+ 
+@@ -1949,6 +1963,7 @@ mod tests {
+                 socket
+                     .set_read_timeout(Some(Duration::from_secs(1)))
+                     .unwrap();
++                let mut socket = tls_test_stream(socket);
+                 let mut request = Vec::new();
+                 while !request.ends_with(b"\r\n\r\n") {
+                     let mut byte = [0];
+@@ -1996,6 +2011,7 @@ mod tests {
+             let mut actor = Actor::start(stop.clone(), allowed).unwrap();
+             let config = ureq::Agent::config_builder()
+                 .proxy(None)
++                .tls_config(test_tls_config())
+                 .max_redirects(0)
+                 .max_idle_connections(0)
+                 .timeout_global(Some(Duration::from_secs(4)))
+@@ -2007,7 +2023,7 @@ mod tests {
+             );
+             actor.resources = ResourceWorkers::new(agent, stop);
+             let started = Instant::now();
+-            actor.load("<img id=public src='http://synthetic.example/public'><img id=private src='http://synthetic.example/private'>", false).unwrap();
++            actor.load("<img id=public src='https://synthetic.example/public'><img id=private src='https://synthetic.example/private'>", false).unwrap();
+             actor.cdp.poll().unwrap();
+             actor.pump().unwrap();
+             assert_eq!(actor.cdp.eval("document.images.length".into()).unwrap(), 2);
+@@ -2108,19 +2124,20 @@ mod tests {
+                     "/image?synthetic=1",
+                     "302 Found",
+                     "image/png",
+-                    "Location: http://user:pass@synthetic.example/never\r\n",
++                    "Location: https://user:pass@synthetic.example/never\r\n",
+                 ),
+                 (
+                     "/image?synthetic=1",
+                     "302 Found",
+                     "image/png",
+-                    "Location: http://synthetic.example:8080/never\r\n",
++                    "Location: https://synthetic.example:8080/never\r\n",
+                 ),
+             ] {
+-                let (mut socket, _) = server.accept().unwrap();
++                let (socket, _) = server.accept().unwrap();
+                 socket
+                     .set_read_timeout(Some(Duration::from_secs(4)))
+                     .unwrap();
++                let mut socket = tls_test_stream(socket);
+                 let mut request = Vec::new();
+                 while !request.ends_with(b"\r\n\r\n") {
+                     let mut byte = [0];
+@@ -2142,6 +2159,7 @@ mod tests {
+         });
+         let config = ureq::Agent::config_builder()
+             .proxy(None)
++                .tls_config(test_tls_config())
+             .max_redirects(0)
+             .max_idle_connections(0)
+             .timeout_global(Some(Duration::from_secs(4)))
+@@ -2151,7 +2169,7 @@ mod tests {
+             ureq::unversioned::transport::DefaultConnector::default(),
+             ControlledResolver(address),
+         );
+-        let url = "http://synthetic.example/image?synthetic=1";
++        let url = "https://synthetic.example/image?synthetic=1";
+         for _ in 0..2 {
+             assert_eq!(
+                 fetch_resource(&agent, url, "Image").unwrap(),
+@@ -2163,8 +2181,9 @@ mod tests {
+         }
+         for url in [
+             "file:///tmp/image",
+-            "http://user:pass@synthetic.example/image",
+-            "http://synthetic.example:8080/image",
++            "http://synthetic.example/plaintext",
++            "https://user:pass@synthetic.example/image",
++            "https://synthetic.example:8080/image",
+             "http://10.0.0.1/image",
+             "http://[::1]/image",
+         ] {
+diff --git i/crates/overlook-app/src/google_signin.rs w/crates/overlook-app/src/google_signin.rs
+index 8dbd672..27f25b0 100644
+--- i/crates/overlook-app/src/google_signin.rs
++++ w/crates/overlook-app/src/google_signin.rs
+@@ -70,6 +70,7 @@ impl PendingSignIn {
+         let cancel = Arc::new(AtomicBool::new(false));
+         let (sender, receiver) = mpsc::channel();
+         let flag = cancel.clone();
++        let expected_request = request.clone();
+         std::thread::Builder::new()
+             .name("overlook-oauth-callback".into())
+             .spawn(move || {
+@@ -85,7 +86,7 @@ impl PendingSignIn {
+                     }
+                     match listener.accept() {
+                         Ok((stream, _)) => {
+-                            if let Some(query) = handle_connection(stream) {
++                            if let Some(query) = handle_connection(stream, &expected_request) {
+                                 let _ = sender.send(Ok(query));
+                                 return;
+                             }
+@@ -122,23 +123,19 @@ impl PendingSignIn {
+ 
+ /// Reads one HTTP request, answers with the completion page, and returns the query string
+ /// of a `/callback` request. Other paths (favicon) get a 404 and `None`.
+-fn handle_connection(mut stream: TcpStream) -> Option<String> {
++fn handle_connection(mut stream: TcpStream, expected: &AuthorizationRequest) -> Option<String> {
+     let _ = stream.set_read_timeout(Some(Duration::from_secs(5)));
+     let mut buf = [0u8; 4096];
+     let n = stream.read(&mut buf).ok()?;
+     let request = String::from_utf8_lossy(&buf[..n]);
+-    let first_line = request.lines().next()?;
+-    let target = first_line.split_whitespace().nth(1)?;
+-    let (path, query) = target.split_once('?').unwrap_or((target, ""));
+-    if path != "/callback" {
+-        let _ = stream.write_all(b"HTTP/1.1 404 Not Found\r\nContent-Length: 0\r\nConnection: close\r\n\r\n");
++    let Some((query, denied)) = validated_callback(&request, expected) else {
++        let _ = stream.write_all(b"HTTP/1.1 400 Bad Request\r\nContent-Length: 0\r\nConnection: close\r\nCache-Control: no-store\r\n\r\n");
+         return None;
+-    }
+-    let denied = query.contains("error=");
++    };
+     let body = completion_page(denied);
+     let _ = stream.write_all(
+         format!(
+-            "HTTP/1.1 200 OK\r\nContent-Type: text/html; charset=utf-8\r\nContent-Length: {}\r\nConnection: close\r\nCache-Control: no-store\r\n\r\n{}",
++            "HTTP/1.1 200 OK\r\nContent-Type: text/html; charset=utf-8\r\nContent-Length: {}\r\nConnection: close\r\nCache-Control: no-store\r\nReferrer-Policy: no-referrer\r\nX-Content-Type-Options: nosniff\r\nContent-Security-Policy: default-src 'none'; style-src 'unsafe-inline'; frame-ancestors 'none'; base-uri 'none'; form-action 'none'\r\n\r\n{}",
+             body.len(),
+             body
+         )
+@@ -148,6 +145,25 @@ fn handle_connection(mut stream: TcpStream) -> Option<String> {
+     Some(query.to_owned())
+ }
+ 
++fn validated_callback<'a>(request: &'a str, expected: &AuthorizationRequest) -> Option<(&'a str, bool)> {
++    use overlook_provider::gmail::oauth::CallbackError;
++    let mut words = request.lines().next()?.split_whitespace();
++    if words.next()? != "GET" { return None; }
++    let (path, query) = words.next()?.split_once('?')?;
++    if path != "/callback" || words.next()? != "HTTP/1.1" || words.next().is_some() { return None; }
++    let authority = expected.redirect_uri.strip_prefix("http://")?.strip_suffix("/callback")?;
++    let hosts: Vec<_> = request.lines().skip(1).take_while(|line| !line.is_empty()).filter_map(|line| {
++        let (name, value) = line.split_once(':')?;
++        name.eq_ignore_ascii_case("host").then_some(value.trim())
++    }).collect();
++    if hosts != [authority] { return None; }
++    match expected.parse_callback(query) {
++        Ok(_) => Some((query, false)),
++        Err(CallbackError::Denied(_)) => Some((query, true)),
++        Err(_) => None,
++    }
++}
++
+ fn completion_page(denied: bool) -> String {
+     let (title, text) = if denied {
+         ("Sign-in cancelled", "You can close this tab and return to Overlook.")
+@@ -179,4 +195,14 @@ mod tests {
+         assert!(completion_page(false).contains("You’re signed in"));
+         assert!(completion_page(true).contains("cancelled"));
+     }
++
++    #[test]
++    fn callback_rejects_forgery_pollution_and_wrong_origin() {
++        let expected = AuthorizationRequest { client_id: "synthetic".into(), redirect_uri: "http://127.0.0.1:43123/callback".into(), state: "synthetic-state".into(), pkce: Pkce::from_random(&[7; 48]), login_hint: None };
++        let valid = "GET /callback?code=synthetic-code&state=synthetic-state HTTP/1.1\r\nHost: 127.0.0.1:43123\r\n\r\n";
++        assert!(validated_callback(valid, &expected).is_some());
++        for invalid in [valid.replace("GET", "POST"), valid.replace("Host: 127.0.0.1:43123", "Host: attacker.example"), valid.replace("state=synthetic-state", "state=wrong"), valid.replace("state=synthetic-state", "state=wrong&state=synthetic-state"), valid.replace("/callback?", "/other?"), valid.replace("\r\n\r\n", "\r\nHost: 127.0.0.1:43123\r\n\r\n")] {
++            assert!(validated_callback(&invalid, &expected).is_none());
++        }
++    }
+ }
+diff --git i/crates/overlook-app/src/main.rs w/crates/overlook-app/src/main.rs
+index b93e1ec..bde9f38 100644
+--- i/crates/overlook-app/src/main.rs
++++ w/crates/overlook-app/src/main.rs
+@@ -104,15 +104,54 @@ fn init_logging() {
+         let _ = std::fs::rename(&path, path.with_extension("log.old"));
+     }
+     let file = std::fs::OpenOptions::new().create(true).append(true).open(&path).ok();
+-    let registry = tracing_subscriber::registry().with(tracing_subscriber::fmt::layer().with_filter(filter()));
++    let registry = tracing_subscriber::registry().with(tracing_subscriber::fmt::layer().with_filter(tracing_subscriber::filter::filter_fn(safe_log_metadata)).with_filter(filter()));
+     match file {
+         Some(file) => registry
+-            .with(tracing_subscriber::fmt::layer().with_ansi(false).with_writer(std::sync::Mutex::new(file)).with_filter(filter()))
++            .with(tracing_subscriber::fmt::layer().with_ansi(false).with_writer(std::sync::Mutex::new(file)).with_filter(tracing_subscriber::filter::filter_fn(safe_log_metadata)).with_filter(filter()))
+             .init(),
+         None => registry.init(),
+     }
+ }
+ 
++/// Protocol and vault diagnostics can contain wire bytes or secrets. An RUST_LOG
++/// override must never enable them in either the file log or stderr.
++fn safe_log_metadata(metadata: &tracing::Metadata<'_>) -> bool {
++    !["ureq", "rustls", "lettre", "imap", "oo7", "zbus", "zvariant"].iter().any(|prefix| metadata.target().starts_with(prefix))
++}
++
++#[cfg(test)]
++mod security_tests {
++    use super::safe_log_metadata;
++    use std::io::Write;
++    use std::sync::{Arc, Mutex};
++    use tracing_subscriber::{layer::SubscriberExt, Layer};
++
++    #[derive(Clone)]
++    struct Capture(Arc<Mutex<Vec<u8>>>);
++    impl Write for Capture {
++        fn write(&mut self, bytes: &[u8]) -> std::io::Result<usize> { self.0.lock().unwrap().extend_from_slice(bytes); Ok(bytes.len()) }
++        fn flush(&mut self) -> std::io::Result<()> { Ok(()) }
++    }
++
++    #[test]
++    fn synthetic_login_logs_redact_credentials_even_with_trace_enabled() {
++        let captured = Capture(Arc::new(Mutex::new(Vec::new())));
++        let writer = captured.clone();
++        let subscriber = tracing_subscriber::registry().with(tracing_subscriber::fmt::layer().without_time().with_ansi(false).with_writer(move || writer.clone()).with_filter(tracing_subscriber::filter::filter_fn(safe_log_metadata)).with_filter(tracing_subscriber::EnvFilter::new("trace")));
++        tracing::subscriber::with_default(subscriber, || {
++            tracing::trace!(target: "ureq_proto::client", "synthetic-wire-secret");
++            tracing::trace!(target: "lettre::smtp", "synthetic-smtp-secret");
++            tracing::trace!(target: "oo7::dbus", "synthetic-vault-secret");
++            let tokens = overlook_provider::gmail::OAuthTokens { access_token: "synthetic-access-secret".into(), refresh_token: Some("synthetic-refresh-secret".into()), expires_at: 3600000, scope: None };
++            tracing::info!(target: "overlook::synthetic_login", ?tokens, "Synthetic login credential diagnostic (not a live Google login)");
++        });
++        let output = String::from_utf8(captured.0.lock().unwrap().clone()).unwrap();
++        assert!(output.contains("[REDACTED]"));
++        assert!(!output.contains("-secret"));
++        println!("{output}");
++    }
++}
++
+ fn main() {
+     STARTED.get_or_init(std::time::Instant::now);
+     // Plain command-line conveniences; anything else starts the app.
+diff --git i/crates/overlook-app/src/providers.rs w/crates/overlook-app/src/providers.rs
+index 1203cad..601c53c 100644
+--- i/crates/overlook-app/src/providers.rs
++++ w/crates/overlook-app/src/providers.rs
+@@ -27,11 +27,13 @@ pub struct AccountProviders {
+     pub calendar: Option<Arc<dyn CalendarProvider>>,
+     /// The same provider as `mail` when it is an IMAP one, for the `IDLE` watcher.
+     pub imap: Option<Arc<ImapProvider>>,
++    /// Shared lifecycle handle so removing an account disables every cloned provider.
++    pub gmail: Option<Arc<GmailClient>>,
+ }
+ 
+ impl AccountProviders {
+     pub fn new(mail: Arc<dyn MailProvider>, calendar: Option<Arc<dyn CalendarProvider>>) -> Self {
+-        Self { mail, calendar, imap: None }
++        Self { mail, calendar, imap: None, gmail: None }
+     }
+ }
+ 
+@@ -48,7 +50,9 @@ pub fn gmail_providers(account: &Account, tokens: OAuthTokens) -> Result<Account
+         }),
+     ));
+     let inbox_limit = crate::store_prefs_inbox_limit();
+-    Ok(AccountProviders::new(Arc::new(GmailProvider::new(client.clone()).with_inbox_limit(inbox_limit)), Some(Arc::new(GoogleCalendarProvider::new(client)))))
++    let mut providers = AccountProviders::new(Arc::new(GmailProvider::new(client.clone()).with_inbox_limit(inbox_limit)), Some(Arc::new(GoogleCalendarProvider::new(client.clone()))));
++    providers.gmail = Some(client);
++    Ok(providers)
+ }
+ 
+ /// An IMAP account: one connection for mail, SMTP for sending, no calendar. The outgoing
+@@ -56,7 +60,7 @@ pub fn gmail_providers(account: &Account, tokens: OAuthTokens) -> Result<Account
+ pub fn imap_providers(servers: MailServers, password: String, outgoing_password: Option<String>) -> AccountProviders {
+     let inbox_limit = crate::store_prefs_inbox_limit();
+     let provider = Arc::new(ImapProvider::new(servers, password).with_outgoing_password(outgoing_password).with_inbox_limit(inbox_limit));
+-    AccountProviders { mail: provider.clone(), calendar: None, imap: Some(provider) }
++    AccountProviders { mail: provider.clone(), calendar: None, imap: Some(provider), gmail: None }
+ }
+ 
+ /// Where a POP3 account's downloaded messages live: `<data dir>/raw/<account>/`, one `.eml`
+@@ -79,8 +83,8 @@ fn stored_passwords(account: &Account) -> Result<(String, Option<String>), Provi
+             let outgoing = match credentials::load_password(&account.id, credentials::KIND_PASSWORD_OUTGOING) {
+                 Ok(found) => found,
+                 Err(e) => {
+-                    warn!("could not read the outgoing password for {}: {e}; using the incoming one", account.email);
+-                    None
++                    // A failed vault read is not the user's "same as incoming" choice.
++                    return Err(ProviderIssue::SignInRequired(e.to_string()));
+                 }
+             };
+             Ok((password, outgoing))
+diff --git i/crates/overlook-app/src/ui/mod.rs w/crates/overlook-app/src/ui/mod.rs
+index cdc5b16..df703f9 100644
+--- i/crates/overlook-app/src/ui/mod.rs
++++ w/crates/overlook-app/src/ui/mod.rs
+@@ -321,6 +321,7 @@ pub struct MailWindow {
+     providers: HashMap<AccountId, providers::AccountProviders>,
+     /// Why an account has no provider (shown as “Sign-in required”).
+     provider_issues: HashMap<AccountId, String>,
++    removing_accounts: HashSet<AccountId>,
+     /// The `IDLE` thread per IMAP account (see `overlook_provider::imap::idle`); each one
+     /// reports Inbox changes through `idle_events`, which `watch_idle_events` turns into a
+     /// sync of that account. Rebuilt by `refresh_idle_watchers` whenever `providers` change.
+@@ -550,6 +551,7 @@ impl MailWindow {
+             idle_watchers: HashMap::new(),
+             idle_events: idle_tx,
+             provider_issues,
++            removing_accounts: HashSet::new(),
+             signin: None,
+             account,
+             utc_offset: overlook_core::time::local_utc_offset_minutes(),
+@@ -831,17 +833,42 @@ impl MailWindow {
+     }
+ 
+     pub(crate) fn remove_account(&mut self, id: AccountId, window: &mut Window, cx: &mut Context<Self>) {
++        let Some(account) = self.accounts.iter().find(|a| a.id == id).cloned() else { return };
++        if !self.removing_accounts.insert(id.clone()) { return; }
++        let gmail = self.providers.get(&id).and_then(|p| p.gmail.clone());
++        let background_id = id.clone();
++        crate::ui::toast(window, cx, crate::notify::Level::Info, "Removing account and disconnecting access…");
++        cx.spawn_in(window, async move |this, cx| {
++            let result = cx.background_spawn(async move {
++                if account.provider == ProviderKind::Gmail {
++                    if let Some(client) = gmail {
++                        client.disconnect().map_err(|e| e.to_string())?;
++                    } else if let Some(tokens) = credentials::load_tokens(&background_id).map_err(|e| e.to_string())? {
++                        overlook_provider::gmail::oauth::revoke(&tokens).map_err(|e| e.to_string())?;
++                    }
++                }
++                if account.provider != ProviderKind::Sample {
++                    credentials::delete_all_secrets(&background_id).map_err(|e| e.to_string())?;
++                }
++                Ok::<(), String>(())
++            }).await;
++            let _ = this.update_in(cx, |this, window, cx| {
++                this.removing_accounts.remove(&id);
++                match result {
++                    Ok(()) => this.finish_remove_account(id, window, cx),
++                    Err(e) => crate::ui::toast(window, cx, crate::notify::Level::Error, format!("Account removal is incomplete: {e}. Reconnect and try again.")),
++                }
++                cx.notify();
++            });
++        }).detach();
++    }
++
++    fn finish_remove_account(&mut self, id: AccountId, window: &mut Window, cx: &mut Context<Self>) {
+         self.other_indexes.remove(&id);
+         if self.composer.is_some() {
+             self.close_composer(window, cx);
+         }
+         let Some(account) = self.accounts.iter().find(|a| a.id == id).cloned() else { return };
+-        if account.provider != ProviderKind::Sample {
+-            // Tokens or passwords, whichever kinds this account stored.
+-            if let Err(e) = credentials::delete_all_secrets(&id) {
+-                tracing::warn!("could not remove stored credentials: {e}");
+-            }
+-        }
+         if let Err(e) = self.store.delete_account(&id) {
+             crate::ui::toast(window, cx, crate::notify::Level::Error, format!("Couldn’t remove the account: {e}"));
+             return;
+diff --git i/crates/overlook-app/src/ui/settings.rs w/crates/overlook-app/src/ui/settings.rs
+index 7521501..4730201 100644
+--- i/crates/overlook-app/src/ui/settings.rs
++++ w/crates/overlook-app/src/ui/settings.rs
+@@ -575,7 +575,7 @@ impl MailWindow {
+             .child(section("Remove", None))
+             .child(setting_row(
+                 "Remove this account from this device",
+-                "Deletes downloaded mail, events, drafts, and stored sign-in for this account. Nothing is deleted at the provider.",
++                if is_gmail { "Removes local mail and sign-in, and revokes this Google account’s access for this app’s Google project on all devices. Requires internet; mail at Google is kept." } else { "Deletes downloaded mail, events, drafts, and stored sign-in for this account. Nothing is deleted at the provider." },
+                 Button::new("settings-remove").danger().small().label("Remove account").on_click(cx.listener(move |this, _, window, cx| {
+                     this.close_settings(window, cx);
+                     this.remove_account(remove_id.clone(), window, cx);
+diff --git i/crates/overlook-app/src/updater.rs w/crates/overlook-app/src/updater.rs
+index a61a1b0..667bdfd 100644
+--- i/crates/overlook-app/src/updater.rs
++++ w/crates/overlook-app/src/updater.rs
+@@ -143,6 +143,7 @@ pub fn is_newer(candidate: &str, current: &str) -> bool {
+ fn agent() -> ureq::Agent {
+     ureq::Agent::config_builder()
+         .http_status_as_error(false)
++        .https_only(true)
+         .timeout_global(Some(Duration::from_secs(30)))
+         .user_agent(format!("Overlook/{CURRENT_VERSION} (+https://github.com/{REPO})"))
+         .build()
+@@ -319,11 +320,8 @@ pub fn apply_pacman_update(package: &Path) -> Result<PacmanOutcome, String> {
+         tracing::warn!("pkexec failed ({:?}): {}", output.status.code(), stderr.trim());
+     }
+     // No polkit agent: hand the step to a terminal so the user can type their password.
+-    let script = format!(
+-        "echo 'Overlook update: installing {}'; sudo pacman -U --noconfirm '{}' && echo && echo 'Done. Restart Overlook to finish.' || echo 'The update did not install.'; echo; read -r -p 'Press Enter to close this window.' _",
+-        package.display(),
+-        package.display()
+-    );
++    // Pass the path as an argument, never interpolate it into shell program text.
++    let script = "printf 'Overlook update: installing %s\\n' \"$1\"; sudo pacman -U --noconfirm -- \"$1\" && echo && echo 'Done. Restart Overlook to finish.' || echo 'The update did not install.'; echo; read -r -p 'Press Enter to close this window.' _";
+     let terminals: Vec<Vec<String>> = {
+         let mut t: Vec<Vec<String>> = vec![vec!["xdg-terminal-exec".into(), "--".into()]];
+         if let Ok(term) = std::env::var("TERMINAL") {
+@@ -336,7 +334,7 @@ pub fn apply_pacman_update(package: &Path) -> Result<PacmanOutcome, String> {
+     };
+     for cmd in terminals {
+         let Some((program, args)) = cmd.split_first() else { continue };
+-        let ok = Command::new(program).args(args).arg("bash").arg("-c").arg(&script).spawn().is_ok();
++        let ok = Command::new(program).args(args).arg("bash").arg("-c").arg(script).arg("overlook-update").arg(package).spawn().is_ok();
+         if ok {
+             return Ok(PacmanOutcome::TerminalOpened);
+         }
+diff --git i/crates/overlook-provider/src/autoconfig.rs w/crates/overlook-provider/src/autoconfig.rs
+index 2da770c..665dd18 100644
+--- i/crates/overlook-provider/src/autoconfig.rs
++++ w/crates/overlook-provider/src/autoconfig.rs
+@@ -108,7 +108,7 @@ fn ispdb(protocol: ServerProtocol, domain: &str, email: &str) -> Option<Suggesti
+     if domain.is_empty() || !domain.contains('.') {
+         return None;
+     }
+-    let agent = ureq::Agent::config_builder().timeout_global(Some(Duration::from_secs(8))).build().new_agent();
++    let agent = ureq::Agent::config_builder().https_only(true).timeout_global(Some(Duration::from_secs(8))).build().new_agent();
+     let mut response = agent.get(format!("{ISPDB_BASE}{domain}")).call().ok()?;
+     if response.status() != 200 {
+         return None;
+diff --git i/crates/overlook-provider/src/gmail/api.rs w/crates/overlook-provider/src/gmail/api.rs
+index c6bfb9b..571b723 100644
+--- i/crates/overlook-provider/src/gmail/api.rs
++++ w/crates/overlook-provider/src/gmail/api.rs
+@@ -3,6 +3,7 @@
+ use super::oauth::{self, url_encode, AuthError, ClientConfig, OAuthTokens};
+ use crate::ProviderError;
+ use std::sync::Mutex;
++use std::sync::atomic::{AtomicBool, Ordering};
+ use std::time::{Duration, Instant};
+ 
+ pub const API_BASE: &str = "https://gmail.googleapis.com/gmail/v1/users/me";
+@@ -49,6 +50,9 @@ pub struct GmailClient {
+     on_tokens: TokenSink,
+     agent: ureq::Agent,
+     last_request: Mutex<Option<Instant>>,
++    /// Serializes request/refresh persistence with grant revocation.
++    session_lock: Mutex<()>,
++    active: AtomicBool,
+ }
+ 
+ impl GmailClient {
+@@ -56,10 +60,30 @@ impl GmailClient {
+     pub fn new(config: ClientConfig, tokens: OAuthTokens, on_tokens: TokenSink) -> Self {
+         let agent: ureq::Agent = ureq::Agent::config_builder()
+             .http_status_as_error(false)
++            .https_only(true)
++            .max_redirects(0)
+             .timeout_global(Some(Duration::from_secs(40)))
+             .build()
+             .into();
+-        Self { config, tokens: Mutex::new(tokens), on_tokens, agent, last_request: Mutex::new(None) }
++        Self { config, tokens: Mutex::new(tokens), on_tokens, agent, last_request: Mutex::new(None), session_lock: Mutex::new(()), active: AtomicBool::new(true) }
++    }
++
++    /// Blocks future use (including cloned providers), drains an in-flight request, then
++    /// revokes the remote grant. On failure the keyring entry is retained for an explicit retry.
++    pub fn disconnect(&self) -> Result<(), AuthError> {
++        self.disconnect_with(oauth::revoke)
++    }
++
++    fn disconnect_with(&self, revoke: impl FnOnce(&OAuthTokens) -> Result<(), AuthError>) -> Result<(), AuthError> {
++        self.active.store(false, Ordering::SeqCst);
++        let _session = self.session_lock.lock().unwrap();
++        let tokens = self.tokens();
++        revoke(&tokens)?;
++        let mut tokens = self.tokens.lock().unwrap();
++        tokens.access_token.clear();
++        tokens.refresh_token = None;
++        tokens.expires_at = 0;
++        Ok(())
+     }
+ 
+     fn throttle(&self) {
+@@ -78,6 +102,7 @@ impl GmailClient {
+     }
+ 
+     fn access_token(&self, force_refresh: bool) -> Result<String, ApiError> {
++        if !self.active.load(Ordering::SeqCst) { return Err(ApiError::Unauthorized); }
+         let current = self.tokens();
+         if !force_refresh && !current.is_expired(overlook_core::time::now()) {
+             return Ok(current.access_token);
+@@ -182,6 +207,7 @@ impl GmailClient {
+         &self,
+         request: impl Fn(&str) -> Result<ureq::http::Response<ureq::Body>, ApiError>,
+     ) -> Result<serde_json::Value, ApiError> {
++        let _session = self.session_lock.lock().unwrap();
+         let mut token = self.access_token(false)?;
+         for attempt in 0..2 {
+             self.throttle();
+@@ -226,6 +252,7 @@ impl GmailClient {
+     /// relative to `users/me` (for example `messages/abc?format=full`). The outer result is the
+     /// request itself; each inner result is that call's own outcome, in the order given.
+     pub fn batch_get(&self, paths: &[String]) -> Result<Vec<Result<serde_json::Value, ApiError>>, ApiError> {
++        let _session = self.session_lock.lock().unwrap();
+         if paths.is_empty() {
+             return Ok(Vec::new());
+         }
+@@ -347,6 +374,20 @@ fn api_message(text: &str) -> String {
+ mod batch_tests {
+     use super::*;
+ 
++    #[test]
++    fn disconnect_blocks_cloned_client_and_retains_retry_on_failure() {
++        let client = std::sync::Arc::new(GmailClient::new(ClientConfig { client_id: "synthetic".into(), client_secret: None }, OAuthTokens { access_token: "synthetic-access".into(), refresh_token: Some("synthetic-refresh".into()), expires_at: i64::MAX, scope: None }, Box::new(|_| panic!("no refresh may persist after disconnect"))));
++        let clone = client.clone();
++        assert!(client.disconnect_with(|_| Err(AuthError::Network("synthetic offline".into()))).is_err());
++        assert_eq!(clone.get("messages", &[]), Err(ApiError::Unauthorized));
++        assert_eq!(clone.batch_get(&["messages/test".into()]), Err(ApiError::Unauthorized));
++        assert_eq!(clone.tokens().refresh_token.as_deref(), Some("synthetic-refresh"));
++        client.disconnect_with(|tokens| { assert_eq!(tokens.refresh_token.as_deref(), Some("synthetic-refresh")); Ok(()) }).unwrap();
++        assert!(clone.tokens().access_token.is_empty());
++        assert!(clone.tokens().refresh_token.is_none());
++        assert_eq!(clone.get("messages", &[]), Err(ApiError::Unauthorized));
++    }
++
+     #[test]
+     fn parses_a_batch_reply_in_content_id_order() {
+         let b = "batch_x";
+diff --git i/crates/overlook-provider/src/gmail/oauth.rs w/crates/overlook-provider/src/gmail/oauth.rs
+index 18805b7..bd2cee8 100644
+--- i/crates/overlook-provider/src/gmail/oauth.rs
++++ w/crates/overlook-provider/src/gmail/oauth.rs
+@@ -8,7 +8,7 @@ use std::collections::BTreeMap;
+ use std::time::Duration;
+ 
+ /// The OAuth client created in Google Cloud ("Desktop app" type).
+-#[derive(Clone, Debug, PartialEq, Eq, Serialize, Deserialize)]
++#[derive(Clone, PartialEq, Eq, Serialize, Deserialize)]
+ pub struct ClientConfig {
+     pub client_id: String,
+     /// Google issues a "secret" for desktop clients but treats it as non-confidential.
+@@ -32,7 +32,7 @@ impl ClientConfig {
+ }
+ 
+ /// Tokens for one account. Stored in the system keyring, never in ordinary configuration.
+-#[derive(Clone, Debug, PartialEq, Eq, Serialize, Deserialize)]
++#[derive(Clone, PartialEq, Eq, Serialize, Deserialize)]
+ pub struct OAuthTokens {
+     pub access_token: String,
+     pub refresh_token: Option<String>,
+@@ -41,6 +41,18 @@ pub struct OAuthTokens {
+     pub scope: Option<String>,
+ }
+ 
++impl std::fmt::Debug for ClientConfig {
++    fn fmt(&self, f: &mut std::fmt::Formatter<'_>) -> std::fmt::Result {
++        f.debug_struct("ClientConfig").field("client_id", &self.client_id).field("client_secret", &"[REDACTED]").finish()
++    }
++}
++
++impl std::fmt::Debug for OAuthTokens {
++    fn fmt(&self, f: &mut std::fmt::Formatter<'_>) -> std::fmt::Result {
++        f.debug_struct("OAuthTokens").field("access_token", &"[REDACTED]").field("refresh_token", &"[REDACTED]").field("expires_at", &self.expires_at).field("scope", &self.scope).finish()
++    }
++}
++
+ impl OAuthTokens {
+     /// Treats the token as expired one minute early to avoid racing the deadline.
+     pub fn is_expired(&self, now_ms: i64) -> bool {
+@@ -70,6 +82,8 @@ pub const USERINFO_ENDPOINT: &str = "https://openidconnect.googleapis.com/v1/use
+ fn agent() -> ureq::Agent {
+     ureq::Agent::config_builder()
+         .http_status_as_error(false)
++        .https_only(true)
++        .max_redirects(0)
+         .timeout_global(Some(Duration::from_secs(30)))
+         .build()
+         .into()
+@@ -146,6 +160,18 @@ pub fn refresh(config: &ClientConfig, refresh_token: &str) -> Result<OAuthTokens
+     token_response(post_form(TOKEN_ENDPOINT, &body)?, Some(refresh_token))
+ }
+ 
++/// Revoke the Google grant before discarding the refresh token. No secret in the URL.
++pub fn revoke(tokens: &OAuthTokens) -> Result<(), AuthError> {
++    let token = tokens.refresh_token.as_deref().unwrap_or(&tokens.access_token);
++    if token.is_empty() { return Ok(()); }
++    let mut response = post_form("https://oauth2.googleapis.com/revoke", &format!("token={}", url_encode(token)))?;
++    let status = response.status().as_u16();
++    if status == 200 { return Ok(()); }
++    let body: serde_json::Value = response.body_mut().read_json().unwrap_or_default();
++    if status == 400 && body.get("error").and_then(|v| v.as_str()) == Some("invalid_token") { return Ok(()); }
++    Err(AuthError::Protocol(format!("token revocation returned HTTP {status}; reconnect and retry account removal")))
++}
++
+ /// Fetches the signed-in user's email and name (blocking).
+ pub fn fetch_userinfo(access_token: &str) -> Result<UserInfo, AuthError> {
+     let mut response = agent()
+@@ -191,12 +217,18 @@ pub const AUTH_ENDPOINT: &str = "https://accounts.google.com/o/oauth2/v2/auth";
+ pub const TOKEN_ENDPOINT: &str = "https://oauth2.googleapis.com/token";
+ 
+ /// PKCE verifier/challenge pair (RFC 7636, S256).
+-#[derive(Debug, Clone, PartialEq, Eq)]
++#[derive(Clone, PartialEq, Eq)]
+ pub struct Pkce {
+     pub verifier: String,
+     pub challenge: String,
+ }
+ 
++impl std::fmt::Debug for Pkce {
++    fn fmt(&self, f: &mut std::fmt::Formatter<'_>) -> std::fmt::Result {
++        f.debug_struct("Pkce").field("verifier", &"[REDACTED]").field("challenge", &self.challenge).finish()
++    }
++}
++
+ impl Pkce {
+     /// Builds a PKCE pair from fresh randomness.
+     pub fn random() -> Self {
+@@ -258,25 +290,32 @@ impl AuthorizationRequest {
+         for pair in query.trim_start_matches('?').split('&') {
+             let (k, v) = pair.split_once('=').unwrap_or((pair, ""));
+             let v = url_decode(v);
+-            match k {
+-                "code" => code = Some(v),
+-                "state" => state = Some(v),
+-                "error" => error = Some(v),
++            match url_decode(k).as_str() {
++                "code" if code.is_none() => code = Some(v),
++                "state" if state.is_none() => state = Some(v),
++                "error" if error.is_none() => error = Some(v),
++                "code" | "state" | "error" => return Err(CallbackError::Ambiguous),
+                 _ => {}
+             }
+         }
+-        if let Some(e) = error {
+-            return Err(CallbackError::Denied(e));
+-        }
+         if state.as_deref() != Some(self.state.as_str()) {
+             return Err(CallbackError::StateMismatch);
+         }
++        if code.is_some() && error.is_some() {
++            return Err(CallbackError::Ambiguous);
++        }
++        if error.is_some() {
++            // Never reflect an untrusted callback value into UI or logs.
++            return Err(CallbackError::Denied("access_denied".into()));
++        }
+         code.filter(|c| !c.is_empty()).ok_or(CallbackError::MissingCode)
+     }
+ }
+ 
+ #[derive(Debug, Clone, PartialEq, Eq, thiserror::Error)]
+ pub enum CallbackError {
++    #[error("the sign-in response contained ambiguous parameters")]
++    Ambiguous,
+     #[error("sign-in was cancelled or denied: {0}")]
+     Denied(String),
+     #[error("the sign-in response did not match this request")]
+@@ -317,8 +356,10 @@ pub fn url_decode(s: &str) -> String {
+     let mut i = 0;
+     while i < bytes.len() {
+         match bytes[i] {
+-            b'%' if i + 2 < bytes.len() + 0 && i + 2 <= bytes.len() - 1 => {
+-                if let Ok(v) = u8::from_str_radix(&s[i + 1..i + 3], 16) {
++            b'%' if i + 2 < bytes.len() => {
++                let hex = |b: u8| (b as char).to_digit(16).map(|v| v as u8);
++                if let (Some(high), Some(low)) = (hex(bytes[i + 1]), hex(bytes[i + 2])) {
++                    let v = high * 16 + low;
+                     out.push(v);
+                     i += 3;
+                     continue;
+@@ -466,5 +507,29 @@ mod tests {
+         assert_eq!(req.parse_callback("?code=4%2Fabc&state=s%20t%40te"), Ok("4/abc".into()));
+         assert_eq!(req.parse_callback("code=x&state=other"), Err(CallbackError::StateMismatch));
+         assert_eq!(req.parse_callback("error=access_denied&state=s%20t%40te"), Err(CallbackError::Denied("access_denied".into())));
++        for query in [
++            "code=x&state=s%20t%40te&state=other",
++            "code=x&state=other&state=s%20t%40te",
++            "code=x&code=y&state=s%20t%40te",
++            "code=x&%63ode=y&state=s%20t%40te",
++            "code=x&error=denied&state=s%20t%40te",
++            "error=a&error=b&state=s%20t%40te",
++        ] {
++            assert_eq!(req.parse_callback(query), Err(CallbackError::Ambiguous));
++        }
++        assert_eq!(req.parse_callback("error=untrusted-secret"), Err(CallbackError::StateMismatch));
++        assert_eq!(url_decode("%é"), "%é");
++    }
++
++    #[test]
++    fn secret_debug_output_is_redacted() {
++        let tokens = OAuthTokens { access_token: "synthetic-access-secret".into(), refresh_token: Some("synthetic-refresh-secret".into()), expires_at: 123, scope: None };
++        let config = ClientConfig { client_id: "public-client".into(), client_secret: Some("synthetic-client-secret".into()) };
++        let pkce = Pkce::from_random(&[7; 48]);
++        let output = format!("{tokens:?} {config:?} {pkce:?}");
++        for secret in [tokens.access_token.as_str(), tokens.refresh_token.as_deref().unwrap(), config.client_secret.as_deref().unwrap(), &pkce.verifier] {
++            assert!(!output.contains(secret));
++        }
++        assert!(output.contains("[REDACTED]"));
+     }
+ }

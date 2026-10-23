@@ -7,8 +7,8 @@ authors.workspace = true
 description = "Mail provider adapters for Overlook: the provider trait, the sample provider, and the Gmail API provider."
 
 [features]
-# Exposes the scripted fake IMAP and SMTP servers (`imap::fake`, `smtp::fake`) so other
-# crates' tests can drive the real providers against them.
+# Exposes fake IMAP, SMTP and CalDAV servers so other crates' tests can drive the
+# real providers against isolated loopback services. Not enabled in release builds.
 fake-servers = []
 
 [dependencies]
@@ -28,3 +28,7 @@ rustls = { version = "0.23", default-features = false, features = ["ring", "std"
 webpki-roots = "1"
 base64 = "0.22"
 rand = "0.10"
+roxmltree = "0.21"
+url = "2"
+ical = { version = "0.11", default-features = false, features = ["ical"] }
+jiff = { workspace = true }

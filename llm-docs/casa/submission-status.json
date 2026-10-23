@@ -1,0 +1,15 @@
+{
+  "submittedAt": "2026-10-22T17:42:15.617Z",
+  "application": "Overlook",
+  "assetType": "Desktop",
+  "assessmentStatus": "In Progress",
+  "evidenceStatus": "Your evidence is under tester review. Access will be available once validation is complete.",
+  "controls": 48,
+  "evidenceImages": 50,
+  "applicable": 33,
+  "notApplicable": 15,
+  "userAuthorizedFinalSubmission": true,
+  "finalSubmitted": true,
+  "auditPassed": false,
+  "confirmationUrl": "https://casa.tacsecurity.com/scan-list/index"
+}

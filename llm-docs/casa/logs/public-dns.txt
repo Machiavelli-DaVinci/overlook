@@ -1,0 +1,17 @@
+lastrefuge.ai IN NS barbara.ns.cloudflare.com               -- link: wlp0s20f3
+lastrefuge.ai IN NS clark.ns.cloudflare.com                 -- link: wlp0s20f3
+
+-- Information acquired via protocol DNS in 10.1ms.
+-- Data is authenticated: no; Data was acquired via local or encrypted transport: no
+-- Data from: network
+lastrefuge.ai: 104.251.123.207                              -- link: wlp0s20f3
+
+-- Information acquired via protocol DNS in 28.1ms.
+-- Data is authenticated: no; Data was acquired via local or encrypted transport: no
+-- Data from: cache network
+www.lastrefuge.ai: 104.251.123.207                          -- link: wlp0s20f3
+                   (lastrefuge.ai)
+
+-- Information acquired via protocol DNS in 77.0ms.
+-- Data is authenticated: no; Data was acquired via local or encrypted transport: no
+-- Data from: cache

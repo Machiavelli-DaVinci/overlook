@@ -1,0 +1,9 @@
+{
+  "permissions": {
+    "allow": [
+      "Bash(ydotool:*)",
+      "Bash(wtype:*)",
+      "Bash(gpu-screen-recorder:*)"
+    ]
+  }
+}

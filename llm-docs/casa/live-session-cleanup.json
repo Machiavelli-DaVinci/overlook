@@ -1,0 +1,9 @@
+{
+  "closed_utc": "2026-10-22T16:51:20.022649+00:00",
+  "test_processes_stopped": 1,
+  "temporary_profile_removed": true,
+  "raw_stderr_removed": true,
+  "sanitized_login_log_retained": true,
+  "normal_profile_modified_by_cleanup": false,
+  "secure_disk_erasure_claimed": false
+}

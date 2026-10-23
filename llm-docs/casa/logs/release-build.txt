@@ -1,0 +1,11 @@
+   Compiling rustls v0.23.46
+   Compiling rustls-webpki v0.103.16
+   Compiling ammonia v4.2.4
+   Compiling webpki-roots v1.0.10
+   Compiling overlook-core v1.5.5 (/home/jason/coding/omarchy-overlook/crates/overlook-core)
+   Compiling overlook-store v1.5.5 (/home/jason/coding/omarchy-overlook/crates/overlook-store)
+   Compiling ureq v3.4.2
+   Compiling lettre v0.11.23
+   Compiling overlook-provider v1.5.5 (/home/jason/coding/omarchy-overlook/crates/overlook-provider)
+   Compiling overlook v1.5.5 (/home/jason/coding/omarchy-overlook/crates/overlook-app)
+    Finished `release` profile [optimized] target(s) in 20.31s

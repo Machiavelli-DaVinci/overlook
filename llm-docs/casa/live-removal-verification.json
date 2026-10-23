@@ -1,0 +1,19 @@
+{
+  "observed_utc": "2026-10-22T16:49:05.074380+00:00",
+  "user_reported_removal_success": true,
+  "source_commit": "5146faa939922efc006732fc1f59060acac8aaee",
+  "binary_sha256": "7e1776bf9758faa80c6b222436a96ced215a8d7e9c582eae7c0d4d9ae510c226",
+  "gmail_account_count": 0,
+  "removed_account_rows": 0,
+  "account_message_count": 0,
+  "account_sync_state_count": 0,
+  "account_keyring_items": 0,
+  "keyring_unlocked_items": 0,
+  "keyring_locked_items": 0,
+  "keyring_query": "application and account, all credential kinds",
+  "keyring_secret_read": false,
+  "remote_revocation_path_completed": true,
+  "remote_revocation_evidence": "Inferred from successful completion of the reviewed guarded remove-account path; it requires revoke endpoint success before deleting the keyring/account. No independent token replay or HTTP trace was captured.",
+  "independent_revoked_token_replay_performed": false,
+  "secure_disk_erasure_claimed": false
+}

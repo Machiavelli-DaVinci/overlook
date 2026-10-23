@@ -2,6 +2,8 @@
 
 mod account_setup;
 mod calendar;
+mod calendar_setup;
+mod calendar_changes;
 mod composer;
 mod contacts;
 mod mail_highlight;
@@ -70,6 +72,7 @@ actions!(
         CalendarAgenda,
         CalendarMonth,
         NewEventAction,
+        SaveCalendarEvent,
         OpenSettings,
         ArchiveSelected,
         TrashSelected,
@@ -79,6 +82,8 @@ actions!(
         SyncNow,
         CalendarDeleteSelected,
         CalendarEditSelected,
+        CalendarSelectNext,
+        CalendarSelectPrevious,
         FormatBold,
         FormatItalic,
         FormatStrike,
@@ -157,6 +162,7 @@ pub fn init(cx: &mut App) {
         KeyBinding::new("ctrl-2", SwitchToCalendar, Some(WINDOW_CONTEXT)),
         KeyBinding::new("ctrl-3", SwitchToContacts, Some(WINDOW_CONTEXT)),
         KeyBinding::new("ctrl-shift-a", NewEventAction, Some(WINDOW_CONTEXT)),
+        KeyBinding::new("ctrl-s", SaveCalendarEvent, Some(WINDOW_CONTEXT)),
         KeyBinding::new("ctrl-,", OpenSettings, Some(WINDOW_CONTEXT)),
         KeyBinding::new("ctrl-b", FormatBold, Some(WINDOW_CONTEXT)),
         KeyBinding::new("ctrl-i", FormatItalic, Some(WINDOW_CONTEXT)),
@@ -175,6 +181,8 @@ pub fn init(cx: &mut App) {
         KeyBinding::new("m", CalendarMonth, Some(CALENDAR_CONTEXT)),
         KeyBinding::new("delete", CalendarDeleteSelected, Some(CALENDAR_CONTEXT)),
         KeyBinding::new("enter", CalendarEditSelected, Some(CALENDAR_CONTEXT)),
+        KeyBinding::new("down", CalendarSelectNext, Some(CALENDAR_CONTEXT)),
+        KeyBinding::new("up", CalendarSelectPrevious, Some(CALENDAR_CONTEXT)),
         KeyBinding::new("j", NextConversation, Some(LIST_CONTEXT)),
         KeyBinding::new("down", NextConversation, Some(LIST_CONTEXT)),
         KeyBinding::new("k", PrevConversation, Some(LIST_CONTEXT)),
@@ -424,6 +432,15 @@ pub struct MailWindow {
     pub(crate) calendars: Vec<Calendar>,
     pub(crate) cal_selected: Option<EventId>,
     pub(crate) cal_status: SyncState,
+    pub(crate) caldav_connection: Option<CalendarConnection>,
+    pub(crate) caldav_cached: bool,
+    pub(crate) caldav_last_sync: Option<i64>,
+    pub(crate) caldav_changes: Vec<CalDavChange>,
+    pub(crate) caldav_previews: HashMap<OperationId, String>,
+    pub(crate) show_caldav_changes: bool,
+    caldav_syncing: HashMap<AccountId, CalendarConnectionId>,
+    caldav_next_retry: HashMap<AccountId, i64>,
+    caldav_requested: HashSet<AccountId>,
     pub(crate) reader_scroll: ScrollHandle,
     pub(crate) cal_scroll: ScrollHandle,
     pub(crate) cal_scrolled_for: std::cell::Cell<Option<(CalView, i64)>>,
@@ -617,6 +634,15 @@ impl MailWindow {
             calendars: Vec::new(),
             cal_selected: None,
             cal_status: SyncState::Offline,
+            caldav_connection: None,
+            caldav_cached: false,
+            caldav_last_sync: None,
+            caldav_changes: Vec::new(),
+            caldav_previews: HashMap::new(),
+            show_caldav_changes: false,
+            caldav_syncing: HashMap::new(),
+            caldav_next_retry: HashMap::new(),
+            caldav_requested: HashSet::new(),
             reader_scroll: ScrollHandle::new(),
             cal_scroll: ScrollHandle::new(),
             cal_scrolled_for: std::cell::Cell::new(None),
@@ -678,7 +704,7 @@ impl MailWindow {
                 this.load_thread();
             }
         }
-        this.list_focus.focus(window, cx);
+        this.focus_current_module(window, cx);
         // Synchronize on startup for every reachable account; queued work from a previous
         // session is replayed before anything else happens.
         this.sync_all(window, cx);
@@ -828,13 +854,19 @@ impl MailWindow {
         self.reload(cx);
         self.selected = self.conversations.first().map(|c| c.id.clone());
         self.load_thread();
-        self.list_focus.focus(window, cx);
+        self.focus_current_module(window, cx);
+        if self.module == Module::Calendar { self.ensure_caldav_range(cx); }
         cx.notify();
     }
 
     pub(crate) fn remove_account(&mut self, id: AccountId, window: &mut Window, cx: &mut Context<Self>) {
         let Some(account) = self.accounts.iter().find(|a| a.id == id).cloned() else { return };
         if !self.removing_accounts.insert(id.clone()) { return; }
+        if let Err(error) = self.store.cancel_caldav_setup(&id) {
+            self.removing_accounts.remove(&id);
+            crate::ui::toast(window, cx, crate::notify::Level::Error, format!("Couldn’t stop calendar setup: {error}"));
+            return;
+        }
         let gmail = self.providers.get(&id).and_then(|p| p.gmail.clone());
         let background_id = id.clone();
         crate::ui::toast(window, cx, crate::notify::Level::Info, "Removing account and disconnecting access…");
@@ -874,6 +906,9 @@ impl MailWindow {
             return;
         }
         self.providers.remove(&id);
+        self.caldav_syncing.remove(&id);
+        self.caldav_next_retry.remove(&id);
+        self.caldav_requested.remove(&id);
         self.provider_issues.remove(&id);
         self.syncing.remove(&id);
         self.refresh_idle_watchers();
@@ -2331,6 +2366,7 @@ impl MailWindow {
 
     pub(crate) fn sync_now(&mut self, window: &mut Window, cx: &mut Context<Self>) {
         let id = self.account.id.clone();
+        self.sync_caldav_account(id.clone(), true, cx);
         self.next_retry.remove(&id);
         self.sync_account(id, window, cx);
     }
@@ -2338,6 +2374,9 @@ impl MailWindow {
     /// Syncs every reachable account that is not in a retry pause. One account never
     /// blocks another.
     pub(crate) fn sync_all(&mut self, window: &mut Window, cx: &mut Context<Self>) {
+        for id in self.accounts.iter().map(|a| a.id.clone()).collect::<Vec<_>>() {
+            self.sync_caldav_account(id, false, cx);
+        }
         let now_ms = now();
         let ids: Vec<AccountId> = self
             .accounts
@@ -2481,7 +2520,7 @@ impl MailWindow {
             self.set_search(String::new(), window, cx);
             self.list_focus.focus(window, cx);
         } else {
-            self.list_focus.focus(window, cx);
+            self.focus_current_module(window, cx);
         }
     }
     fn on_format_bold(&mut self, _: &FormatBold, window: &mut Window, cx: &mut Context<Self>) {
@@ -2645,9 +2684,11 @@ impl MailWindow {
         let Some(editor) = &self.new_event else { return false };
         editor.title.read(cx).focus_handle(cx).is_focused(window)
             || editor.date.read(cx).focus_handle(cx).is_focused(window)
+            || editor.end_date.read(cx).focus_handle(cx).is_focused(window)
             || editor.start.read(cx).focus_handle(cx).is_focused(window)
             || editor.end.read(cx).focus_handle(cx).is_focused(window)
             || editor.location.read(cx).focus_handle(cx).is_focused(window)
+            || editor.guests.read(cx).focus_handle(cx).is_focused(window)
             || editor.description.read(cx).focus_handle(cx).is_focused(window)
     }
     fn on_cal_prev(&mut self, _: &CalendarPrevious, window: &mut Window, cx: &mut Context<Self>) {
@@ -2687,7 +2728,7 @@ impl MailWindow {
         self.set_cal_view(CalView::Agenda, cx);
     }
     fn on_cal_delete_selected(&mut self, _: &CalendarDeleteSelected, window: &mut Window, cx: &mut Context<Self>) {
-        if self.typing_in_event_editor(window, cx) || self.module != Module::Calendar {
+        if !self.cal_focus.is_focused(window) || self.typing_in_event_editor(window, cx) || self.module != Module::Calendar {
             return cx.propagate();
         }
         if let Some(id) = self.cal_selected.clone() {
@@ -2695,12 +2736,35 @@ impl MailWindow {
         }
     }
     fn on_cal_edit_selected(&mut self, _: &CalendarEditSelected, window: &mut Window, cx: &mut Context<Self>) {
-        if self.typing_in_event_editor(window, cx) || self.module != Module::Calendar {
+        if !self.cal_focus.is_focused(window) || self.typing_in_event_editor(window, cx) || self.module != Module::Calendar {
             return cx.propagate();
         }
         if let Some(id) = self.cal_selected.clone() {
             self.request_edit_event(id, window, cx);
         }
+    }
+
+    fn select_calendar_event(&mut self, forward: bool, window: &mut Window, cx: &mut Context<Self>) {
+        if self.new_event.is_some() || !self.cal_focus.is_focused(window) {
+            return cx.propagate();
+        }
+        let len = self.cal_events.len();
+        if len == 0 { return; }
+        let current = self.cal_selected.as_ref().and_then(|id| self.cal_events.iter().position(|e| &e.id == id));
+        let next = match (current, forward) {
+            (Some(i), true) => (i + 1).min(len - 1),
+            (Some(i), false) => i.saturating_sub(1),
+            (None, true) => 0,
+            (None, false) => len - 1,
+        };
+        self.cal_selected = Some(self.cal_events[next].id.clone());
+        cx.notify();
+    }
+    fn on_cal_select_next(&mut self, _: &CalendarSelectNext, window: &mut Window, cx: &mut Context<Self>) {
+        self.select_calendar_event(true, window, cx);
+    }
+    fn on_cal_select_previous(&mut self, _: &CalendarSelectPrevious, window: &mut Window, cx: &mut Context<Self>) {
+        self.select_calendar_event(false, window, cx);
     }
     fn on_cal_month(&mut self, _: &CalendarMonth, window: &mut Window, cx: &mut Context<Self>) {
         if self.typing_in_event_editor(window, cx) {
@@ -2711,6 +2775,14 @@ impl MailWindow {
     fn on_new_event(&mut self, _: &NewEventAction, window: &mut Window, cx: &mut Context<Self>) {
         self.set_module(Module::Calendar, window, cx);
         self.start_new_event(window, cx);
+    }
+
+    fn on_save_calendar_event(&mut self, _: &SaveCalendarEvent, window: &mut Window, cx: &mut Context<Self>) {
+        if self.module == Module::Calendar && self.new_event.is_some() && self.settings.is_none() {
+            self.save_new_event(window, cx);
+        } else {
+            cx.propagate();
+        }
     }
 
     // ---------------------------------------------------------------- header
@@ -3196,6 +3268,9 @@ impl Render for MailWindow {
             .on_action(cx.listener(Self::on_cal_delete_selected))
             .on_action(cx.listener(Self::on_cal_edit_selected))
             .on_action(cx.listener(Self::on_new_event))
+            .on_action(cx.listener(Self::on_cal_select_next))
+            .on_action(cx.listener(Self::on_cal_select_previous))
+            .on_action(cx.listener(Self::on_save_calendar_event))
             .on_action(cx.listener(Self::on_open_settings))
             .size_full()
             .bg(p.background)

@@ -125,9 +125,18 @@ pub struct AccountPrefs {
     pub default_reply: Option<String>,
     pub sign_new_messages: bool,
     pub sign_replies: bool,
+    /// Provider URL/id survives reconnecting a CalDAV account with a fresh local id.
+    pub default_calendar: Option<String>,
 }
 
 impl AccountPrefs {
+    pub fn preferred_calendar<'a>(&self, calendars: &'a [crate::Calendar]) -> Option<&'a crate::Calendar> {
+        calendars.iter().filter(|c| c.can_edit).find(|c| {
+            self.default_calendar.as_deref() == Some(c.provider_id.as_ref().map(|id| id.0.as_str()).unwrap_or(&c.id.0))
+        }).or_else(|| calendars.iter().find(|c| c.can_edit && c.is_primary))
+            .or_else(|| calendars.iter().find(|c| c.can_edit))
+    }
+
     /// Brings older stored preferences up to date: the single signature becomes the first
     /// named one, and the two "include" switches become the defaults.
     pub fn normalized(mut self) -> Self {
@@ -173,6 +182,28 @@ impl AccountPrefs {
 #[cfg(test)]
 mod tests {
     use super::*;
+
+    #[test]
+    fn default_calendar_survives_reconnect_and_ignores_unwritable_or_missing_choices() {
+        use crate::*;
+        let calendar = |id: &str, url: &str, primary| Calendar {
+            id: CalendarId::from(id), account_id: AccountId::from("imap:test"),
+            provider_id: Some(ProviderId::from(url)), name: id.into(), color: None,
+            is_primary: primary, can_edit: true, visible: true, sort_order: 0, default_reminders: vec![],
+        };
+        let mut calendars = vec![calendar("first", "https://example.test/first/", true), calendar("second", "https://example.test/second/", false)];
+        let prefs: AccountPrefs = serde_json::from_str(r#"{"default_calendar":"https://example.test/second/"}"#).unwrap();
+        let reopened: AccountPrefs = serde_json::from_str(&serde_json::to_string(&prefs).unwrap()).unwrap();
+        calendars[1].id = CalendarId::from("reconnected-second");
+        assert_eq!(reopened.preferred_calendar(&calendars).unwrap().id.0, "reconnected-second");
+        calendars[1].can_edit = false;
+        assert_eq!(reopened.preferred_calendar(&calendars).unwrap().id.0, "first");
+        calendars.remove(1);
+        assert_eq!(reopened.preferred_calendar(&calendars).unwrap().id.0, "first");
+        calendars[0].can_edit = false;
+        assert!(reopened.preferred_calendar(&calendars).is_none());
+        assert!(serde_json::from_str::<AccountPrefs>("{}").unwrap().default_calendar.is_none());
+    }
 
     #[test]
     fn defaults_survive_partial_json() {

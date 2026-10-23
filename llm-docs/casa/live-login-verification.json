@@ -1,0 +1,28 @@
+{
+  "observed_utc": "2026-10-22T16:41:44.056184+00:00",
+  "source_commit": "5146faa939922efc006732fc1f59060acac8aaee",
+  "binary_sha256": "7e1776bf9758faa80c6b222436a96ced215a8d7e9c582eae7c0d4d9ae510c226",
+  "user_reported_login_complete": true,
+  "gmail_account_count": 1,
+  "downloaded_message_count": 93,
+  "sync_state": {
+    "state": "up-to-date"
+  },
+  "last_successful_sync": 1792687287351,
+  "keyring_metadata": {
+    "unlocked_items": 1,
+    "locked_items": 0
+  },
+  "keyring_secret_read": false,
+  "credential_pattern_matches": {
+    "google_access_token": 0,
+    "google_refresh_token": 0,
+    "bearer_header": 0,
+    "credential_assignment": 0
+  },
+  "log_raw_sha256": "7b8f98c39fa45214e36447e2603498411f9297d468a743f79f7cec1a26ad3f33",
+  "log_redacted_sha256": "91bd191394574b9c5742d31c1fe6f9974f404be2cba7e82262e3d4571587a8ca",
+  "log_source": "Private isolated application profile; raw data is not in the repository",
+  "remote_revocation_verified": false,
+  "account_removal_verified": false
+}

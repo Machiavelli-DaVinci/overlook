@@ -12,10 +12,10 @@ use super::MailWindow;
 use crate::assets::icon;
 use crate::sync::pollster_block;
 use crate::theme::ActivePalette;
-use crate::{credentials, providers};
+use crate::{caldav_sync, credentials, providers};
 use gpui_kit::base::{h_flex, v_flex};
 use gpui_kit::component::button::{Button, ButtonVariants};
-use gpui_kit::component::input::{Input, InputState};
+use gpui_kit::component::input::{Input, InputEvent, InputState};
 use gpui_kit::component::menu::{DropdownMenu, PopupMenuItem};
 use gpui_kit::component::scroll::ScrollableElement;
 use gpui_kit::component::switch::Switch;
@@ -25,6 +25,7 @@ use gpui_kit::*;
 use overlook_core::time::now;
 use overlook_core::*;
 use overlook_provider::autoconfig::{self, Source, Suggestion};
+use overlook_provider::caldav::fastmail_preset_for_login;
 use overlook_provider::imap::ImapProvider;
 use overlook_provider::pop3::Pop3Provider;
 use overlook_provider::{smtp, MailProvider, ProviderError};
@@ -84,6 +85,9 @@ pub struct AccountSetup {
     pub test_result: Vec<(bool, String)>,
     /// Bumped per background task so a stale result is dropped.
     pub generation: u64,
+    /// Explicit consent to reuse this new Fastmail account's incoming credential.
+    pub connect_calendars: bool,
+    _subscriptions: Vec<Subscription>,
 }
 
 impl AccountSetup {
@@ -169,6 +173,17 @@ impl MailWindow {
             SetupStep::Servers if matches!(existing, SetupMode::UpdatePassword(_)) => password.clone(),
             SetupStep::Servers => in_host.clone(),
         };
+        let subscriptions = [&in_host, &in_user].into_iter().map(|input| {
+            cx.subscribe(input, |this, _, event: &InputEvent, cx| {
+                if matches!(event, InputEvent::Change) {
+                    if let Some(setup) = this.account_setup.as_mut() {
+                        // A changed login must not carry an earlier credential choice.
+                        setup.connect_calendars = false;
+                    }
+                    cx.notify();
+                }
+            })
+        }).collect();
         self.account_setup = Some(AccountSetup {
             kind,
             mode: existing,
@@ -198,6 +213,8 @@ impl MailWindow {
             error: None,
             test_result: Vec::new(),
             generation: 0,
+            connect_calendars: false,
+            _subscriptions: subscriptions,
         });
         focus.update(cx, |s, cx| s.focus(window, cx));
         cx.notify();
@@ -205,7 +222,7 @@ impl MailWindow {
 
     pub(crate) fn close_account_setup(&mut self, window: &mut Window, cx: &mut Context<Self>) {
         self.account_setup = None;
-        self.list_focus.focus(window, cx);
+        self.focus_current_module(window, cx);
         cx.notify();
     }
 
@@ -478,6 +495,7 @@ impl MailWindow {
         let kind = setup.kind;
         let mode = setup.mode.clone();
         let is_new = matches!(mode, SetupMode::New);
+        let connect_calendars = is_new && setup.connect_calendars;
         let account = match &mode {
             SetupMode::Edit(id) | SetupMode::UpdatePassword(id) => match self.accounts.iter().find(|a| &a.id == id).cloned() {
                 Some(mut a) => {
@@ -521,6 +539,9 @@ impl MailWindow {
         if let Err(e) = outgoing_result {
             crate::ui::toast(window, cx, crate::notify::Level::Warning, format!("The outgoing password could not be saved: {e}"));
         }
+        // Calendar configuration is durable before starting its worker. A failure
+        // is reported independently and never rolls back a working mail account.
+        let calendar_result = caldav_sync::add_fastmail_calendars(&self.store, &account, &servers, connect_calendars);
         // A fresh provider drops any connection made with the old settings.
         let bundle = match kind {
             ProviderKind::Pop3 => providers::pop3_providers(&account.id, servers, password, out_password.clone()),
@@ -546,6 +567,12 @@ impl MailWindow {
             if self.settings.is_some() {
                 self.open_settings(super::SettingsPage::Accounts, window, cx);
             }
+        }
+        match calendar_result {
+            Ok(Some(_)) => self.sync_caldav_account(account.id.clone(), true, cx),
+            Ok(None) => {},
+            Err(error) => crate::ui::toast(window, cx, crate::notify::Level::Warning,
+                format!("Mail is ready, but calendars could not be added. {error}")),
         }
         self.sync_account(account.id, window, cx);
     }
@@ -576,6 +603,8 @@ impl MailWindow {
         let busy = setup.busy;
         let field = |label: &str, input: AnyElement| v_flex().gap(px(4.)).child(div().text_size(px(11.)).font_weight(FontWeight::MEDIUM).text_color(p.muted).child(label.to_owned())).child(input);
         let is_pop3 = setup.kind == ProviderKind::Pop3;
+        let offer_calendars = setup.mode == SetupMode::New && setup.kind == ProviderKind::Imap
+            && fastmail_preset_for_login(setup.in_host.read(cx).value().trim(), setup.in_user.read(cx).value().trim()).is_some();
         let title = match (&setup.mode, setup.step) {
             (SetupMode::New, SetupStep::Basics) => format!("Add {} account", if is_pop3 { "a POP3" } else { "an IMAP" }),
             (SetupMode::New, SetupStep::Servers) => "Server settings".to_owned(),
@@ -611,6 +640,18 @@ impl MailWindow {
                 .child(field("User name", Input::new(&setup.out_user).into_any_element()))
                 .child(h_flex().items_center().gap(px(10.)).child(Switch::new("setup-same-password").checked(setup.same_password).label("Use the same password for sending").on_click(cx.listener(|this, checked: &bool, _w, cx| this.setup_toggle_same_password(*checked, cx)))))
                 .when(!setup.same_password, |d| d.child(field("Outgoing password", Input::new(&setup.out_password).into_any_element())))
+                .when(offer_calendars, |d| d
+                    .child(divider(&p))
+                    .child(div().text_size(px(13.)).font_weight(FontWeight::SEMIBOLD).child("Fastmail calendars"))
+                    .child(Switch::new("setup-fastmail-calendars")
+                        .checked(setup.connect_calendars).disabled(busy.is_some())
+                        .label("Connect calendars using this mail password")
+                        .accessibility_label("Connect Fastmail calendars using this mail password")
+                        .on_click(cx.listener(|this, checked: &bool, _, cx| {
+                            if let Some(setup) = this.account_setup.as_mut() { setup.connect_calendars = *checked; }
+                            cx.notify();
+                        })))
+                    .child(div().text_size(px(12.)).text_color(p.muted).child("Use a Fastmail app password with calendar access. Calendars connect in the background after you add the account. If access is denied, mail keeps working and you can enter a separate calendar password in Settings → Accounts → Calendars.")))
                 .when(!is_pop3, |d| {
                     d.child(div().text_size(px(13.)).font_weight(FontWeight::SEMIBOLD).pt(px(6.)).child("Folders on the server"))
                         .child(div().text_size(px(12.)).text_color(p.muted).child("Sent, Trash and Archive are found from the server’s folder list. Name a folder here only when the server gets it wrong (paths as the server names them, like INBOX/Archive)."))

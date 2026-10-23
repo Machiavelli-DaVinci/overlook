@@ -1,0 +1,387 @@
+   Compiling overlook v1.5.5 (/home/jason/coding/omarchy-overlook/crates/overlook-app)
+warning: variable does not need to be mutable
+    --> crates/overlook-app/src/browser_engine.rs:1955:22
+     |
+1955 |                 let (mut socket, _) = match server.accept() {
+     |                      ----^^^^^^
+     |                      |
+     |                      help: remove this `mut`
+     |
+     = note: `#[warn(unused_mut)]` (part of `#[warn(unused)]`) on by default
+
+warning: `overlook` (bin "overlook" test) generated 1 warning (run `cargo fix --bin "overlook" -p overlook --tests` to apply 1 suggestion)
+    Finished `test` profile [optimized + debuginfo] target(s) in 3.74s
+     Running unittests src/main.rs (target/debug/deps/overlook-2c666ec1b7aeccb3)
+
+running 87 tests
+test browser_body::tests::browser_body_frontend_eviction_ack_restores_backend_cached_tile ... ignored, runs real sandboxed Chromium; no GUI or private data
+test browser_body::tests::browser_body_unchanged_visible_range_does_not_capture_populated_tiles ... ignored, runs real sandboxed Chromium; no GUI or private data
+test browser_body::tests::application_shortcuts_do_not_reach_chromium ... ok
+test browser_body::tests::clipped_visibility_does_not_shrink_document_and_mouse_is_document_relative ... ok
+test browser_body::tests::cached_overscan_is_refreshed_without_a_redecode ... ok
+test browser_body::tests::coordinates_are_css_relative ... ok
+test browser_body::tests::invalidation_rejects_old_decode_without_parallel_work ... ok
+test browser_body::tests::lru_is_bounded_and_visible_tiles_are_pinned ... ok
+test browser_body::tests::finished_renders_are_found_by_document_and_size_and_bounded ... ok
+test browser_body::tests::browser_body_failure_classification_is_private_and_exact ... ok
+test browser_body::tests::browser_body_retry_resets_generation_and_preserves_prepared_consent ... ok
+test browser_body::tests::keys_and_unicode ... ok
+test browser_body::tests::browser_body_failure_retains_tiles_height_and_rejects_active_decode ... ok
+test browser_body::tests::reflow_keeps_paint_until_new_revision_replaces_it ... ok
+test browser_engine::cancelled_resource_tests::browser_cancelled_resource_does_not_destroy_rendered_document ... ignored, runs real sandboxed Chromium
+test browser_body::tests::options_restart_engine ... ok
+test browser_body::tests::replaced_active_offset_and_error_cannot_publish ... ok
+test browser_engine::cancelled_resource_tests::browser_private_runtime_avoids_tmp_quota_and_long_socket_paths ... ignored, runs real sandboxed Chromium
+test browser_engine::tests::browser_drag_selection_survives_tile_capture ... ignored, runs real sandboxed Chromium with fictional text only
+test browser_engine::tests::browser_warm_pool_first_tile_timing ... ignored, Chromium timing diagnostic: cold launch vs warm pool
+test browser_engine::tests::chromium_authored_card_layout_and_hidpi ... ignored, runs real sandboxed Chromium
+test browser_engine::tests::chromium_controlled_redirect_consent ... ignored, runs real sandboxed Chromium with a controlled anonymous resource server
+test browser_body::tests::safe_link_schemes_only ... ok
+test browser_engine::tests::chromium_dark_paper_is_actually_painted_dark ... ignored, runs real sandboxed Chromium
+test browser_engine::tests::chromium_document_tiles_and_interaction ... ignored, runs real sandboxed Chromium
+test browser_engine::tests::chromium_handle_last_clone_lifetime ... ignored, runs real sandboxed /usr/bin/chromium
+test browser_body::tests::pending_tiles_coalesce_by_offset_not_entire_frame ... ok
+test browser_engine::cancelled_resource_tests::browser_only_obsolete_resource_resolution_is_nonfatal ... ok
+test browser_engine::tests::chromium_nested_scroll_edges ... ignored, runs real sandboxed Chromium
+test browser_engine::tests::chromium_private_pipe_live_dom ... ignored, runs real sandboxed /usr/bin/chromium
+test browser_engine::tests::chromium_remote_image_consent ... ignored, fetches a public benign HTTPS image with real sandboxed Chromium
+test browser_engine::tests::chromium_repro_concurrent_replace_stderr ... ignored, synthetic-only 4 live BrowserHandles, unique stderr files; run alone
+test browser_engine::tests::chromium_repro_handle_post_render ... ignored, synthetic-only production BrowserHandle post-render diagnostic
+test browser_engine::tests::chromium_repro_prepared_inline_image_layout ... ignored, synthetic-only prepared Outlook-like inline-image/layout diagnostic
+test browser_engine::tests::chromium_repro_tile_boundary_dimensions ... ignored, synthetic-only real Chromium tile boundary/DPR diagnostic
+test browser_engine::tests::network_and_link_policy ... ok
+test browser_engine::tests::wheel_bursts_are_coalesced_without_reordering_buttons ... ok
+test browser_engine::tests::tile_queue_preserves_offsets_and_revisions ... ok
+test google_signin::tests::completion_page_mentions_overlook ... ok
+test google_signin::tests::config_path_is_under_dot_config_overlook ... ok
+test google_signin::tests::callback_rejects_forgery_pollution_and_wrong_origin ... ok
+test notify::tests::long_messages_split_into_headline_and_description ... ok
+test notify::tests::the_click_command_comes_last_as_separate_words ... ok
+test pdf_preview::tests::orders_pages_numerically ... ok
+test persist::tests::jobs_run_in_order ... ok
+test sync::tests::imap_account_syncs_through_the_store_across_a_restart ... ignored
+test sync::tests::imap_exit_criteria_against_the_spike_servers ... ignored
+test sync::tests::imap_idle_delivers_new_mail_against_the_spike_servers ... ignored
+test security_tests::synthetic_login_logs_redact_credentials_even_with_trace_enabled ... ok
+test sync::tests::pop3::pop3_exit_criteria_against_the_spike_servers ... ignored
+test browser_engine::tests::resource_fetch_is_anonymous_and_gated ... ok
+test sync::tests::deletions_by_provider_id_and_folder_rows_are_recorded ... ok
+test sync::tests::applied_changes_rewrite_provider_ids ... ok
+test sync::tests::header_only_changes_queue_bodies_that_complete_the_same_row ... ok
+test sync::tests::move_seen_elsewhere_keeps_the_local_message ... ok
+test theme::tests::alexander_has_navy_navigation_gray_highlights_and_amber_edge ... ok
+test theme::tests::all_themes_have_readable_text_and_matching_component_tokens ... ok
+test theme::tests::colorways_are_distinct ... ok
+test theme::tests::message_center_is_white_except_in_dark_mode ... ok
+test ui::composer::tests::reveal_is_minimal_and_clamped ... ok
+test ui::composer::tests::reveal_long_message_editor_precisely ... ok
+test ui::composer::tests::reveal_tracks_height_settling_without_a_fixed_scroll_distance ... ok
+test ui::mail_highlight::tests::marks_bold_italic_links_and_lists ... ok
+test ui::mail_highlight::tests::styles_cover_the_requested_range ... ok
+test sync::tests::offline_sync_leaves_everything_queued ... ok
+test ui::palette::tests::every_word_must_match_and_title_starts_rank_first ... ok
+test ui::reader::tests::placeholder_is_plain_text_and_bounded ... ok
+test ui::reader::tests::plain_text_keeps_lines_escapes_markup_and_links_urls ... ok
+test updater::tests::checksum_parsing ... ok
+test updater::tests::detects_development_build ... ok
+test updater::tests::skips_debug_package_asset ... ok
+test updater::tests::version_comparison ... ok
+test sync::tests::first_sync_downloads_snapshot_when_store_is_empty ... ok
+test sync::tests::cancelled_send_is_not_sent ... ok
+test sync::tests::dropped_connection_during_send_is_uncertain_then_reconciled_without_duplicates ... ok
+test backup::tests::backup_copies_database_raw_and_attachments_and_reopens ... ok
+test sync::tests::threads_messages_for_providers_without_thread_ids ... ok
+test ui::new_mail_tests::only_mail_that_arrived_since_the_last_index_is_announced ... ok
+test sync::tests::replay_is_ordered_and_send_needs_provider_acceptance ... ok
+test sync::tests::pop3::pop3_user_labels_survive_a_full_resync_and_backup_opens_on_a_clean_dir ... ok
+test sync::tests::imap_replay_after_a_crash_between_server_success_and_local_commit ... ok
+test sync::tests::imap_local_sent_copy_is_replaced_by_the_server_copy ... ok
+test sync::tests::pop3::pop3_account_downloads_once_and_never_duplicates_across_polls_and_restarts ... ok
+test sync::tests::pop3::pop3_trash_deletes_on_the_server_when_asked_and_sends_through_smtp ... ok
+test sync::tests::pop3::pop3_retention_honours_leave_on_server_and_delete_after_days ... ok
+test sync::tests::imap_offline_queue_survives_a_restart_and_replays_in_order ... ok
+test sync::tests::imap_uncertain_send_waits_for_the_user_without_blocking_other_changes ... ok
+
+test result: ok. 65 passed; 0 failed; 22 ignored; 0 measured; 0 filtered out; finished in 2.69s
+
+     Running unittests src/lib.rs (target/debug/deps/overlook_core-e00cc2b738996575)
+
+running 84 tests
+test appearance::tests::follow_system_selects_light_or_dark ... ok
+test appearance::tests::keys_round_trip ... ok
+test appearance::tests::explicit_themes_ignore_system ... ok
+test appearance::tests::preferences_serialize_as_keys ... ok
+test appearance::tests::retired_gray_white_settings_migrate_to_gray ... ok
+test calendar::tests::provider_ids_are_base32hex ... ok
+test compose::tests::plain_text_drops_marks_keeps_structure ... ok
+test compose::tests::typed_html_is_escaped_not_rendered ... ok
+test compose::tests::renders_mail_markdown ... ok
+test focus::tests::overrides_and_rules_win ... ok
+test ics::tests::parses_google_style_invite ... ok
+test compose::tests::unicode_and_inline_soft_breaks_survive_rendering ... ok
+test model::tests::conversation_summary_names_other_participants ... ok
+test model::tests::human_sizes ... ok
+test focus::tests::correspondents_and_categories ... ok
+test model::tests::initials_and_names ... ok
+test mailto::tests::parses_addresses_and_fields ... ok
+test model::tests::parses_recipient_lists ... ok
+test prefs::tests::defaults_survive_partial_json ... ok
+test ops::plan_tests::labels_merge_only_with_the_same_label ... ok
+test model::tests::reply_quotes_and_sets_subject ... ok
+test ops::plan_tests::different_kinds_keep_their_order_and_sends_never_merge ... ok
+test prepass::tests::links_bare_urls_outside_anchors ... ok
+test ops::plan_tests::a_burst_of_reads_becomes_one_call ... ok
+test compose::tests::authored_image_previews_also_require_local_resource_consent ... ok
+test prepass::tests::preserves_intentional_breaks ... ok
+test prepass::tests::preserves_spacer_blocks_and_converts_center ... ok
+test prepass::tests::sup_and_sub_become_glyphs_when_possible ... ok
+test prepass::tests::splits_gmail_quote_but_not_forwards ... ok
+test prepass::tests::splits_cite_blockquotes_and_outlook_headers ... ok
+test prepass::tests::url_boundaries ... ok
+test prepass::tests::superscripts_never_resurrect_hidden_descendants ... ok
+test ops::plan_tests::only_the_final_star_state_is_sent ... ok
+test prefs::tests::signature_block_follows_toggles ... ok
+test prepass::tests::preformatted_lines_survive ... ok
+test prepass::tests::embedded_message_headers_get_a_rule ... ok
+test ics::tests::parses_tzid_and_dates ... ok
+test prepass::tests::hides_what_a_browser_hides ... ok
+test sanitize::tests::blank_blocks_and_inline_wrapped_hard_breaks_survive ... ok
+test sanitize::tests::color_adaptation_does_not_rewrite_text_or_link_values ... ok
+test sanitize::tests::breaks_are_kept_for_the_view ... ok
+test compose::tests::reply_quotes_below_the_body ... ok
+test sanitize::tests::blocks_remote_images_by_default ... ok
+test sanitize::tests::color_policy_and_adaptation_agree_and_preserve_alpha ... ok
+test sanitize::tests::counts_real_remote_images_not_text_or_attributes ... ok
+test sanitize::tests::full_history_quote_removes_hidden_without_restructuring ... ok
+test sanitize::tests::gmail_div_bodies_keep_their_lines ... ok
+test sanitize::tests::data_tables_are_kept_and_layout_tables_flattened ... ok
+test sanitize::tests::inline_priority_is_resolved_before_stripping_important ... ok
+test sanitize::tests::plain_text_preserves_blank_runs_indentation_and_terminal_breaks ... ok
+test sanitize::tests::safe_side_margins_have_the_same_bounds_as_other_margins ... ok
+test compose::tests::forward_carries_a_header_block ... ok
+test sanitize::tests::margin_shorthand_and_longhand_priority_is_resolved_per_side ... ok
+test sanitize::tests::flattened_layout_attributes_and_anchor_structure_are_stable ... ok
+test sanitize::tests::sender_presentation_is_bounded_and_inherited ... ok
+test sanitize::tests::rejects_active_and_unbounded_style_values ... ok
+test sanitize::tests::root_presentation_is_safe_and_idempotent ... ok
+test sanitize::tests::strips_scripts_and_handlers ... ok
+test sanitize::tests::split_history_keeps_inherited_sender_presentation ... ok
+test sanitize::tests::table_spans_cannot_request_unbounded_layout ... ok
+test sanitize::tests::text_extraction_keeps_structure ... ok
+test sanitize::tests::text_extraction_never_exposes_active_or_hidden_subtrees ... ok
+test sanitize::tests::split_history_preserves_root_inheritance_exactly ... ok
+test sanitize::tests::text_round_trips_to_html ... ok
+test servers::tests::default_ports_and_local_hosts ... ok
+test servers::tests::round_trips_through_json_with_defaults ... ok
+test threading::tests::in_reply_to_joins_a_known_conversation ... ok
+test threading::tests::existing_conversation_ids_are_kept_and_ids_are_normalised ... ok
+test threading::tests::parent_arriving_after_its_reply_joins_the_reply ... ok
+test sanitize::tests::tables_use_real_cells_and_nested_row_state ... ok
+test threading::tests::references_are_tried_newest_first ... ok
+test sanitize::tests::text_colour_survives_and_adapts ... ok
+test sanitize::tests::tables_become_rows_with_gaps ... ok
+test threading::tests::replies_in_the_same_batch_follow_their_parent_regardless_of_order ... ok
+test threading::tests::unknown_parents_start_a_conversation_named_after_the_message ... ok
+test time::tests::civil_round_trip ... ok
+test time::tests::offsets_parse ... ok
+test time::tests::relative_labels ... ok
+test tz::tests::month_math ... ok
+test tz::tests::parses_google_times ... ok
+test tz::tests::parses_typed_clock_times ... ok
+test tz::tests::week_and_day_math ... ok
+test sanitize::tests::visibility_uses_winning_declarations_and_requires_clipping ... ok
+test compose::tests::quotes_share_visible_content_but_preview_requires_remote_consent ... ok
+
+test result: ok. 84 passed; 0 failed; 0 ignored; 0 measured; 0 filtered out; finished in 0.00s
+
+     Running tests/browser_document.rs (target/debug/deps/browser_document-dba16ee1aa76c80a)
+
+running 16 tests
+test cid_image_sources_are_normalized_and_not_remote_resources ... ok
+test css_normalization_preserves_quotes_escapes_and_surrounding_syntax ... ok
+test body_styles_cannot_escape_into_markup ... ok
+test actual_document_roots_keep_authored_attributes_without_wrappers ... ok
+test css_tokenization_rejects_escaped_schemes_and_external_imports ... ok
+test counts_retained_dom_resources_not_links_or_removed_payloads ... ok
+test authored_card_layout_and_typography_survive ... ok
+test protocol_relative_image_source_is_retained_as_https ... ok
+test normalization_does_not_enable_relative_paths_or_change_absolute_urls ... ok
+test malicious_root_attributes_and_spoofed_wrappers_cannot_replace_policy ... ok
+test policy_is_first_and_sender_active_content_is_removed ... ok
+test protocol_relative_resources_and_navigation_are_normalized ... ok
+test excessive_tag_starts_are_rejected_before_dom_preparation ... ok
+test deeply_nested_css_is_dropped_without_affecting_regular_styles ... ok
+test oversized_source_is_rejected_without_echoing_or_changing_it ... ok
+test deeply_nested_dom_is_rejected_without_recursive_traversal ... ok
+
+test result: ok. 16 passed; 0 failed; 0 ignored; 0 measured; 0 filtered out; finished in 0.00s
+
+     Running tests/message_formatting.rs (target/debug/deps/message_formatting-557529ab3da306bc)
+
+running 12 tests
+test direct_text_extraction_never_indexes_script_or_style_payloads ... ok
+test css_values_cannot_reintroduce_active_content_or_arbitrary_layout ... ok
+test nested_lists_and_preformatted_code_keep_structure_and_lines ... ok
+test forwarded_history_stays_inline_and_complete ... ok
+test remote_policy_blocks_images_not_links_and_keeps_cid ... ok
+test layout_tables_flatten_but_real_data_and_footer_survive ... ok
+test authored_breaks_and_blank_blocks_are_not_discarded ... ok
+test replies_fold_in_reader_but_keep_all_history_when_quoted ... ok
+test safe_typography_and_zero_margin_signatures_survive_both_paths ... ok
+test hidden_content_is_removed_even_from_full_history_quotes ... ok
+test adapt_colors_changes_only_color_attributes_not_text_urls_or_typography ... ok
+test corpus_is_safe_meaningful_and_cleaning_is_idempotent ... ok
+
+test result: ok. 12 passed; 0 failed; 0 ignored; 0 measured; 0 filtered out; finished in 0.02s
+
+     Running unittests src/lib.rs (target/debug/deps/overlook_provider-d5f30dcdfb8d4e87)
+
+running 95 tests
+test autoconfig::tests::presets_and_guesses ... ok
+test autoconfig::tests::parses_ispdb_xml ... ok
+test gmail::api::batch_tests::parses_a_batch_reply_in_content_id_order ... ok
+test gmail::calendar::tests::conference_request_only_when_asked ... ok
+test gmail::api::batch_tests::disconnect_blocks_cloned_client_and_retains_retry_on_failure ... ok
+test gmail::calendar::tests::recurrence_rules_end_and_split_cleanly ... ok
+test gmail::mapping::tests::inline_images_keep_their_content_id ... ok
+test gmail::mapping::tests::maps_labels ... ok
+test gmail::mapping::tests::maps_minimal_message_without_payload ... ok
+test gmail::oauth::tests::parses_google_client_json ... ok
+test gmail::oauth::tests::authorization_url_and_callback ... ok
+test gmail::oauth::tests::pkce_matches_rfc_7636_appendix_b ... ok
+test gmail::oauth::tests::secret_debug_output_is_redacted ... ok
+test gmail::mapping::tests::maps_full_message ... ok
+test gmail::oauth::tests::sha256_known_vector ... ok
+test imap::connection::tests::maps_no_responses_by_code ... ok
+test imap::folders::tests::gmail_layout ... ok
+test imap::folders::tests::policy_overrides_and_inbox_namespace ... ok
+test imap::folders::tests::special_use_then_names_then_user_labels ... ok
+test imap::connection::tests::refuses_plaintext_to_remote_hosts ... ok
+test imap::structure::tests::single_part_and_forwarded_message ... ok
+test imap::structure::tests::plans_text_parts_and_attachments ... ok
+test imap::structure::tests::synthetic_message_parses_with_the_shared_parser ... ok
+test gmail::calendar::tests::maps_calendar_and_events ... ok
+test imap::tests::a_dead_idle_connection_is_reopened_once ... ok
+test imap::tests::large_messages_take_the_bodystructure_path ... ok
+test imap::tests::idle_ends_on_servers_without_it_or_with_a_refused_login ... ok
+test imap::tests::real_imap_server_round_trip ... ignored
+test imap::tests::real_imap_server_write_round_trip ... ignored
+test imap::tests::fetch_messages_parses_bodies_flags_and_attachments ... ok
+test imap::tests::attachments_and_raw_bytes_are_fetched_by_section ... ok
+test imap::tests::condstore_without_qresync_keeps_the_uid_diff_for_deletions ... ok
+test imap::tests::a_checkpoint_without_modseq_takes_the_plain_path_once ... ok
+test imap::tests::labels_are_folders_to_move_between ... ok
+test imap::tests::flags_are_stored_per_folder_and_stale_rows_are_skipped ... ok
+test imap::tests::server_failures_map_to_provider_errors ... ok
+test imap::uidset::tests::chunks_keep_order ... ok
+test imap::uidset::tests::round_trips_ranges_and_singles ... ok
+test imap::unit::checkpoint_round_trips_and_rejects_other_versions ... ok
+test imap::unit::decodes_parts_by_their_mime_headers ... ok
+test imap::unit::folder_limits_scale_with_the_inbox_preference ... ok
+test imap::unit::provider_ids_round_trip ... ok
+test imap::unit::search_criteria_quote_ascii_and_use_literals_for_the_rest ... ok
+test mime::parse::tests::forwarded_message_and_rfc2231_names ... ok
+test mime::parse::tests::inline_images_keep_their_content_id_and_section ... ok
+test mime::parse::tests::malformed_messages_never_panic ... ok
+test mime::parse::tests::maps_full_message ... ok
+test mime::parse::tests::minimal_message_uses_flags_and_sender ... ok
+test mime::parse::tests::part_bytes_follow_attachment_section_paths ... ok
+test mime::tests::decodes_encoded_words ... ok
+test outgoing::tests::builds_plain_message_with_threading ... ok
+test pop3::client::tests::codes_and_words ... ok
+test pop3::client::tests::login_failures_are_sign_in_required_unless_temporary ... ok
+test pop3::client::tests::refuses_plaintext_to_remote_hosts_and_maps_refused_connections ... ok
+test pop3::client::tests::unstuffs_multiline_replies_and_maps_errors ... ok
+test imap::tests::an_interrupted_move_is_completed_on_the_retry ... ok
+test imap::tests::idle_reports_inbox_changes_and_stops_at_once ... ok
+test pop3::tests::real_pop3_server_round_trip ... ignored
+test imap::tests::server_search_runs_text_search_per_folder ... ok
+test imap::tests::snapshot_maps_folders_and_queues_newest_messages ... ok
+test imap::tests::archive_creates_the_folder_moves_with_uid_move_and_reports_copyuid ... ok
+test imap::tests::a_dropped_send_is_uncertain_until_the_sent_folder_or_the_user_decides ... ok
+test imap::tests::qresync_changes_come_from_changedsince_and_vanished ... ok
+test pop3::unit::checkpoint_round_trips_and_rejects_other_shapes ... ok
+test pop3::unit::labels_and_paths ... ok
+test pop3::unit::ledger_prunes_long_gone_uidls_and_caps_the_rest ... ok
+test pop3::unit::retention_policy_decisions ... ok
+test sample::tests::offline_provider_refuses_everything ... ok
+test sample::tests::sample_calendar_has_a_week_of_events ... ok
+test sample::tests::snapshot_is_consistent ... ok
+test sample::tests::uncertain_send_reconciles_as_delivered ... ok
+test smtp::real_server::real_smtp_server_round_trip ... ignored
+test smtp::tests::dropped_connection_after_data_is_uncertain ... ok
+test pop3::tests::a_message_gone_from_the_server_before_its_download_is_skipped ... ok
+test smtp::tests::refuses_plaintext_to_remote_hosts_and_bad_addresses ... ok
+test pop3::tests::send_goes_over_smtp_and_keeps_a_local_sent_copy ... ok
+test smtp::tests::rejected_recipient_carries_the_servers_words ... ok
+test imap::tests::changes_report_new_mail_flags_and_deletions ... ok
+test smtp::tests::unreachable_server_is_offline ... ok
+test smtp::tests::transient_reply_is_temporary ... ok
+test smtp::tests::probe_connects_and_authenticates ... ok
+test smtp::tests::wrong_password_is_sign_in_required ... ok
+test smtp::tests::sends_with_auth_plain_and_dot_stuffing ... ok
+test imap::tests::send_submits_over_smtp_appends_to_sent_and_reconciles ... ok
+test pop3::tests::snapshot_lists_newest_first_tops_large_messages_and_retr_saves_eml_files ... ok
+test pop3::tests::repeated_polls_never_list_a_message_twice_and_new_mail_appears ... ok
+test imap::tests::a_failed_sent_copy_still_counts_as_sent ... ok
+test imap::tests::moves_fall_back_to_copy_and_expunge_without_move ... ok
+test imap::tests::write_failures_map_to_provider_errors ... ok
+test imap::tests::idle_reconnects_after_a_dropped_connection ... ok
+test pop3::tests::trash_deletes_on_the_server_only_when_the_policy_says_so ... ok
+test imap::tests::uidvalidity_change_and_folder_list_changes ... ok
+test imap::tests::trash_without_a_trash_folder_follows_the_policy ... ok
+test pop3::tests::retention_deletes_downloaded_messages_only_after_the_bytes_are_on_disk ... ok
+test pop3::tests::connection_drops_and_refusals_map_to_provider_errors_without_duplicates ... ok
+
+test result: ok. 91 passed; 0 failed; 4 ignored; 0 measured; 0 filtered out; finished in 4.50s
+
+     Running unittests src/lib.rs (target/debug/deps/overlook_store-b337928d9f733267)
+
+running 26 tests
+test tests::index_leaves_bodies_out ... ok
+test tests::failed_change_leaves_no_operation ... ok
+test tests::imap_folder_rows_round_trip ... ok
+test tests::a_late_background_save_never_replaces_newer_text ... ok
+test tests::complete_send_stores_message_and_clears_draft ... ok
+test tests::a_late_autosave_does_not_unqueue_a_sent_draft ... ok
+test tests::focused_inbox_splits_and_respects_rules ... ok
+test tests::index_answers_recipients_and_thread_members_like_the_store ... ok
+test tests::calendar_round_trip_and_pending_flags ... ok
+test tests::merge_keeps_local_conversation_for_header_only_refresh ... ok
+test tests::local_primary_is_pop3_only ... ok
+test tests::header_only_refresh_keeps_snippet_and_invitation ... ok
+test tests::in_memory_index_matches_the_store_after_each_change ... ok
+test tests::draft_queue_and_cancel_are_atomic_and_durable ... ok
+test tests::change_and_operation_survive_restart ... ok
+test tests::local_primary_accounts_keep_their_flags_when_a_message_is_served_again ... ok
+test tests::references_persist_and_message_ids_resolve ... ok
+test tests::provider_id_changes_move_the_message ... ok
+test tests::series_edits_and_deletes_follow_the_scope ... ok
+test tests::settings_round_trip_and_recipients ... ok
+test tests::server_settings_round_trip_and_cascade ... ok
+test tests::search_and_coverage ... ok
+test tests::v11_tables_accept_folder_and_pop3_rows ... ok
+test tests::trash_and_untrash_round_trip ... ok
+test tests::remote_merge_respects_pending_intent_and_keeps_bodies ... ok
+test tests::pop3_seen_rows_round_trip_and_backup_reopens ... ok
+
+test result: ok. 26 passed; 0 failed; 0 ignored; 0 measured; 0 filtered out; finished in 0.26s
+
+   Doc-tests overlook_core
+
+running 0 tests
+
+test result: ok. 0 passed; 0 failed; 0 ignored; 0 measured; 0 filtered out; finished in 0.00s
+
+   Doc-tests overlook_provider
+
+running 0 tests
+
+test result: ok. 0 passed; 0 failed; 0 ignored; 0 measured; 0 filtered out; finished in 0.00s
+
+   Doc-tests overlook_store
+
+running 0 tests
+
+test result: ok. 0 passed; 0 failed; 0 ignored; 0 measured; 0 filtered out; finished in 0.00s
+

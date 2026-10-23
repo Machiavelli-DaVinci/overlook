@@ -82,6 +82,10 @@ id_type!(
     CalendarId
 );
 id_type!(
+    /// Local identity of an independently configured calendar connection.
+    CalendarConnectionId
+);
+id_type!(
     /// Local identifier of a calendar event (an expanded instance for recurring events).
     EventId
 );

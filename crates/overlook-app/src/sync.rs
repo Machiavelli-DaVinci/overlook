@@ -1410,6 +1410,7 @@ mod tests {
         // The server copy shows up later (a retried APPEND elsewhere, or another client):
         // it is the same message, not a second one.
         let rfc = local.rfc_message_id.clone().unwrap();
+        env.smtp.wait_for_connections(1);
         let data = env.smtp.messages().remove(0);
         env.imap.lock().folder_mut("Sent").add(FakeMessage::new(&["\\Seen"], "14-Oct-2026 12:00:00 +0000", data));
         let outcome = block_on(run_sync(store.clone(), live.clone(), None, env.account.clone()));

@@ -642,7 +642,7 @@ fn send_submits_over_smtp_appends_to_sent_and_reconciles() {
     assert_eq!(m.label_ids.iter().collect::<Vec<_>>(), vec![&sent_label]);
     assert_eq!(m.subject, "Agenda");
     {
-        let seen = smtp.seen.lock().unwrap();
+        let seen = smtp.wait_for_connections(1);
         assert_eq!(seen.len(), 1);
         assert_eq!(seen[0].auth, Some(("jason@example.com".into(), "smtp-secret".into())), "the outgoing password is used");
         assert_eq!(seen[0].rcpt, vec!["RCPT TO:<maya@northstar.example>", "RCPT TO:<alex@studio.example>"]);
@@ -714,7 +714,7 @@ fn a_failed_sent_copy_still_counts_as_sent() {
     assert!(is_local_placeholder(&receipt.provider_id), "{:?}", receipt.provider_id);
     assert!(MessageRef::parse(&receipt.provider_id).is_none(), "never mistaken for a server message");
     assert_eq!(receipt.message.label_ids.iter().map(|l| l.as_str()).collect::<Vec<_>>(), vec!["imap:jason@example.com:Sent"]);
-    assert_eq!(smtp.seen.lock().unwrap().len(), 1);
+    assert_eq!(smtp.wait_for_connections(1).len(), 1);
 
     // The APPEND reply is lost: the retry finds the copy instead of appending twice.
     server.lock().drop_after_next = Some("APPEND".into());
@@ -724,7 +724,7 @@ fn a_failed_sent_copy_still_counts_as_sent() {
     let s = server.lock();
     assert_eq!(s.folder("Sent").messages.len(), 2, "one copy");
     assert_eq!(s.commands("APPEND"), 2);
-    assert_eq!(smtp.seen.lock().unwrap().len(), 2, "SMTP is never retried on its own");
+    assert_eq!(smtp.wait_for_connections(2).len(), 2, "SMTP is never retried on its own");
 
     // No Sent folder at all: local copy with the context's label.
     drop(s);

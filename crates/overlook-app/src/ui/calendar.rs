@@ -14,7 +14,7 @@ use gpui_kit::component::notification::Notification;
 use gpui_kit::component::scroll::ScrollableElement;
 use gpui_kit::component::switch::Switch;
 use gpui_kit::component::text::TextView;
-use gpui_kit::component::{Sizable, WindowExt};
+use gpui_kit::component::{Disableable, Sizable, WindowExt};
 use gpui_kit::prelude::*;
 use gpui_kit::*;
 use overlook_core::sanitize::{sanitize_html, text_to_html, RemoteContent};
@@ -44,6 +44,7 @@ const AGENDA_DAYS: i32 = 14;
 pub struct NewEvent {
     pub title: Entity<InputState>,
     pub date: Entity<InputState>,
+    pub end_date: Entity<InputState>,
     pub start: Entity<InputState>,
     pub end: Entity<InputState>,
     pub location: Entity<InputState>,
@@ -59,6 +60,8 @@ pub struct NewEvent {
     pub error: Option<String>,
     /// `Some` when editing an existing event.
     pub editing: Option<EventId>,
+    /// Preserve the version the editor opened, so a refresh cannot silently rebase it.
+    pub original: Option<Event>,
     /// For a repeating event: which occurrences the edit applies to.
     pub scope: RecurrenceScope,
 }
@@ -100,7 +103,11 @@ impl CalDrag {
     /// The times the drag currently proposes, snapped to 15 minutes.
     pub fn proposed(&self) -> (i64, i64) {
         let minutes = ((self.dy / HOUR_PX * 60.) / 15.).round() as i64 * 15;
-        let shift = minutes * 60_000 + self.day_offset as i64 * 86_400_000;
+        let day_shift = if self.day_offset == 0 { 0 } else {
+            let date = tz::local_date(tz::add_days(self.start, self.day_offset));
+            tz::local_datetime(date, tz::zoned(self.start).time()) - self.start
+        };
+        let shift = minutes * 60_000 + day_shift;
         match self.mode {
             DragMode::Move => (self.start + shift, self.end + shift),
             DragMode::Resize => (self.start, (self.end + minutes * 60_000).max(self.start + 15 * 60_000)),
@@ -143,6 +150,18 @@ impl MailWindow {
             self.cal_events.retain(|e| e.my_response() != Some(ResponseStatus::Declined));
         }
         self.cal_status = crate::sync::calendar_status(&self.store, &self.account.id);
+        self.caldav_connection = self.store.calendar_connection(&self.account.id).ok().flatten();
+        self.caldav_cached = self.caldav_connection.as_ref().is_some_and(|c| self.store.caldav_range_cached(&c.id, from, to, &format!("{:?}", tz::system_zone())).unwrap_or(false));
+        self.caldav_last_sync = self.caldav_connection.as_ref().and_then(|c| self.store.caldav_last_sync(&c.id).ok().flatten());
+        self.caldav_changes = self.store.caldav_changes(&self.account.id).unwrap_or_default();
+        self.caldav_previews = self.caldav_changes.iter().filter_map(|change| {
+            change.remote.as_ref().map(|remote| (change.id.clone(), overlook_provider::caldav::resource_preview(&remote.icalendar)))
+        }).collect();
+        // Date-only and floating projections depend on the local zone. Preserve them on
+        // disk, but don't present an old-zone projection as the current calendar.
+        if self.caldav_connection.as_ref().is_some_and(|c| !self.store.caldav_timezone_matches(&c.id, &format!("{:?}", tz::system_zone())).unwrap_or(false)) {
+            self.cal_events.clear();
+        }
         if let Some(sel) = &self.cal_selected {
             if self.store.event(sel).ok().flatten().is_none() {
                 self.cal_selected = None;
@@ -152,6 +171,7 @@ impl MailWindow {
 
     pub(crate) fn set_module(&mut self, module: Module, window: &mut Window, cx: &mut Context<Self>) {
         if self.module == module {
+            self.focus_current_module(window, cx);
             return;
         }
         self.module = module;
@@ -159,6 +179,7 @@ impl MailWindow {
         match module {
             Module::Calendar => {
                 self.reload_calendar();
+                self.ensure_caldav_range(cx);
                 self.cal_focus.focus(window, cx);
             }
             Module::Contacts => {
@@ -171,9 +192,18 @@ impl MailWindow {
         cx.notify();
     }
 
+    pub(crate) fn focus_current_module(&self, window: &mut Window, cx: &mut Context<Self>) {
+        match self.module {
+            Module::Calendar => self.cal_focus.focus(window, cx),
+            Module::Contacts => self.contact_search.update(cx, |s, cx| s.focus(window, cx)),
+            Module::Mail => self.list_focus.focus(window, cx),
+        }
+    }
+
     pub(crate) fn set_cal_view(&mut self, view: CalView, cx: &mut Context<Self>) {
         self.cal_view = view;
         self.reload_calendar();
+        self.ensure_caldav_range(cx);
         cx.notify();
     }
 
@@ -185,12 +215,14 @@ impl MailWindow {
             CalView::Agenda => tz::add_days(self.cal_anchor, direction * AGENDA_DAYS),
         };
         self.reload_calendar();
+        self.ensure_caldav_range(cx);
         cx.notify();
     }
 
     pub(crate) fn cal_today(&mut self, cx: &mut Context<Self>) {
         self.cal_anchor = tz::day_start(now());
         self.reload_calendar();
+        self.ensure_caldav_range(cx);
         cx.notify();
     }
 
@@ -211,6 +243,11 @@ impl MailWindow {
         self.calendars.iter().find(|c| c.id == event.calendar_id)
     }
 
+    fn can_edit_calendar_event(&self, event: &Event) -> bool {
+        self.calendar_of(event).is_some_and(|c| event.editable_by(&self.account.email,c))
+            && (!event.calendar_id.0.starts_with("caldav:") || event.attendees.is_empty())
+    }
+
     /// Switches to the calendar, moves to the event's day, and selects it.
     pub(crate) fn show_event_in_calendar(&mut self, id: EventId, window: &mut Window, cx: &mut Context<Self>) {
         let Some(event) = self.store.event(&id).ok().flatten() else { return };
@@ -221,6 +258,7 @@ impl MailWindow {
         }
         self.new_event = None;
         self.reload_calendar();
+        self.ensure_caldav_range(cx);
         self.cal_selected = Some(id);
         cx.notify();
     }
@@ -235,6 +273,7 @@ impl MailWindow {
         let horizon = now_ms + 2 * 3_600_000;
         let accounts = self.accounts.clone();
         for account in accounts {
+            if self.store.calendar_connection(&account.id).ok().flatten().is_some_and(|c| !self.store.caldav_timezone_matches(&c.id, &format!("{:?}", tz::system_zone())).unwrap_or(false)) { continue; }
             let calendars = self.store.calendars(&account.id).unwrap_or_default();
             let Ok(events) = self.store.events_starting_between(&account.id, now_ms - 60_000, horizon) else { continue };
             for event in events {
@@ -303,6 +342,7 @@ impl MailWindow {
 
     /// Edit or delete on a repeating event asks for the scope first.
     pub(crate) fn request_edit_event(&mut self, id: EventId, window: &mut Window, cx: &mut Context<Self>) {
+        if self.store.event(&id).ok().flatten().is_some_and(|e| !self.can_edit_calendar_event(&e)) { return; }
         match self.store.event(&id).ok().flatten() {
             Some(e) if e.is_recurring_instance() => {
                 self.cal_scope_prompt = Some(ScopePrompt { event_id: id, action: ScopeAction::Edit });
@@ -313,6 +353,7 @@ impl MailWindow {
     }
 
     pub(crate) fn request_delete_event(&mut self, id: EventId, window: &mut Window, cx: &mut Context<Self>) {
+        if self.store.event(&id).ok().flatten().is_some_and(|e| !self.can_edit_calendar_event(&e)) { return; }
         match self.store.event(&id).ok().flatten() {
             Some(e) if e.is_recurring_instance() => {
                 self.cal_scope_prompt = Some(ScopePrompt { event_id: id, action: ScopeAction::Delete });
@@ -332,17 +373,19 @@ impl MailWindow {
 
     pub(crate) fn start_edit_event_scoped(&mut self, id: EventId, scope: RecurrenceScope, window: &mut Window, cx: &mut Context<Self>) {
         let Some(event) = self.store.event(&id).ok().flatten() else { return };
+        if !self.can_edit_calendar_event(&event) { return; }
         let guest_text = event.attendees.iter().filter(|a| !a.is_self).map(|a| a.email.clone()).collect::<Vec<_>>().join(", ");
         let guests = cx.new(|cx| InputState::new(window, cx).placeholder("Guests, comma separated").default_value(guest_text));
         let add_meet = event.conference_url.is_some() || event.wants_conference;
         let title = cx.new(|cx| InputState::new(window, cx).placeholder("Add a title").default_value(event.summary.clone()));
         let date = cx.new(|cx| InputState::new(window, cx).placeholder("YYYY-MM-DD").default_value(tz::local_date(event.start).to_string()));
+        let end_date = cx.new(|cx| InputState::new(window,cx).placeholder("YYYY-MM-DD").default_value(tz::local_date(if event.all_day {tz::add_days(event.end,-1)} else {event.end}).to_string()));
         let start = cx.new(|cx| InputState::new(window, cx).placeholder("9:00 AM").default_value(clock_text(event.start)));
         let end = cx.new(|cx| InputState::new(window, cx).placeholder("10:00 AM").default_value(clock_text(if event.all_day { event.start + 3_600_000 } else { event.end })));
         let location = cx.new(|cx| InputState::new(window, cx).placeholder("Add a location").default_value(event.location.clone().unwrap_or_default()));
         let description = cx.new(|cx| TextareaState::new(window, cx).placeholder("Add a description").default_value(event.description.clone().unwrap_or_default()));
         title.update(cx, |s, cx| s.focus(window, cx));
-        self.new_event = Some(NewEvent { title, date, start, end, location, description, guests, add_meet, availability: Vec::new(), checking: false, calendar: Some(event.calendar_id.clone()), all_day: event.all_day, error: None, editing: Some(id), scope });
+        self.new_event = Some(NewEvent { title, date, end_date, start, end, location, description, guests, add_meet, availability: Vec::new(), checking: false, calendar: Some(event.calendar_id.clone()), all_day: event.all_day, error: None, editing: Some(id), original: Some(event), scope });
         cx.notify();
     }
 
@@ -386,18 +429,21 @@ impl MailWindow {
     /// Start and end from the form's date and clock fields.
     fn form_times(&self, form: &NewEvent, cx: &App) -> Option<(i64, i64)> {
         let date = tz::parse_date(form.date.read(cx).value().trim())?;
+        let end_date = tz::parse_date(form.end_date.read(cx).value().trim())?;
         if form.all_day {
             let s = tz::date_start(date);
-            return Some((s, tz::add_days(s, 1)));
+            let end = tz::add_days(tz::date_start(end_date),1);
+            return (end>s).then_some((s,end));
         }
         let st = tz::parse_clock(form.start.read(cx).value().trim())?;
         let et = tz::parse_clock(form.end.read(cx).value().trim())?;
-        let (s, e) = (tz::local_datetime(date, st), tz::local_datetime(date, et));
+        let (s, e) = (tz::local_datetime(date, st), tz::local_datetime(end_date, et));
         (e > s).then_some((s, e))
     }
 
     pub(crate) fn respond_to_event(&mut self, id: EventId, response: ResponseStatus, window: &mut Window, cx: &mut Context<Self>) {
         let Some(mut event) = self.store.event(&id).ok().flatten() else { return };
+        if event.id.0.starts_with("caldav:") { return; }
         let mut found = false;
         for a in &mut event.attendees {
             if a.is_self {
@@ -422,6 +468,13 @@ impl MailWindow {
 
     pub(crate) fn delete_event_scoped(&mut self, id: EventId, scope: RecurrenceScope, window: &mut Window, cx: &mut Context<Self>) {
         let Some(event) = self.store.event(&id).ok().flatten() else { return };
+        if event.calendar_id.0.starts_with("caldav:") {
+            match self.save_caldav_edit(Some(event),None,scope,cx) {
+                Ok(_) => { self.cal_selected=None; crate::ui::toast(window,cx,crate::notify::Level::Info,"Deletion saved on this device. It will sync when connected."); },
+                Err(e) => crate::ui::toast(window,cx,crate::notify::Level::Error,e),
+            }
+            cx.notify(); return;
+        }
         match self.store.delete_event_locally_scoped(&self.account.id, &event, scope) {
             Ok(_) => {
                 self.cal_selected = None;
@@ -447,7 +500,7 @@ impl MailWindow {
             crate::ui::toast(window, cx, crate::notify::Level::Warning, "No calendar you can write to is connected yet.");
             return;
         }
-        let calendar = editable.iter().find(|c| c.is_primary).or(editable.first()).map(|c| c.id.clone());
+        let calendar = self.account_prefs_for(&self.account.id).preferred_calendar(&self.calendars).map(|c| c.id.clone());
         let day = if self.cal_view == CalView::Week { tz::day_start(now()).max(self.cal_range().0).min(tz::add_days(self.cal_range().1, -1)) } else { self.cal_anchor };
         let date_text = tz::local_date(day).to_string();
         let next_hour = {
@@ -463,7 +516,8 @@ impl MailWindow {
             format!("{}:{:02} {}", if h % 12 == 0 { 12 } else { h % 12 }, m, if h < 12 { "AM" } else { "PM" })
         };
         let title = cx.new(|cx| InputState::new(window, cx).placeholder("Add a title"));
-        let date = cx.new(|cx| InputState::new(window, cx).placeholder("YYYY-MM-DD").default_value(date_text));
+        let date = cx.new(|cx| InputState::new(window, cx).placeholder("YYYY-MM-DD").default_value(date_text.clone()));
+        let end_date = cx.new(|cx| InputState::new(window,cx).placeholder("YYYY-MM-DD").default_value(date_text));
         let start = cx.new(|cx| InputState::new(window, cx).placeholder("9:00 AM").default_value(next_hour));
         let end = cx.new(|cx| InputState::new(window, cx).placeholder("10:00 AM").default_value(end_hour));
         let location = cx.new(|cx| InputState::new(window, cx).placeholder("Add a location"));
@@ -472,7 +526,7 @@ impl MailWindow {
         title.update(cx, |s, cx| s.focus(window, cx));
         self.cal_selected = None;
         self.cal_scope_prompt = None;
-        self.new_event = Some(NewEvent { title, date, start, end, location, description, guests, add_meet: false, availability: Vec::new(), checking: false, calendar, all_day: false, error: None, editing: None, scope: RecurrenceScope::This });
+        self.new_event = Some(NewEvent { title, date, end_date, start, end, location, description, guests, add_meet: false, availability: Vec::new(), checking: false, calendar, all_day: false, error: None, editing: None, original: None, scope: RecurrenceScope::This });
         cx.notify();
     }
 
@@ -486,6 +540,7 @@ impl MailWindow {
         let Some(form) = self.new_event.as_ref() else { return };
         let title = form.title.read(cx).value().trim().to_owned();
         let date_text = form.date.read(cx).value().trim().to_owned();
+        let end_date_text = form.end_date.read(cx).value().trim().to_owned();
         let start_text = form.start.read(cx).value().trim().to_owned();
         let end_text = form.end.read(cx).value().trim().to_owned();
         let location = form.location.read(cx).value().trim().to_owned();
@@ -495,6 +550,7 @@ impl MailWindow {
         let scope = form.scope;
         let all_day = form.all_day;
         let editing = form.editing.clone();
+        let original = form.original.clone();
         let calendar = form.calendar.clone().and_then(|id| self.calendars.iter().find(|c| c.id == id).cloned());
         let fail = |msg: &str, this: &mut Self, cx: &mut Context<Self>| {
             if let Some(f) = this.new_event.as_mut() {
@@ -503,31 +559,44 @@ impl MailWindow {
             cx.notify();
         };
         let Some(calendar) = calendar else { return fail("Choose a calendar.", self, cx) };
+        if !calendar.can_edit { return fail("This calendar is available for viewing only.", self, cx); }
         let Some(date) = tz::parse_date(&date_text) else { return fail("Enter the date as YYYY-MM-DD.", self, cx) };
+        let Some(end_date) = tz::parse_date(&end_date_text) else {return fail("Enter the end date as YYYY-MM-DD.",self,cx)};
         let (start, end) = if all_day {
             let s = tz::date_start(date);
-            (s, tz::add_days(s, 1))
+            let end = tz::add_days(tz::date_start(end_date),1);
+            if end<=s {return fail("The end date must not precede the start date.",self,cx);}
+            (s,end)
         } else {
             let Some(st) = tz::parse_clock(&start_text) else { return fail("Enter a start time like 9:30 AM.", self, cx) };
             let Some(et) = tz::parse_clock(&end_text) else { return fail("Enter an end time like 10:00 AM.", self, cx) };
             let s = tz::local_datetime(date, st);
-            let e = tz::local_datetime(date, et);
+            let e = tz::local_datetime(end_date, et);
             if e <= s {
                 return fail("The end time must be after the start time.", self, cx);
             }
             (s, e)
         };
         if let Some(existing_id) = editing {
-            let Some(mut existing) = self.store.event(&existing_id).ok().flatten() else { return fail("This event no longer exists.", self, cx) };
+            let Some(mut existing) = original.clone().or_else(||self.store.event(&existing_id).ok().flatten()) else { return fail("This event no longer exists.", self, cx) };
             existing.summary = if title.is_empty() { "(No title)".into() } else { title };
             existing.location = if location.is_empty() { None } else { Some(location) };
             existing.description = if description.is_empty() { None } else { Some(description) };
             existing.start = start;
             existing.end = end;
             existing.all_day = all_day;
-            existing.attendees = merge_guests(&existing.attendees, &guest_addresses, &self.owner());
-            existing.wants_conference = add_meet;
+            if !calendar.id.0.starts_with("caldav:") {
+                existing.attendees = merge_guests(&existing.attendees, &guest_addresses, &self.owner());
+                existing.wants_conference = add_meet;
+            }
             existing.updated = now();
+            if calendar.id.0.starts_with("caldav:") {
+                match self.save_caldav_edit(original,Some(existing),scope,cx) {
+                    Ok(id)=>{self.new_event=None;self.cal_anchor=tz::day_start(start);self.reload_calendar();self.cal_selected=Some(id);self.cal_focus.focus(window,cx);cx.notify();crate::ui::toast(window,cx,crate::notify::Level::Info,"Saved on this device. Changes will sync when connected.");},
+                    Err(e)=>fail(&e,self,cx),
+                }
+                return;
+            }
             match self.store.apply_series_change(&self.account.id, &existing, scope) {
                 Ok(_) => {
                     self.new_event = None;
@@ -572,6 +641,13 @@ impl MailWindow {
             wants_conference: add_meet,
             pending: true,
         };
+        if calendar.id.0.starts_with("caldav:") {
+            match self.save_caldav_edit(None,Some(event),scope,cx) {
+                Ok(id)=>{self.new_event=None;self.cal_anchor=tz::day_start(start);self.reload_calendar();self.cal_selected=Some(id);self.cal_focus.focus(window,cx);cx.notify();crate::ui::toast(window,cx,crate::notify::Level::Info,"Saved on this device. Changes will sync when connected.");},
+                Err(e)=>fail(&e,self,cx),
+            }
+            return;
+        }
         match self.store.apply_event_change(&self.account.id, &event, OperationKind::CreateEvent { event_id: event.id.clone() }) {
             Ok(_) => {
                 self.new_event = None;
@@ -588,6 +664,8 @@ impl MailWindow {
             Err(e) => fail(&format!("Couldn’t save the event: {e}"), self, cx),
         }
     }
+
+
 
     // --------------------------------------------------------------- sidebar
 
@@ -646,6 +724,7 @@ impl MailWindow {
             .pb(px(14.))
             .child(
                 Button::new("new-event")
+                    .disabled(!self.calendars.iter().any(|c| c.can_edit))
                     .primary()
                     .icon(icon("calendar-plus").size(px(16.)))
                     .label("New event")
@@ -733,19 +812,40 @@ impl MailWindow {
                         .child(Button::new("cal-signin").small().label("Sign in again").on_click(cx.listener(move |this, _, window, cx| this.start_google_sign_in(Some(email.clone()), window, cx)))),
                 )
             }
-            _ if matches!(self.account.provider, ProviderKind::Imap | ProviderKind::Pop3) => Some(
+            _ if matches!(self.account.provider, ProviderKind::Imap | ProviderKind::Pop3)
+                && (self.caldav_connection.is_none()
+                    || !self.caldav_cached
+                    || !self.caldav_changes.is_empty()
+                    || !matches!(self.cal_status, SyncState::UpToDate | SyncState::Syncing)) => Some(
                 h_flex()
                     .items_center()
                     .gap(px(10.))
                     .px(px(16.))
-                    .h(px(40.))
+                    .min_h(px(40.))
+                    .py(px(8.))
                     .bg(p.chip)
                     .border_b_1()
                     .border_color(p.divider)
                     .text_size(px(13.))
                     .text_color(p.muted)
                     .child(icon("info").size(px(16.)).text_color(p.muted))
-                    .child("This account has no calendar. Calendars come with Gmail accounts; switch accounts to see one."),
+                    .child(div().flex_1().child(if self.caldav_connection.is_none() {
+                        "Connect Fastmail or another calendar service to see your events here.".to_owned()
+                    } else {
+                        match &self.cal_status {
+                            SyncState::Syncing => "Syncing calendar changes… Saved events remain available.".to_owned(),
+                            SyncState::SignInRequired => "Calendar sign-in needs attention. Check the app password and calendar permission in settings.".to_owned(),
+                            SyncState::SyncFailed(error) | SyncState::Paused(error) => error.clone(),
+                            _ if !self.caldav_cached => "This date range has not been downloaded for your current time zone. Connect to sync it; saved events may be incomplete.".to_owned(),
+                            SyncState::Offline => "Offline · Changes are saved on this device and will sync when you reconnect.".to_owned(),
+                            _ => "Changes are saved on this device and waiting to sync.".to_owned(),
+                        }
+                    }))
+                    .when(!self.caldav_changes.is_empty(), |d| d.child(Button::new("caldav-review").small().label(format!("Review {} {}",self.caldav_changes.len(),if self.caldav_changes.len()==1 {"change"} else {"changes"})).on_click(cx.listener(|this,_,_,cx|{this.show_caldav_changes = !this.show_caldav_changes;cx.notify();}))))
+                    .child(Button::new("caldav-settings").small().label(if self.caldav_connection.is_some() { "Calendar settings" } else { "Connect calendars" })
+                        .on_click(cx.listener(|this, _, window, cx| this.open_settings(super::settings::SettingsPage::Accounts, window, cx))))
+                    .when(self.caldav_connection.is_some(), |d| d.child(Button::new("caldav-refresh").small().ghost().label("Sync now")
+                        .on_click(cx.listener(|this, _, _, cx| this.sync_caldav_account(this.account.id.clone(), true, cx))))),
             ),
             _ if self.account.provider == ProviderKind::Sample && self.cal_status != SyncState::UpToDate => Some(
                 h_flex()
@@ -785,6 +885,7 @@ impl MailWindow {
             .bg(p.surface)
             .child(toolbar)
             .children(banner)
+            .when(self.show_caldav_changes, |d|d.child(self.render_caldav_changes(cx)))
             .child(
                 h_flex()
                     .flex_1()
@@ -970,9 +1071,15 @@ impl MailWindow {
             return;
         }
         let Some(mut event) = self.store.event(&drag.event_id).ok().flatten() else { return };
+        let original = event.clone();
         event.start = start;
         event.end = end;
         event.updated = now();
+        if event.calendar_id.0.starts_with("caldav:") {
+            if original.start!=drag.start || original.end!=drag.end {crate::ui::toast(window,cx,crate::notify::Level::Warning,"The event changed during the drag. Try again.");return;}
+            if let Err(e)=self.save_caldav_edit(Some(original),Some(event),RecurrenceScope::This,cx){crate::ui::toast(window,cx,crate::notify::Level::Error,e);}
+            cx.notify();return;
+        }
         match self.store.apply_event_change(&self.account.id, &event, OperationKind::UpdateEvent { event_id: event.id.clone(), scope: RecurrenceScope::This }) {
             Ok(_) => {
                 self.reload_calendar();
@@ -1016,7 +1123,7 @@ impl MailWindow {
         let dragging = self.cal_drag.as_ref().is_some_and(|d| d.event_id == e.id && d.moved);
         let declined = e.my_response() == Some(ResponseStatus::Declined);
         let tentative = matches!(e.my_response(), Some(ResponseStatus::NeedsAction) | Some(ResponseStatus::Tentative)) && e.is_invitation();
-        let can_edit = self.calendar_of(e).is_some_and(|c| e.editable_by(&self.account.email, c));
+        let can_edit = self.can_edit_calendar_event(e);
         let id = e.id.clone();
         let (start_ms, end_ms) = (e.start, e.end);
         let begin_drag = move |mode: DragMode, id: EventId, y: f32| CalDrag { event_id: id, mode, origin_y: y, origin_day: day_index, day_offset: 0, dy: 0., start: start_ms, end: end_ms, moved: false };
@@ -1256,8 +1363,8 @@ impl MailWindow {
         let (fill, edge) = self.event_colors(e, &p);
         let calendar = self.calendar_of(e);
         let when = if e.all_day {
-            let days = ((e.end - e.start) / 86_400_000).max(1);
-            if days == 1 { format!("{} · All day", tz::format_day(e.start)) } else { format!("{} – {} · All day", tz::format_day(e.start), tz::format_day(tz::add_days(e.end, -1))) }
+            let single_day = tz::local_date(e.end) <= tz::local_date(tz::add_days(e.start, 1));
+            if single_day { format!("{} · All day", tz::format_day(e.start)) } else { format!("{} – {} · All day", tz::format_day(e.start), tz::format_day(tz::add_days(e.end, -1))) }
         } else if tz::day_start(e.start) == tz::day_start(e.end) || e.end == tz::add_days(tz::day_start(e.start), 1) {
             format!("{} · {} – {}", tz::zoned(e.start).strftime("%A, %B %-d"), tz::format_clock(e.start), tz::format_clock(e.end))
         } else {
@@ -1265,7 +1372,7 @@ impl MailWindow {
         };
         let my = e.my_response();
         let id = e.id.clone();
-        let can_edit = calendar.is_some_and(|c| e.editable_by(&self.account.email, c));
+        let can_edit = self.can_edit_calendar_event(e);
         let can_delete = can_edit;
         let fallback = self.prefs.default_reminder_minutes as i32;
         let defaults: Vec<i32> = calendar.map(|c| c.default_reminders.clone()).filter(|d| !d.is_empty()).unwrap_or_else(|| if fallback > 0 { vec![fallback] } else { Vec::new() });
@@ -1315,8 +1422,8 @@ impl MailWindow {
                         .flex_wrap()
                         .gap(px(6.))
                         .child(choice("This event", RecurrenceScope::This, cx))
-                        .child(choice("This and following", RecurrenceScope::Following, cx))
-                        .child(choice("All events", RecurrenceScope::All, cx))
+                        .when(!e.calendar_id.0.starts_with("caldav:"),|d|d.child(choice("This and following", RecurrenceScope::Following, cx)))
+                        .when(!e.calendar_id.0.starts_with("caldav:") || matches!(prompt.action,ScopeAction::Delete),|d|d.child(choice("All events", RecurrenceScope::All, cx)))
                         .child(Button::new("scope-cancel").ghost().small().label("Cancel").on_click(cx.listener(|this, _, _w, cx| {
                             this.cal_scope_prompt = None;
                             cx.notify();
@@ -1346,7 +1453,7 @@ impl MailWindow {
                 .children(calendar.map(|c| h_flex().gap(px(8.)).items_center().child(icon("calendar").size(px(15.)).text_color(p.muted)).child(c.name.clone())))
                 .children(reminder_text.map(|t| h_flex().gap(px(8.)).items_center().child(icon("bell").size(px(15.)).text_color(p.muted)).child(format!("Reminder {t}"))))
                 .when(e.pending, |d| d.child(h_flex().gap(px(8.)).items_center().text_color(p.warning).child(icon("cloud-off").size(px(15.)).text_color(p.warning)).child("Saved on this device, waiting to sync"))))
-            .when(e.is_invitation(), |d| {
+            .when(e.is_invitation() && !e.id.0.starts_with("caldav:"), |d| {
                 d.child(
                     v_flex()
                         .gap(px(8.))
@@ -1412,6 +1519,7 @@ impl MailWindow {
     fn render_new_event(&self, cx: &mut Context<Self>) -> impl IntoElement {
         let p = *cx.palette();
         let Some(form) = self.new_event.as_ref() else { return div().into_any_element() };
+        let caldav = form.calendar.as_ref().is_some_and(|id|id.0.starts_with("caldav:"));
         let calendar_name = form.calendar.as_ref().and_then(|id| self.calendars.iter().find(|c| &c.id == id)).map(|c| c.name.clone()).unwrap_or_else(|| "Choose…".into());
         let editable: Vec<(CalendarId, String)> = self.calendars.iter().filter(|c| c.can_edit).map(|c| (c.id.clone(), c.name.clone())).collect();
         let this = cx.entity().downgrade();
@@ -1424,17 +1532,18 @@ impl MailWindow {
             .p(px(20.))
             .gap(px(12.))
             .child(h_flex().items_center().child(div().flex_1().text_size(px(16.)).font_weight(FontWeight::SEMIBOLD).child(if form.editing.is_some() { "Edit event" } else { "New event" })).child(Button::new("cancel-new-event").ghost().xsmall().icon(icon("x").size(px(14.))).on_click(cx.listener(|this, _, window, cx| this.cancel_new_event(window, cx)))))
-            .child(field("Title", Input::new(&form.title).into_any_element()))
-            .child(field("Date", Input::new(&form.date).into_any_element()))
+            .child(field("Title", Input::new(&form.title).aria_label("Event title").into_any_element()))
+            .child(h_flex().gap(px(8.)).child(div().flex_1().min_w_0().child(field("Starts on", Input::new(&form.date).aria_label("Event start date").into_any_element())))
+                .child(div().flex_1().min_w_0().child(field("Ends on",Input::new(&form.end_date).aria_label("Event end date").into_any_element()))))
             .child(h_flex().items_center().gap(px(10.)).child(Switch::new("all-day").checked(form.all_day).label("All day").on_click(cx.listener(|this, checked: &bool, _w, cx| {
                 if let Some(f) = this.new_event.as_mut() {
                     f.all_day = *checked;
                 }
                 cx.notify();
             }))))
-            .when(!form.all_day, |d| d.child(h_flex().gap(px(10.)).child(div().flex_1().child(field("Start", Input::new(&form.start).into_any_element()))).child(div().flex_1().child(field("End", Input::new(&form.end).into_any_element())))))
-            .child(field("Location", Input::new(&form.location).into_any_element()))
-            .child(field(
+            .when(!form.all_day, |d| d.child(h_flex().gap(px(10.)).child(div().flex_1().child(field("Start", Input::new(&form.start).aria_label("Event start time").into_any_element()))).child(div().flex_1().child(field("End", Input::new(&form.end).aria_label("Event end time").into_any_element())))))
+            .child(field("Location", Input::new(&form.location).aria_label("Event location").into_any_element()))
+            .when(!caldav,|d|d.child(field(
                 "Guests",
                 v_flex()
                     .gap(px(6.))
@@ -1462,13 +1571,13 @@ impl MailWindow {
                             ),
                     )
                     .into_any_element(),
-            ))
-            .child(h_flex().items_center().gap(px(10.)).child(Switch::new("add-meet").checked(form.add_meet).label("Add a Google Meet link").on_click(cx.listener(|this, checked: &bool, _w, cx| {
+            )))
+            .when(!caldav,|d|d.child(h_flex().items_center().gap(px(10.)).child(Switch::new("add-meet").checked(form.add_meet).label("Add a Google Meet link").on_click(cx.listener(|this, checked: &bool, _w, cx| {
                 if let Some(f) = this.new_event.as_mut() {
                     f.add_meet = *checked;
                 }
                 cx.notify();
-            }))))
+            })))))
             .when(form.editing.is_some() && form.scope != RecurrenceScope::This, |d| {
                 d.child(h_flex().items_center().gap(px(6.)).text_size(px(12.)).text_color(p.muted).child(icon("repeat").size(px(13.))).child(format!("Applies to: {}", form.scope.label().to_lowercase())))
             })
@@ -1498,7 +1607,7 @@ impl MailWindow {
             )))
             .children(form.error.clone().map(|e| h_flex().gap(px(6.)).items_center().text_size(px(12.)).text_color(p.error).child(icon("circle-alert").size(px(14.)).text_color(p.error)).child(e)))
             .child(div().flex_1())
-            .child(h_flex().gap(px(8.)).child(Button::new("save-event").primary().label("Save").on_click(cx.listener(|this, _, window, cx| this.save_new_event(window, cx)))).child(Button::new("discard-event").ghost().label("Cancel").on_click(cx.listener(|this, _, window, cx| this.cancel_new_event(window, cx)))))
+            .child(h_flex().gap(px(8.)).child(Button::new("save-event").primary().label("Save").tooltip("Save event (Ctrl S)").on_click(cx.listener(|this, _, window, cx| this.save_new_event(window, cx)))).child(Button::new("discard-event").ghost().label("Cancel").on_click(cx.listener(|this, _, window, cx| this.cancel_new_event(window, cx)))))
             .into_any_element()
     }
 }
@@ -1558,4 +1667,29 @@ fn merge_guests(existing: &[Attendee], guests: &[Address], owner: &Address) -> V
     let me = existing.iter().find(|a| a.is_self).cloned().unwrap_or(Attendee { email: owner.email.clone(), name: owner.name.clone(), response: ResponseStatus::Accepted, is_self: true, is_organizer: true, optional: false });
     out.insert(0, me);
     out
+}
+
+#[cfg(test)]
+mod calendar_drag_tests {
+    use super::{CalDrag, DragMode};
+    use overlook_core::{tz, EventId};
+
+    #[test]
+    fn dragging_between_days_preserves_wall_clock_time_across_dst() {
+        // Also run in a separate TZ=Europe/Berlin process to exercise both transitions.
+        for date in ["2026-03-28", "2026-10-24"] {
+            let start = tz::date_start(tz::parse_date(date).unwrap()) + 9 * 3_600_000;
+            let mut drag = CalDrag { event_id: EventId::from("drag-test"), mode: DragMode::Move,
+                origin_y: 0., origin_day: 0, day_offset: 1, dy: 0., start,
+                end: start + 3_600_000, moved: true };
+            let (moved, end) = drag.proposed();
+            assert_eq!(tz::minutes_into_day(moved), tz::minutes_into_day(start));
+            assert_eq!(tz::local_date(moved), tz::local_date(tz::add_days(start, 1)));
+            assert_eq!(end - moved, 3_600_000);
+            drag.start = moved;
+            drag.end = end;
+            drag.day_offset = -1;
+            assert_eq!(drag.proposed(), (start, start + 3_600_000));
+        }
+    }
 }

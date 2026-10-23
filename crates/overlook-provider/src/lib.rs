@@ -7,6 +7,7 @@
 
 pub mod autoconfig;
 pub mod calendar;
+pub mod caldav;
 pub mod gmail;
 pub mod imap;
 pub mod mime;

@@ -1,0 +1,32 @@
+Live Overlook Google login session — 22 October 2026
+Captured from the actual isolated application profile, after user-completed Google sign-in.
+Account identifiers and names are redacted; no credential values were retrieved from the keyring.
+The log does not contain an explicit OAuth-success event; successful authenticated sync and keyring metadata corroborate sign-in.
+Credential-pattern scan is supplementary and is not a proof that every possible secret format is absent.
+
+2026-10-22T16:38:56.183264Z  INFO overlook: seeded sample account
+2026-10-22T16:38:56.194210Z  INFO gpui_linux::linux::platform: Compositor GPU hint: vendor=0x8086, device=0xb080 (from dev 226:128)
+2026-10-22T16:38:56.195240Z  INFO gpui_component::theme::system_font: UI font ".SystemUIFont" resolves to "Adwaita Sans", naming it on the theme.
+2026-10-22T16:38:56.322028Z  INFO wgpu_hal::vulkan::adapter: Found 2 cooperative matrix configurations supported by wgpu
+2026-10-22T16:38:56.322938Z  INFO gpui_wgpu::wgpu_context: Found 2 GPU adapter(s):
+2026-10-22T16:38:56.322942Z  INFO gpui_wgpu::wgpu_context:   - Intel(R) Arc(tm) B390 (PTL) (vendor=0x8086, device=0xb080, backend=Vulkan, type=IntegratedGpu)
+2026-10-22T16:38:56.322945Z  INFO gpui_wgpu::wgpu_context:   - Mesa Intel(R) Arc(tm) B390 (PTL) (vendor=0x8086, device=0x0000, backend=Gl, type=IntegratedGpu)
+2026-10-22T16:38:56.322947Z  INFO gpui_wgpu::wgpu_context: Testing adapter: Intel(R) Arc(tm) B390 (PTL) (Vulkan)...
+2026-10-22T16:38:56.338052Z  INFO gpui_wgpu::wgpu_context: Selected GPU (passed configuration test): Intel(R) Arc(tm) B390 (PTL) (Vulkan)
+2026-10-22T16:38:56.338095Z  INFO gpui_wgpu::wgpu_context: Selected GPU adapter: "Intel(R) Arc(tm) B390 (PTL)" (Vulkan)
+2026-10-22T16:38:56.363701Z  INFO overlook::ui: startup: first frame after 185 ms
+2026-10-22T16:38:56.404572Z  INFO gpui_linux::linux::platform: activate is not implemented on Linux, ignoring the call
+2026-10-22T16:39:30.368448Z  INFO overlook_provider::gmail::provider: gmail: 93 recent messages queued for download
+2026-10-22T16:39:33.043280Z  INFO overlook_provider::gmail::calendar: calendar [test account redacted]: 0 changes, 0 removed
+2026-10-22T16:39:33.229811Z  INFO overlook_provider::gmail::calendar: calendar Holidays in United States: 31 changes, 0 removed
+2026-10-22T16:39:33.556663Z  INFO overlook::sync: synced 0 contacts for [test account redacted]
+2026-10-22T16:39:57.137869Z  INFO overlook_provider::gmail::calendar: calendar [test account redacted]: 0 changes, 0 removed
+2026-10-22T16:39:57.301973Z  INFO overlook_provider::gmail::calendar: calendar Holidays in United States: 0 changes, 0 removed
+2026-10-22T16:40:10.746386Z  INFO overlook_provider::gmail::calendar: calendar [test account redacted]: 0 changes, 0 removed
+2026-10-22T16:40:10.898318Z  INFO overlook_provider::gmail::calendar: calendar Holidays in United States: 0 changes, 0 removed
+2026-10-22T16:40:27.163505Z  INFO overlook_provider::gmail::calendar: calendar [test account redacted]: 0 changes, 0 removed
+2026-10-22T16:40:27.441045Z  INFO overlook_provider::gmail::calendar: calendar Holidays in United States: 0 changes, 0 removed
+2026-10-22T16:40:57.170856Z  INFO overlook_provider::gmail::calendar: calendar [test account redacted]: 0 changes, 0 removed
+2026-10-22T16:40:57.339477Z  INFO overlook_provider::gmail::calendar: calendar Holidays in United States: 0 changes, 0 removed
+2026-10-22T16:41:27.252145Z  INFO overlook_provider::gmail::calendar: calendar [test account redacted]: 0 changes, 0 removed
+2026-10-22T16:41:27.350812Z  INFO overlook_provider::gmail::calendar: calendar Holidays in United States: 0 changes, 0 removed

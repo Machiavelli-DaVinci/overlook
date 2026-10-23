@@ -2,7 +2,41 @@
 
 use rusqlite::Connection;
 
-const MIGRATIONS: &[&str] = &[V1, V2, V3, V4, V5, V6, V7, V8, V9, V10, V11, V12];
+const MIGRATIONS: &[&str] = &[V1, V2, V3, V4, V5, V6, V7, V8, V9, V10, V11, V12, V13, V14, V15, V16];
+
+const V16: &str = "
+BEGIN;
+CREATE TABLE caldav_checkpoints (
+    calendar_id TEXT PRIMARY KEY REFERENCES caldav_collections(calendar_id) ON DELETE CASCADE,
+    token TEXT NOT NULL,
+    range_start INTEGER NOT NULL,
+    range_end INTEGER NOT NULL,
+    timezone TEXT NOT NULL
+);
+PRAGMA user_version = 16;
+COMMIT;
+";
+
+const V15: &str = "
+CREATE TABLE caldav_outbox (
+    id TEXT PRIMARY KEY,
+    connection_id TEXT NOT NULL REFERENCES calendar_connections(id) ON DELETE CASCADE,
+    calendar_id TEXT NOT NULL REFERENCES calendars(id) ON DELETE CASCADE,
+    href TEXT NOT NULL,
+    revision INTEGER NOT NULL,
+    payload_json TEXT NOT NULL,
+    UNIQUE(calendar_id,href)
+);
+";
+
+/// Check before changing journal mode or migrating, leaving newer databases untouched.
+pub fn ensure_supported(conn: &Connection) -> super::Result<()> {
+    let version: i64 = conn.query_row("PRAGMA user_version", [], |r| r.get(0))?;
+    if version > MIGRATIONS.len() as i64 {
+        return Err(super::StoreError::Invalid("This database was created by a newer version of Overlook. Update Overlook before opening it.".into()));
+    }
+    Ok(())
+}
 
 pub fn migrate(conn: &Connection) -> rusqlite::Result<()> {
     let current: i64 = conn.query_row("PRAGMA user_version", [], |r| r.get(0))?;
@@ -323,3 +357,105 @@ BEGIN;
 CREATE INDEX attachments_message ON attachments(message_id);
 COMMIT;
 "#;
+
+// CalDAV setup only. Existing Google calendars, tokens and queued operations are untouched.
+// Keep the version in this transaction so reopening after a crash cannot replay the DDL.
+const V13: &str = r#"
+BEGIN;
+CREATE TABLE calendar_connections (
+    id TEXT PRIMARY KEY,
+    account_id TEXT NOT NULL UNIQUE REFERENCES accounts(id) ON DELETE CASCADE,
+    settings_json TEXT NOT NULL,
+    enabled INTEGER NOT NULL CHECK(enabled IN (0, 1)),
+    generation INTEGER NOT NULL CHECK(generation > 0)
+);
+PRAGMA user_version = 13;
+COMMIT;
+"#;
+
+const V14: &str = r#"
+BEGIN;
+CREATE TABLE caldav_collections (
+    calendar_id TEXT PRIMARY KEY REFERENCES calendars(id) ON DELETE CASCADE,
+    connection_id TEXT NOT NULL REFERENCES calendar_connections(id) ON DELETE CASCADE
+);
+CREATE TABLE caldav_resources (
+    calendar_id TEXT NOT NULL REFERENCES caldav_collections(calendar_id) ON DELETE CASCADE,
+    href TEXT NOT NULL,
+    etag TEXT NOT NULL,
+    icalendar TEXT NOT NULL,
+    PRIMARY KEY(calendar_id, href)
+);
+CREATE TABLE caldav_event_resources (
+    event_id TEXT PRIMARY KEY REFERENCES events(id) ON DELETE CASCADE,
+    calendar_id TEXT NOT NULL,
+    href TEXT NOT NULL,
+    FOREIGN KEY(calendar_id, href) REFERENCES caldav_resources(calendar_id, href) ON DELETE CASCADE
+);
+CREATE INDEX caldav_event_resource ON caldav_event_resources(calendar_id, href);
+CREATE TABLE caldav_coverage (
+    connection_id TEXT NOT NULL REFERENCES calendar_connections(id) ON DELETE CASCADE,
+    range_start INTEGER NOT NULL,
+    range_end INTEGER NOT NULL,
+    timezone TEXT NOT NULL,
+    synced_at INTEGER NOT NULL,
+    PRIMARY KEY(connection_id, range_start, range_end, timezone)
+);
+PRAGMA user_version = 14;
+COMMIT;
+"#;
+
+#[cfg(test)]
+mod calendar_migration_tests {
+    use super::*;
+
+    #[test]
+    fn upgrade_from_v12_preserves_accounts_events_and_pending_operations() {
+        let conn = Connection::open_in_memory().unwrap();
+        for sql in &MIGRATIONS[..12] {
+            conn.execute_batch(sql).unwrap();
+        }
+        conn.pragma_update(None, "user_version", 12).unwrap();
+        conn.execute("INSERT INTO accounts(id, provider, display_name, email, created_at) VALUES('test', 'gmail', 'Test', 'test@example.com', 1)", []).unwrap();
+        conn.execute("INSERT INTO calendars(id, account_id, provider_id, name) VALUES('calendar', 'test', 'primary', 'Personal')", []).unwrap();
+        conn.execute("INSERT INTO events(id, account_id, calendar_id, provider_id, summary, start, end, status, attendees_json, updated)
+            VALUES('event', 'test', 'calendar', 'remote-event', 'Unsynced title', 100, 200, 'confirmed', '[]', 1)", []).unwrap();
+        let operation = overlook_core::OperationKind::UpdateEvent {
+            event_id: overlook_core::EventId::from("event"),
+            scope: overlook_core::RecurrenceScope::default(),
+        };
+        let queued_json = serde_json::to_string(&operation).unwrap();
+        conn.execute("INSERT INTO pending_operations(id, account_id, seq, kind_json, state, created_at, updated_at)
+            VALUES('operation', 'test', 1, ?1, 'pending', 1, 1)", [&queued_json]).unwrap();
+        // Existing tables must retain their definitions; queued operation JSON needs no rewrite.
+        let before: Vec<(String, String)> = conn.prepare("SELECT name, sql FROM sqlite_master WHERE type='table' ORDER BY name").unwrap()
+            .query_map([], |r| Ok((r.get(0)?, r.get(1)?))).unwrap().map(Result::unwrap).collect();
+        migrate(&conn).unwrap();
+        assert_eq!(conn.query_row("PRAGMA user_version", [], |r| r.get::<_, u32>(0)).unwrap(), MIGRATIONS.len() as u32);
+        assert_eq!(conn.query_row("SELECT email FROM accounts WHERE id='test'", [], |r| r.get::<_, String>(0)).unwrap(), "test@example.com");
+        assert_eq!(conn.query_row("SELECT summary FROM events WHERE id='event'", [], |r| r.get::<_, String>(0)).unwrap(), "Unsynced title");
+        assert_eq!(conn.query_row("SELECT kind_json FROM pending_operations WHERE id='operation' AND state='pending'", [], |r| r.get::<_, String>(0)).unwrap(), queued_json);
+        for (name, definition) in before {
+            assert_eq!(conn.query_row("SELECT sql FROM sqlite_master WHERE type='table' AND name=?1", [name], |r| r.get::<_, String>(0)).unwrap(), definition);
+        }
+        migrate(&conn).unwrap(); // Reopening does not replay the new table creation.
+        assert_eq!(conn.query_row("SELECT COUNT(*) FROM calendar_connections", [], |r| r.get::<_, u32>(0)).unwrap(), 0);
+    }
+
+    #[test]
+    fn newer_schema_is_rejected_before_journal_mode_changes() {
+        let path = std::env::temp_dir().join(format!("overlook-newer-schema-{}.sqlite", overlook_core::CalendarConnectionId::generate()));
+        {
+            let conn = Connection::open(&path).unwrap();
+            conn.pragma_update(None, "journal_mode", "DELETE").unwrap();
+            conn.pragma_update(None, "user_version", 999).unwrap();
+        }
+        assert!(matches!(crate::Store::open(&path), Err(crate::StoreError::Invalid(_))));
+        {
+            let conn = Connection::open(&path).unwrap();
+            assert_eq!(conn.query_row("PRAGMA user_version", [], |r| r.get::<_, u32>(0)).unwrap(), 999);
+            assert_eq!(conn.query_row("PRAGMA journal_mode", [], |r| r.get::<_, String>(0)).unwrap(), "delete");
+        }
+        std::fs::remove_file(path).unwrap();
+    }
+}

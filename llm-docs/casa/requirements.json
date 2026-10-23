@@ -1,0 +1,338 @@
+[
+  {
+    "category": "1 – Authentication",
+    "documentation": "https://github.com/appdefensealliance/ASA-WG/blob/v1.0/Web%20App%20Profile/Web%20App%20Test%20Guide.md#111-authentication-is-resistant-to-brute-force-attacks",
+    "guidance": "Provide a list of any external user authentication services.If a proprietary user authentication service is used by the application, provide a written description of the password policyIf a proprietary user authentication service is used by the application, provide a written description of any anti-automation controls in place including multi-factor controls, rate limiting, CAPTCHAs, or soft account lockouts.If a proprietary user authentication service is used by the application, provide screenshots of the anti-automation controls in action. View Documentation",
+    "id": "1.1.1",
+    "requirement": "Authentication is resistant to brute force attacks *"
+  },
+  {
+    "category": "1 – Authentication",
+    "documentation": "https://github.com/appdefensealliance/ASA-WG/blob/v1.0/Web%20App%20Profile/Web%20App%20Test%20Guide.md#112-system-generated-initial-passwords-or-activation-codes-shall-be-securely-randomly-generated-and-expire-after-a-short-period",
+    "guidance": "Provide a list of any external user authentication services.If a proprietary user authentication service is used by the application, provide a written description of the initial password or activation code process.If a proprietary user authentication service is used by the application, provide screenshots of the initial password or activation code process in action. View Documentation",
+    "id": "1.1.2",
+    "requirement": "System generated initial passwords or activation codes shall be securely randomly generated and expire after a short period. *"
+  },
+  {
+    "category": "1 – Authentication",
+    "documentation": "https://github.com/appdefensealliance/ASA-WG/blob/v1.0/Web%20App%20Profile/Web%20App%20Test%20Guide.md#113-passwords-shall-be-stored-in-a-form-that-is-resistant-to-offline-attacks",
+    "guidance": "Provide a list of any external user authentication services.If a proprietary user authentication service is used by the application, provide a written description of the password storage methods including any cryptographic protections such as salts or hashing. View Documentation",
+    "id": "1.1.3",
+    "requirement": "Passwords shall be stored in a form that is resistant to offline attacks. *"
+  },
+  {
+    "category": "1 – Authentication",
+    "documentation": "https://github.com/appdefensealliance/ASA-WG/blob/v1.0/Web%20App%20Profile/Web%20App%20Test%20Guide.md#121-default-credentials-shall-not-be-present-on-publicly-exposed-interfaces",
+    "guidance": "If any default accounts are present on publicly exposed interfaces, a confirmation that default credentials are not used shall be provided. View Documentation",
+    "id": "1.2.1",
+    "requirement": "Default credentials shall not present on publicly exposed interfaces. *"
+  },
+  {
+    "category": "1 – Authentication",
+    "documentation": "https://github.com/appdefensealliance/ASA-WG/blob/v1.0/Web%20App%20Profile/Web%20App%20Test%20Guide.md#131-out-of-band-verifier-shall-expire-in-a-reasonable-timeframe",
+    "guidance": "Provide a list of any external user authentication services.If a proprietary user authentication service is used by the application, provide a written description of the out of band verifier expiration process. View Documentation",
+    "id": "1.3.1",
+    "requirement": "Out of band verifier shall expire in a reasonable timeframe. *"
+  },
+  {
+    "category": "1 – Authentication",
+    "documentation": "https://github.com/appdefensealliance/ASA-WG/blob/v1.0/Web%20App%20Profile/Web%20App%20Test%20Guide.md#132-out-of-band-verifier-shall-only-be-used-once",
+    "guidance": "Provide a list of any external user authentication services.If a proprietary user authentication service is used by the application, provide a written description of the out of band expiration process. View Documentation",
+    "id": "1.3.2",
+    "requirement": "Out of band verifier shall only be used once. *"
+  },
+  {
+    "category": "1 – Authentication",
+    "documentation": "https://github.com/appdefensealliance/ASA-WG/blob/v1.0/Web%20App%20Profile/Web%20App%20Test%20Guide.md#133-out-of-band-verifier-shall-be-securely-random",
+    "guidance": "Provide a list of any external user authentication services.If a proprietary user authentication service is used by the application, provide a written description of the algorithm used to generate initial authentication codes. View Documentation",
+    "id": "1.3.3",
+    "requirement": "Out of band verifier shall be securely random *"
+  },
+  {
+    "category": "1 – Authentication",
+    "documentation": "https://github.com/appdefensealliance/ASA-WG/blob/v1.0/Web%20App%20Profile/Web%20App%20Test%20Guide.md#134-out-of-band-verifier-shall-be-resistant-to-brute-force-attacks",
+    "guidance": "Provide a list of any external user authentication servicesIf a proprietary user authentication service is used by the application, provide a written description of the algorithm used to generate initial authentication codes and also of any rate-limiting applied during the application’s initial authentication code validation process. View Documentation",
+    "id": "1.3.4",
+    "requirement": "Out of band verifier shall be resistant to brute force attacks *"
+  },
+  {
+    "category": "2 – Session Management",
+    "documentation": "https://github.com/appdefensealliance/ASA-WG/blob/v1.0/Web%20App%20Profile/Web%20App%20Test%20Guide.md#dynamic-application-security-testing-dast-guidance",
+    "guidance": "Testing results from a scan completed by using the ADA's Dynamic Application Security Testing Guidance . Scanning may be performed by the developer or by an authorized testing lab. View Documentation",
+    "id": "2.1.1",
+    "requirement": "The application shall not reveal passwords or session tokens in URL parameters. In cases where the application provides an API, the application shall prevent (or give developers an option) to prevent exposing sensitive information like API keys or session tokens within the URL query strings *"
+  },
+  {
+    "category": "2 – Session Management",
+    "documentation": "https://github.com/appdefensealliance/ASA-WG/blob/v1.0/Web%20App%20Profile/Web%20App%20Test%20Guide.md#221-users-shall-have-the-ability-to-logout-of-the-application-logout-or-session-expiration-shall-invalidate-all-stateful-session-tokens-including-refresh-tokens",
+    "guidance": "Provide code snippets that show how the logout and expiration functionality is implemented and that demonstrate user session tokens are invalidated when a user logs out or the session is expired. View Documentation",
+    "id": "2.2.1",
+    "requirement": "Users shall have the ability to logout of the application. Logout or session expiration shall invalidate all stateful session tokens, including refresh tokens. *"
+  },
+  {
+    "category": "2 – Session Management",
+    "documentation": "https://github.com/appdefensealliance/ASA-WG/blob/v1.0/Web%20App%20Profile/Web%20App%20Test%20Guide.md#222-the-application-shall-provide-the-option-or-acts-by-default-to-terminate-all-other-active-sessions-including-stateful-refresh-tokens-after-a-successful-password-change-including-change-via-password-resetrecovery-and-that-this-is-effective-across-the-application-federated-login-if-present-and-any-relying-parties",
+    "guidance": "Provide code snippets that show how session invalidation is handled for a user after a successful password change. View Documentation",
+    "id": "2.2.2",
+    "requirement": "The application shall provide the option (or acts by default) to terminate all other active sessions, including stateful refresh tokens, after a successful password change (including change via password reset/recovery), and that this is effective across the application, federated login (if present), and any relying parties. *"
+  },
+  {
+    "category": "2 – Session Management",
+    "documentation": "https://github.com/appdefensealliance/ASA-WG/blob/v1.0/Web%20App%20Profile/Web%20App%20Test%20Guide.md#223-non-revocable-stateless-authentication-tokens-must-expire-within-24-hours-of-being-issued",
+    "guidance": "Provide code snippets, screenshot, or documentation that shows the time period for which stateless tokens are valid (if utilized). View Documentation",
+    "id": "2.2.3",
+    "requirement": "Non-revocable sateless authentication tokens must expire within 24 hours of being issued *"
+  },
+  {
+    "category": "2 – Session Management",
+    "documentation": "https://github.com/appdefensealliance/ASA-WG/blob/v1.0/Web%20App%20Profile/Web%20App%20Test%20Guide.md#dynamic-application-security-testing-dast-guidance",
+    "guidance": "Testing results from a scan completed by using the ADA's Dynamic Application Security Testing Guidance . Scanning may be performed by the developer or by an authorized testing lab. View Documentation",
+    "id": "2.3.1",
+    "requirement": "Cookie-based session tokens shall have the 'Secure' attribute set. *"
+  },
+  {
+    "category": "2 – Session Management",
+    "documentation": "https://github.com/appdefensealliance/ASA-WG/blob/v1.0/Web%20App%20Profile/Web%20App%20Test%20Guide.md#dynamic-application-security-testing-dast-guidance",
+    "guidance": "Testing results from a scan completed by using the ADA's Dynamic Application Security Testing Guidance . Scanning may be performed by the developer or by an authorized testing lab. View Documentation",
+    "id": "2.3.2",
+    "requirement": "Cookie-based session tokens shall have the 'HttpOnly' attribute setCookie-based session tokens shall have the 'HttpOnly' attribute set. *"
+  },
+  {
+    "category": "2 – Session Management",
+    "documentation": "https://github.com/appdefensealliance/ASA-WG/blob/v1.0/Web%20App%20Profile/Web%20App%20Test%20Guide.md#233-the-application-shall-use-session-tokens-rather-than-static-api-secrets-and-keys-except-with-legacy-implementations",
+    "guidance": "Provide code snippets of session token creation; showing dynamically generated tokens View Documentation",
+    "id": "2.3.3",
+    "requirement": "The application shall use session tokens rather than static API secrets and keys, except with legacy implementations. *"
+  },
+  {
+    "category": "2 – Session Management",
+    "documentation": "https://github.com/appdefensealliance/ASA-WG/blob/v1.0/Web%20App%20Profile/Web%20App%20Test%20Guide.md#dynamic-application-security-testing-dast-guidance",
+    "guidance": "Testing results from a scan completed by using the ADA's Dynamic Application Security Testing Guidance . Scanning may be performed by the developer or by an authorized testing lab. View Documentation",
+    "id": "2.3.4",
+    "requirement": "Stateless session tokens shall use digital signatures, encryption, and other countermeasures to protect against tampering, enveloping, replay, null cipher, and key substitution attacks. *"
+  },
+  {
+    "category": "2 – Session Management",
+    "documentation": "https://github.com/appdefensealliance/ASA-WG/blob/v1.0/Web%20App%20Profile/Web%20App%20Test%20Guide.md#241-verify-the-application-ensures-a-full-valid-login-session-or-requires-re-authentication-or-secondary-verification-before-allowing-any-sensitive-transactions-or-account-modifications",
+    "guidance": "Provide code snippets that shows either the user has a full login session or an account verification process is conducted before allowing user account modifications or sensitive data transaction. View Documentation",
+    "id": "2.4.1",
+    "requirement": "Verify the application ensures a full, valid login session or requires re-authentication or secondary verification before allowing any sensitive transactions or account modifications. *"
+  },
+  {
+    "category": "3 – Access Control",
+    "documentation": "https://github.com/appdefensealliance/ASA-WG/blob/v1.0/Web%20App%20Profile/Web%20App%20Test%20Guide.md#311-the-application-shall-enforce-least-privilege-access-control-rules-on-a-trusted-service-layer",
+    "guidance": "Explain / Provide documentation how user authentication and authorization are implemented, what roles and permissions are defined, and how access control rules are enforced when users interact with the application.Explain / Provide documentation that the principle of least privilege exists - users should only be able to access functions, data files, URLs, controllers, services, and other resources, for which they possess specific authorization. Note: A single written description shall be used for access control test cases 3.1.1 - 3.1.3. View Documentation",
+    "id": "3.1.1",
+    "requirement": "The application shall enforce least privilege access control rules on a trusted service layer. *"
+  },
+  {
+    "category": "3 – Access Control",
+    "documentation": "https://github.com/appdefensealliance/ASA-WG/blob/v1.0/Web%20App%20Profile/Web%20App%20Test%20Guide.md#312-all-user-and-data-attributes-and-policy-information-used-by-access-controls-shall-not-be-able-to-be-manipulated-by-end-users-unless-specifically-authorized",
+    "guidance": "Explain / Provide documentation how user authentication and authorization are implemented, what roles and permissions are defined, and how access control rules are enforced when users interact with the application.Explain / Provide documentation that the principle of least privilege exists - users should only be able to access functions, data files, URLs, controllers, services, and other resources, for which they possess specific authorization. Note: A single written description shall be used for access control test cases 3.1.1 - 3.1.3. View Documentation",
+    "id": "3.1.2",
+    "requirement": "All user and data attributes and policy information used by access controls shall not be able to be manipulated by end users unless specifically authorized. *"
+  },
+  {
+    "category": "3 – Access Control",
+    "documentation": "https://github.com/appdefensealliance/ASA-WG/blob/v1.0/Web%20App%20Profile/Web%20App%20Test%20Guide.md#313-access-controls-shall-fail-securely-including-when-an-exception-occurs",
+    "guidance": "Explain / Provide documentation how user authentication and authorization are implemented, what roles and permissions are defined, and how access control rules are enforced when users interact with the application.Explain / Provide documentation that the principle of least privilege exists - users should only be able to access functions, data files, URLs, controllers, services, and other resources, for which they possess specific authorization. Note: A single written description shall be used for access control test cases 3.1.1 - 3.1.3. View Documentation",
+    "id": "3.1.3",
+    "requirement": "Access controls shall fail securely including when an exception occurs. *"
+  },
+  {
+    "category": "3 – Access Control",
+    "documentation": "https://github.com/appdefensealliance/ASA-WG/blob/v1.0/Web%20App%20Profile/Web%20App%20Test%20Guide.md#314-sensitive-resources-shall-be-protected-against-insecure-direct-object-reference-idor-attacks-targeting-creation-reading-updating-and-deletion-of-records-such-as-creating-or-updating-someone-elses-record-viewing-everyones-records-or-deleting-all-records",
+    "guidance": "Provide a list of APIs in which portions of the API/URL or parameters may be passed from the user into the application.Provide a written description how the APIs are protected from Insecure Direct Object Reference attacks. View Documentation",
+    "id": "3.1.4",
+    "requirement": "Sensitive resources shall be protected against Insecure Direct Object Reference (IDOR) attacks targeting creation, reading, updating and deletion of records, such as creating or updating someone else's record, viewing everyone's records, or deleting all records. *"
+  },
+  {
+    "category": "3 – Access Control",
+    "documentation": "https://github.com/appdefensealliance/ASA-WG/blob/v1.0/Web%20App%20Profile/Web%20App%20Test%20Guide.md#dynamic-application-security-testing-dast-guidance",
+    "guidance": "Testing results from a scan completed by using the ADA's Dynamic Application Security Testing Guidance . Scanning may be performed by the developer or by an authorized testing lab. View Documentation",
+    "id": "3.1.5",
+    "requirement": "Application shall enforce a strong anti-CSRF mechanism to protect authenticated functionalityThe application or framework shall enforce a strong anti-CSRF mechanism to protect authenticated functionality, and effective anti-automation or anti-CSRF protects unauthenticated functionality. *"
+  },
+  {
+    "category": "3 – Access Control",
+    "documentation": "https://github.com/appdefensealliance/ASA-WG/blob/v1.0/Web%20App%20Profile/Web%20App%20Test%20Guide.md#dynamic-application-security-testing-dast-guidance",
+    "guidance": "Testing results from a scan completed by using the ADA's Dynamic Application Security Testing Guidance . Scanning may be performed by the developer or by an authorized testing lab. View Documentation",
+    "id": "3.1.6",
+    "requirement": "Directory browsing shall be disabled unless deliberately desiredDirectory browsing shall be disabled unless deliberately desired. *"
+  },
+  {
+    "category": "3 – Access Control",
+    "documentation": "https://github.com/appdefensealliance/ASA-WG/blob/v1.0/Web%20App%20Profile/Web%20App%20Test%20Guide.md#321-application-shall-implement-only-secure-and-recommended-oauth-20-flows-such-as-the-authorization-code-flow-or-the-authorization-code-flow-with-pkce-while-avoiding-the-use-of-deprecated-flows-like-the-implicit-flow-or-the-resource-owner-password-credentials-flow",
+    "guidance": "If the application uses an OAuth 2.0 integration, provide a written description along with relevant evidence (screenshots, source code, or other documentation) detailing which OAuth 2.0 flow is used. View Documentation",
+    "id": "3.2.1",
+    "requirement": "Application shall implement only secure and recommended OAuth 2.0 flows, such as the Authorization Code Flow or the Authorization Code Flow with PKCE, while avoiding the use of deprecated flows like the Implicit Flow or the Resource Owner Password Credentials Flow. *"
+  },
+  {
+    "category": "3 – Access Control",
+    "documentation": "https://github.com/appdefensealliance/ASA-WG/blob/v1.0/Web%20App%20Profile/Web%20App%20Test%20Guide.md#322-application-shall-securely-validate-the-redirect_uri-and-state-parameters-during-the-oauth-20-authorization-process-to-prevent-open-redirect-and-csrf-vulnerabilities",
+    "guidance": "If the application uses an OAuth 2.0 integration, provide a written description along with relevant evidence (screenshots, source code, or other documentation) detailing how the application uses the state and redirect_uri parameters to prevent common OAuth vulnerabilities. View Documentation",
+    "id": "3.2.2",
+    "requirement": "Ensure that the application securely validates the redirect_uri and state parameters during the OAuth 2.0 authorization process to prevent open redirect and CSRF vulnerabilities. *"
+  },
+  {
+    "category": "3 – Access Control",
+    "documentation": "https://github.com/appdefensealliance/ASA-WG/blob/v1.0/Web%20App%20Profile/Web%20App%20Test%20Guide.md#331-application-administrative-interfaces-shall-use-appropriate-multi-factor-authentication-to-prevent-unauthorized-use",
+    "guidance": "Provide evidence demonstrating that any application exposed administrative interfaces enforce multi-factor authentication for all accounts. View Documentation",
+    "id": "3.3.1",
+    "requirement": "Application administrative interfaces shall use appropriate multi-factor authentication to prevent unauthorized use.Application administrative interfaces shall use appropriate multi-factor authentication to prevent unauthorized use. *"
+  },
+  {
+    "category": "4 – Communications",
+    "documentation": "https://github.com/appdefensealliance/ASA-WG/blob/v1.0/Web%20App%20Profile/Web%20App%20Test%20Guide.md#411-application-shall-enforce-the-use-of-tls-for-all-connections-and-default-to-tls-12-in-cases-where-support-for-legacy-clients-is-necessary-tls-10-and-11-may-be-supported-if-mitigations-are-implemented-to-minimize-the-risk-of-downgrade-attacks-and-known-tls-exploits-regardless-of-the-tls-version-in-use-the-application-shall-default-to-secure-cipher-suites-and-reject-those-with-known-vulnerabilities",
+    "guidance": "Execute a Qualys SSL Labs scan for the application and provide a PDF export of the test results demonstrating that application meets the aforementioned TLS requirements. In most cases, this should result in a B or higher score. View Documentation",
+    "id": "4.1.1",
+    "requirement": "Application shall enforce the use of TLS for all connections and default to TLS 1.2+. In cases where support for legacy clients is necessary, TLS 1.0 and 1.1 may be supported if mitigations are implemented to minimize the risk of downgrade attacks and known TLS exploits. Regardless of the TLS version in use, the application shall default to secure cipher suites and reject those with known vulnerabilities. *"
+  },
+  {
+    "category": "4 – Communications",
+    "documentation": "https://github.com/appdefensealliance/ASA-WG/blob/v1.0/Web%20App%20Profile/Web%20App%20Test%20Guide.md#412-connections-to-and-from-the-server-shall-use-trusted-tls-certificates-where-internally-generated-or-self-signed-certificates-are-used-the-server-must-be-configured-to-only-trust-specific-internal-cas-and-specific-self-signed-certificates-all-others-should-be-rejected",
+    "guidance": "Execute a Qualys SSL Labs scan for the application and provide a PDF export of the test results demonstrating that application meets the aforementioned TLS requirements. In most cases, this should result in a B or higher score. View Documentation",
+    "id": "4.1.2",
+    "requirement": "Connections to and from the server shall use trusted TLS certificates. Where internally generated or self-signed certificates are used, the server must be configured to only trust specific internal CAs and specific self-signed certificates. All others should be rejected. *"
+  },
+  {
+    "category": "4 – Communications",
+    "documentation": "https://github.com/appdefensealliance/ASA-WG/blob/v1.0/Web%20App%20Profile/Web%20App%20Test%20Guide.md#413-no-instances-of-weak-cryptography-which-meaningfully-impact-the-confidentiality-or-integrity-of-data",
+    "guidance": "Describe any situations in which your application uses the following cryptographic operations:Encryption or decryptionHashingMAC or HMACFor each of these operations, briefly describe how your application performs the cryptographic operation including:Chosen cryptographic algorithmsKey size and mechanism of generationIV size and mechanism of generation (if applicable)Key management (storage, rotation, and expiration) View Documentation",
+    "id": "4.1.3",
+    "requirement": "No instances of weak cryptography which meaningfully impact confidentiality or integrity of confidential data. *"
+  },
+  {
+    "category": "4 – Communications",
+    "documentation": "https://github.com/appdefensealliance/ASA-WG/blob/v1.0/Web%20App%20Profile/Web%20App%20Test%20Guide.md#414-all-cryptographic-modules-shall-fail-securely-and-errors-are-handled-in-a-way-that-does-not-enable-padding-oracle-attacks",
+    "guidance": "Describe how your application handles cryptographic failures for the previously identified crypto operations. Provide detailed evidence such as source code, screenshots, or other relevant sources that showcase how the application handles cryptographic failures. View Documentation",
+    "id": "4.1.4",
+    "requirement": "All cryptographic modules shall fail securely, and errors are handled in a way that does not enable Padding Oracle attacks. *"
+  },
+  {
+    "category": "5 – Data Validation",
+    "documentation": "https://github.com/appdefensealliance/ASA-WG/blob/v1.0/Web%20App%20Profile/Web%20App%20Test%20Guide.md#dynamic-application-security-testing-dast-guidance",
+    "guidance": "Testing results from a scan completed by using the ADA's Dynamic Application Security Testing Guidance . Scanning may be performed by the developer or by an authorized testing lab. View Documentation",
+    "id": "5.1.1",
+    "requirement": "Protect against HTTP parameter pollution. *"
+  },
+  {
+    "category": "5 – Data Validation",
+    "documentation": "https://github.com/appdefensealliance/ASA-WG/blob/v1.0/Web%20App%20Profile/Web%20App%20Test%20Guide.md#dynamic-application-security-testing-dast-guidance",
+    "guidance": "Testing results from a scan completed by using the ADA's Dynamic Application Security Testing Guidance . Scanning may be performed by the developer or by an authorized testing lab. View Documentation",
+    "id": "5.1.2",
+    "requirement": "URL redirects and forwards are limited to allowlisted URLs or a warning is displayedURL redirects and forwards are limited to allowlisted URLs or a warning is displayed when redirecting to untrusted content. *"
+  },
+  {
+    "category": "5 – Data Validation",
+    "documentation": "https://github.com/appdefensealliance/ASA-WG/blob/v1.0/Web%20App%20Profile/Web%20App%20Test%20Guide.md#dynamic-application-security-testing-dast-guidance",
+    "guidance": "Testing results from a scan completed by using the ADA's Dynamic Application Security Testing Guidance . Scanning may be performed by the developer or by an authorized testing lab. View Documentation",
+    "id": "5.1.3",
+    "requirement": "Avoid the use of eval() or other dynamic code execution features. When there is no alternative, any user input is sanitized and sandboxed before being executed. *"
+  },
+  {
+    "category": "5 – Data Validation",
+    "documentation": "https://github.com/appdefensealliance/ASA-WG/blob/v1.0/Web%20App%20Profile/Web%20App%20Test%20Guide.md#dynamic-application-security-testing-dast-guidance",
+    "guidance": "Testing results from a scan completed by using the ADA's Dynamic Application Security Testing Guidance . Scanning may be performed by the developer or by an authorized testing lab. View Documentation",
+    "id": "5.1.4",
+    "requirement": "Protect against template injection attacks by ensuring that any user input being included is sanitized or sandboxed. *"
+  },
+  {
+    "category": "5 – Data Validation",
+    "documentation": "https://github.com/appdefensealliance/ASA-WG/blob/v1.0/Web%20App%20Profile/Web%20App%20Test%20Guide.md#dynamic-application-security-testing-dast-guidance",
+    "guidance": "Testing results from a scan completed by using the ADA's Dynamic Application Security Testing Guidance . Scanning may be performed by the developer or by an authorized testing lab. View Documentation",
+    "id": "5.1.5",
+    "requirement": "Prevent Server-Side Request Forgery (SSRF) *"
+  },
+  {
+    "category": "5 – Data Validation",
+    "documentation": "https://github.com/appdefensealliance/ASA-WG/blob/v1.0/Web%20App%20Profile/Web%20App%20Test%20Guide.md#dynamic-application-security-testing-dast-guidance",
+    "guidance": "Testing results from a scan completed by using the ADA's Dynamic Application Security Testing Guidance . Scanning may be performed by the developer or by an authorized testing lab. View Documentation",
+    "id": "5.1.6",
+    "requirement": "Protect against XPath or XML injection attacks *"
+  },
+  {
+    "category": "5 – Data Validation",
+    "documentation": "https://github.com/appdefensealliance/ASA-WG/blob/v1.0/Web%20App%20Profile/Web%20App%20Test%20Guide.md#dynamic-application-security-testing-dast-guidance",
+    "guidance": "Testing results from a scan completed by using the ADA's Dynamic Application Security Testing Guidance . Scanning may be performed by the developer or by an authorized testing lab. View Documentation",
+    "id": "5.1.7",
+    "requirement": "Context-aware output escaping or sanitization protects against reflected, stored, and DOM based XSS. *"
+  },
+  {
+    "category": "5 – Data Validation",
+    "documentation": "https://github.com/appdefensealliance/ASA-WG/blob/v1.0/Web%20App%20Profile/Web%20App%20Test%20Guide.md#dynamic-application-security-testing-dast-guidance",
+    "guidance": "Testing results from a scan completed by using the ADA's Dynamic Application Security Testing Guidance . Scanning may be performed by the developer or by an authorized testing lab. View Documentation",
+    "id": "5.1.8",
+    "requirement": "Protect against database injection attacks *"
+  },
+  {
+    "category": "5 – Data Validation",
+    "documentation": "https://github.com/appdefensealliance/ASA-WG/blob/v1.0/Web%20App%20Profile/Web%20App%20Test%20Guide.md#dynamic-application-security-testing-dast-guidance",
+    "guidance": "Testing results from a scan completed by using the ADA's Dynamic Application Security Testing Guidance . Scanning may be performed by the developer or by an authorized testing lab. View Documentation",
+    "id": "5.1.9",
+    "requirement": "Protect against OS command injections *"
+  },
+  {
+    "category": "5 – Data Validation",
+    "documentation": "https://github.com/appdefensealliance/ASA-WG/blob/v1.0/Web%20App%20Profile/Web%20App%20Test%20Guide.md#dynamic-application-security-testing-dast-guidance",
+    "guidance": "Testing results from a scan completed by using the ADA's Dynamic Application Security Testing Guidance . Scanning may be performed by the developer or by an authorized testing lab. View Documentation",
+    "id": "5.1.10",
+    "requirement": "Protect against local file inclusion or remote file inclusion attacks. *"
+  },
+  {
+    "category": "5 – Data Validation",
+    "documentation": "https://github.com/appdefensealliance/ASA-WG/blob/v1.0/Web%20App%20Profile/Web%20App%20Test%20Guide.md#521-protect-against-malicious-file-uploads-by-limiting-uploads-to-expected-file-types-and-preventing-direct-execution-of-uploaded-content",
+    "guidance": "Identify any situations in which the application accepts user file uploads. Describe how the application securely validates file type and prevents file execution. Provide detailed evidence such as source code, screenshots, or other relevant sources. View Documentation",
+    "id": "5.2.1",
+    "requirement": "Protect against malicious file uploads by limiting uploads to expected file types and preventing direct execution of uploaded content. *"
+  },
+  {
+    "category": "6 – Configuration",
+    "documentation": "https://github.com/appdefensealliance/ASA-WG/blob/v1.0/Web%20App%20Profile/Web%20App%20Test%20Guide.md#611-the-application-only-uses-software-components-without-known-exploitable-vulnerabilities",
+    "guidance": "Provide output of a dependency scan of application and 3P libraries using OWASP dependency check or other ADA approved scanning tools. View Documentation",
+    "id": "6.1.1",
+    "requirement": "The app only uses software components without known exploitable vulnerabilities. *"
+  },
+  {
+    "category": "6 – Configuration",
+    "documentation": "https://github.com/appdefensealliance/ASA-WG/blob/v1.0/Web%20App%20Profile/Web%20App%20Test%20Guide.md#dynamic-application-security-testing-dast-guidance",
+    "guidance": "Testing results from a scan completed by using the ADA's Dynamic Application Security Testing Guidance . Scanning may be performed by the developer or by an authorized testing lab. View Documentation",
+    "id": "6.2.1",
+    "requirement": "Disable debug modes in production environments *"
+  },
+  {
+    "category": "6 – Configuration",
+    "documentation": "https://github.com/appdefensealliance/ASA-WG/blob/v1.0/Web%20App%20Profile/Web%20App%20Test%20Guide.md#dynamic-application-security-testing-dast-guidance",
+    "guidance": "Testing results from a scan completed by using the ADA's Dynamic Application Security Testing Guidance . Scanning may be performed by the developer or by an authorized testing lab. View Documentation",
+    "id": "6.3.1",
+    "requirement": "The origin header shall not be used for authentication of access control decisions. *"
+  },
+  {
+    "category": "6 – Configuration",
+    "documentation": "https://github.com/appdefensealliance/ASA-WG/blob/v1.0/Web%20App%20Profile/Web%20App%20Test%20Guide.md#641-the-application-shall-not-be-susceptible-to-subdomain-takeovers",
+    "guidance": "Provide evidence of DNS configuration for the target domain and subdomains, confirming that either all subdomains are explicitly defined and point to IP addresses or other domains controlled by your organization; or where the record points to a third party owned domain, confirm that the subdomain record isn't configured to point to a non-existing or non-active resource/external service/endpoint. View Documentation",
+    "id": "6.4.1",
+    "requirement": "The application shall not be susceptible to subdomain takeovers. *"
+  },
+  {
+    "category": "6 – Configuration",
+    "documentation": "https://github.com/appdefensealliance/ASA-WG/blob/v1.0/Web%20App%20Profile/Web%20App%20Test%20Guide.md#651-the-application-shall-not-log-credentials-or-payment-details-session-tokens-shall-only-be-stored-in-logs-in-an-irreversible-hashed-form",
+    "guidance": "Provide a written description highlighting the protections to prevent logging of credentials or payment details.Provide a sample from a log captured during a login process.Provide a sample from a log captured during a payment process. (If applicable) View Documentation",
+    "id": "6.5.1",
+    "requirement": "The application shall not log credentials or payment details. Session tokens shall only be stored in logs in an irreversible, hashed form. *"
+  },
+  {
+    "category": "6 – Configuration",
+    "documentation": "https://github.com/appdefensealliance/ASA-WG/blob/v1.0/Web%20App%20Profile/Web%20App%20Test%20Guide.md#661-browser-storage-is-securely-cleared-during-logout",
+    "guidance": "Provide a written description of what (if any) confidential data or authentication material is stored in the browser after user logout. View Documentation",
+    "id": "6.6.1",
+    "requirement": "Browser storage is securely cleared during logout. *"
+  },
+  {
+    "category": "6 – Configuration",
+    "documentation": "https://github.com/appdefensealliance/ASA-WG/blob/v1.0/Web%20App%20Profile/Web%20App%20Test%20Guide.md#671-the-application-shall-securely-store-access-tokens-api-keys-and-other-server-side-secrets",
+    "guidance": "Provide a written description along with relevant evidence (source code, screenshots, architecture diagrams, etc.) describing your approach to secrets management for any access tokens, API keys, or other server-side secrets used by the application. View Documentation",
+    "id": "6.7.1",
+    "requirement": "The application shall securely store access tokens, API keys, and other server-side secrets. *"
+  }
+]

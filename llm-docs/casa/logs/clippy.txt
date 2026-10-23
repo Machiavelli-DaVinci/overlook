@@ -1,0 +1,924 @@
+warning: this `if` has identical blocks
+   --> crates/overlook-core/src/browser.rs:96:77
+    |
+ 96 |               if matches!(attr, "src" | "background") && !resource_url(value) {
+    |  _____________________________________________________________________________^
+ 97 | |                 None
+ 98 | |             } else if tag == "a" && attr == "href" && !navigation_url(value) {
+    | |_____________^
+    |
+note: same as this
+   --> crates/overlook-core/src/browser.rs:98:78
+    |
+ 98 |               } else if tag == "a" && attr == "href" && !navigation_url(value) {
+    |  ______________________________________________________________________________^
+ 99 | |                 None
+100 | |             } else {
+    | |_____________^
+    = help: for further information visit https://rust-lang.github.io/rust-clippy/rust-1.99.0/index.html#if_same_then_else
+    = note: `#[warn(clippy::if_same_then_else)]` on by default
+
+warning: this expression creates a reference which is immediately dereferenced by the compiler
+   --> crates/overlook-core/src/browser.rs:376:33
+    |
+376 |                 if resource_url(&url) {
+    |                                 ^^^^ help: change this to: `url`
+    |
+    = help: for further information visit https://rust-lang.github.io/rust-clippy/rust-1.99.0/index.html#needless_borrow
+    = note: `#[warn(clippy::needless_borrow)]` on by default
+
+warning: this expression creates a reference which is immediately dereferenced by the compiler
+   --> crates/overlook-core/src/browser.rs:377:54
+    |
+377 |                     *count += usize::from(remote_url(&url));
+    |                                                      ^^^^ help: change this to: `url`
+    |
+    = help: for further information visit https://rust-lang.github.io/rust-clippy/rust-1.99.0/index.html#needless_borrow
+
+warning: using `contains()` instead of `iter().any()` is more efficient
+  --> crates/overlook-core/src/ics.rs:51:19
+   |
+51 |     let is_date = params.iter().any(|p| *p == "VALUE=DATE") || value.len() == 8;
+   |                   ^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^ help: try: `params.contains(&"VALUE=DATE")`
+   |
+   = help: for further information visit https://rust-lang.github.io/rust-clippy/rust-1.99.0/index.html#manual_contains
+   = note: `#[warn(clippy::manual_contains)]` on by default
+
+warning: this operation has no effect
+  --> crates/overlook-core/src/mailto.rs:40:40
+   |
+40 |         if bytes[i] == b'%' && i + 2 < bytes.len() + 0 && i + 2 <= bytes.len() - 1 + 1 {
+   |                                        ^^^^^^^^^^^^^^^ help: consider reducing it to: `bytes.len()`
+   |
+   = help: for further information visit https://rust-lang.github.io/rust-clippy/rust-1.99.0/index.html#identity_op
+   = note: `#[warn(clippy::identity_op)]` on by default
+
+warning: called `Iterator::last` on a `DoubleEndedIterator`; this will needlessly iterate the entire iterator
+  --> crates/overlook-core/src/model.rs:92:20
+   |
+92 |         let last = parts.last().and_then(|p| p.chars().next());
+   |                    ^^^^^^^^^^^^
+   |
+   = help: for further information visit https://rust-lang.github.io/rust-clippy/rust-1.99.0/index.html#double_ended_iterator_last
+   = note: `#[warn(clippy::double_ended_iterator_last)]` on by default
+help: try
+   |
+92 -         let last = parts.last().and_then(|p| p.chars().next());
+92 +         let last = parts.next_back().and_then(|p| p.chars().next());
+   |
+
+warning: stripping a prefix manually
+   --> crates/overlook-core/src/presentation.rs:201:63
+    |
+201 |         let (r, g, b, _) = cssparser::color::parse_hash_color(v[1..].as_bytes()).ok()?;
+    |                                                               ^^^^^^
+    |
+note: the prefix was tested here
+   --> crates/overlook-core/src/presentation.rs:200:5
+    |
+200 |     if v.starts_with('#') {
+    |     ^^^^^^^^^^^^^^^^^^^^^^
+    = help: for further information visit https://rust-lang.github.io/rust-clippy/rust-1.99.0/index.html#manual_strip
+    = note: `#[warn(clippy::manual_strip)]` on by default
+help: try using the `strip_prefix` method
+    |
+200 ~     if let Some(<stripped>) = v.strip_prefix('#') {
+201 ~         let (r, g, b, _) = cssparser::color::parse_hash_color(<stripped>.as_bytes()).ok()?;
+    |
+
+warning: calling `as_bytes` after slicing a string
+   --> crates/overlook-core/src/presentation.rs:201:63
+    |
+201 |         let (r, g, b, _) = cssparser::color::parse_hash_color(v[1..].as_bytes()).ok()?;
+    |                                                               ^^^^^^^^^^^^^^^^^ help: try: `&v.as_bytes()[1..]`
+    |
+    = help: for further information visit https://rust-lang.github.io/rust-clippy/rust-1.99.0/index.html#sliced_string_as_bytes
+    = note: `#[warn(clippy::sliced_string_as_bytes)]` on by default
+
+warning: `overlook-core` (lib) generated 8 warnings (run `cargo clippy --fix --lib -p overlook-core -- ` to apply 5 suggestions)
+    Checking overlook-provider v1.5.5 (/home/jason/coding/omarchy-overlook/crates/overlook-provider)
+warning: consider using `sort_by_key`
+    --> crates/overlook-store/src/lib.rs:1226:9
+     |
+1226 |         hits.sort_by(|a, b| b.in_address_book.cmp(&a.in_address_book));
+     |         ^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^
+     |
+     = help: for further information visit https://rust-lang.github.io/rust-clippy/rust-1.99.0/index.html#unnecessary_sort_by
+     = note: `#[warn(clippy::unnecessary_sort_by)]` on by default
+help: try
+     |
+1226 -         hits.sort_by(|a, b| b.in_address_book.cmp(&a.in_address_book));
+1226 +         hits.sort_by_key(|a| std::cmp::Reverse(a.in_address_book));
+     |
+
+warning: unnecessary use of `clone` to create a slice from a reference
+    --> crates/overlook-store/src/lib.rs:2315:40
+     |
+2315 |         store.replace_calendars(&acct, &[cal.clone()]).unwrap();
+     |                                        ^^^^^^^^^^^^^^ help: try: `std::slice::from_ref(&cal)`
+     |
+     = help: for further information visit https://rust-lang.github.io/rust-clippy/rust-1.99.0/index.html#cloned_ref_to_slice_refs
+     = note: `#[warn(clippy::cloned_ref_to_slice_refs)]` on by default
+
+warning: unnecessary use of `clone` to create a slice from a reference
+    --> crates/overlook-store/src/lib.rs:2359:40
+     |
+2359 |         store.replace_calendars(&acct, &[cal.clone()]).unwrap();
+     |                                        ^^^^^^^^^^^^^^ help: try: `std::slice::from_ref(&cal)`
+     |
+     = help: for further information visit https://rust-lang.github.io/rust-clippy/rust-1.99.0/index.html#cloned_ref_to_slice_refs
+
+warning: unnecessary use of `clone` to create a slice from a reference
+    --> crates/overlook-store/src/lib.rs:2392:29
+     |
+2392 |         store.upsert_events(&[event.clone()]).unwrap();
+     |                             ^^^^^^^^^^^^^^^^ help: try: `std::slice::from_ref(&event)`
+     |
+     = help: for further information visit https://rust-lang.github.io/rust-clippy/rust-1.99.0/index.html#cloned_ref_to_slice_refs
+
+warning: unnecessary use of `clone` to create a slice from a reference
+    --> crates/overlook-store/src/lib.rs:2482:37
+     |
+2482 |         store.merge_remote_messages(&[m2.clone()], &BTreeSet::new()).unwrap();
+     |                                     ^^^^^^^^^^^^^ help: try: `std::slice::from_ref(&m2)`
+     |
+     = help: for further information visit https://rust-lang.github.io/rust-clippy/rust-1.99.0/index.html#cloned_ref_to_slice_refs
+
+warning: unnecessary use of `clone` to create a slice from a reference
+    --> crates/overlook-store/src/lib.rs:2486:37
+     |
+2486 |         store.merge_remote_messages(&[m2.clone()], &BTreeSet::new()).unwrap();
+     |                                     ^^^^^^^^^^^^^ help: try: `std::slice::from_ref(&m2)`
+     |
+     = help: for further information visit https://rust-lang.github.io/rust-clippy/rust-1.99.0/index.html#cloned_ref_to_slice_refs
+
+warning: used `assert_eq!` with a literal bool
+   --> crates/overlook-core/src/servers.rs:216:9
+    |
+216 |         assert_eq!(Pop3Policy::default().leave_on_server, true);
+    |         ^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^
+    |
+    = help: for further information visit https://rust-lang.github.io/rust-clippy/rust-1.99.0/index.html#bool_assert_comparison
+    = note: `#[warn(clippy::bool_assert_comparison)]` on by default
+help: replace it with `assert!(..)`
+    |
+216 -         assert_eq!(Pop3Policy::default().leave_on_server, true);
+216 +         assert!(Pop3Policy::default().leave_on_server);
+    |
+
+warning: `overlook-store` (lib) generated 1 warning
+warning: `overlook-store` (lib test) generated 6 warnings (1 duplicate) (run `cargo clippy --fix --lib -p overlook-store --tests -- ` to apply 5 suggestions)
+warning: `overlook-core` (lib test) generated 9 warnings (8 duplicates) (run `cargo clippy --fix --lib -p overlook-core --tests -- ` to apply 1 suggestion)
+warning: very complex type used. Consider factoring parts into `type` definitions
+  --> crates/overlook-provider/src/autoconfig.rs:53:18
+   |
+53 |     const TABLE: &[(&[&str], &str, &str, u16, &str, u16, Security)] = &[
+   |                  ^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^
+   |
+   = help: for further information visit https://rust-lang.github.io/rust-clippy/rust-1.99.0/index.html#type_complexity
+   = note: `#[warn(clippy::type_complexity)]` on by default
+
+warning: using `contains()` instead of `iter().any()` is more efficient
+  --> crates/overlook-provider/src/autoconfig.rs:64:49
+   |
+64 |     let row = TABLE.iter().find(|(domains, ..)| domains.iter().any(|d| *d == domain))?;
+   |                                                 ^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^ help: try: `domains.contains(&domain)`
+   |
+   = help: for further information visit https://rust-lang.github.io/rust-clippy/rust-1.99.0/index.html#manual_contains
+   = note: `#[warn(clippy::manual_contains)]` on by default
+
+warning: very complex type used. Consider factoring parts into `type` definitions
+  --> crates/overlook-provider/src/autoconfig.rs:72:18
+   |
+72 |     const TABLE: &[(&[&str], &str, &str, u16, Security, &str, u16, Security)] = &[
+   |                  ^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^
+   |
+   = help: for further information visit https://rust-lang.github.io/rust-clippy/rust-1.99.0/index.html#type_complexity
+
+warning: using `contains()` instead of `iter().any()` is more efficient
+  --> crates/overlook-provider/src/autoconfig.rs:87:49
+   |
+87 |     let row = TABLE.iter().find(|(domains, ..)| domains.iter().any(|d| *d == domain))?;
+   |                                                 ^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^ help: try: `domains.contains(&domain)`
+   |
+   = help: for further information visit https://rust-lang.github.io/rust-clippy/rust-1.99.0/index.html#manual_contains
+
+warning: very complex type used. Consider factoring parts into `type` definitions
+  --> crates/overlook-provider/src/calendar.rs:54:104
+   |
+54 | ... Timestamp, _end: Timestamp) -> BoxFuture<'_, Result<Vec<(String, Option<bool>)>, ProviderError>> {
+   |                                    ^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^
+   |
+   = help: for further information visit https://rust-lang.github.io/rust-clippy/rust-1.99.0/index.html#type_complexity
+
+warning: manually reimplementing `div_ceil`
+   --> crates/overlook-provider/src/gmail/oauth.rs:385:41
+    |
+385 |     let mut out = String::with_capacity((bytes.len() + 2) / 3 * 4);
+    |                                         ^^^^^^^^^^^^^^^^^^^^^ help: consider using `.div_ceil()`: `bytes.len().div_ceil(3)`
+    |
+    = help: for further information visit https://rust-lang.github.io/rust-clippy/rust-1.99.0/index.html#manual_div_ceil
+    = note: `#[warn(clippy::manual_div_ceil)]` on by default
+
+warning: very complex type used. Consider factoring parts into `type` definitions
+   --> crates/overlook-provider/src/imap/mod.rs:295:49
+    |
+295 |     fn run_copyuid(&mut self, command: &str) -> Result<Option<(u32, Vec<u32>, Vec<u32>)>, imap::Error> {
+    |                                                 ^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^
+    |
+    = help: for further information visit https://rust-lang.github.io/rust-clippy/rust-1.99.0/index.html#type_complexity
+
+warning: very complex type used. Consider factoring parts into `type` definitions
+   --> crates/overlook-provider/src/imap/mod.rs:360:54
+    |
+360 |     fn flags_for(&mut self, uids: &BTreeSet<u32>) -> Result<(BTreeSet<u32>, BTreeSet<u32>, BTreeSet<u32>), ProviderError> {
+    |                                                      ^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^
+    |
+    = help: for further information visit https://rust-lang.github.io/rust-clippy/rust-1.99.0/index.html#type_complexity
+
+warning: very complex type used. Consider factoring parts into `type` definitions
+   --> crates/overlook-provider/src/imap/mod.rs:587:113
+    |
+587 | ...u32, uids: &BTreeSet<u32>) -> Result<(Vec<Message>, BTreeSet<u32>, BTreeSet<u32>), ProviderError> {
+    |                                  ^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^
+    |
+    = help: for further information visit https://rust-lang.github.io/rust-clippy/rust-1.99.0/index.html#type_complexity
+
+warning: consider using `sort_by_key`
+   --> crates/overlook-provider/src/imap/mod.rs:606:9
+    |
+606 |         rows.sort_by(|a, b| b.date.cmp(&a.date));
+    |         ^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^
+    |
+    = help: for further information visit https://rust-lang.github.io/rust-clippy/rust-1.99.0/index.html#unnecessary_sort_by
+    = note: `#[warn(clippy::unnecessary_sort_by)]` on by default
+help: try
+    |
+606 -         rows.sort_by(|a, b| b.date.cmp(&a.date));
+606 +         rows.sort_by_key(|a| std::cmp::Reverse(a.date));
+    |
+
+warning: the following explicit lifetimes could be elided: 'a
+    --> crates/overlook-provider/src/imap/mod.rs:1061:18
+     |
+1061 |     fn kind_path<'a>(labels: &'a [Label], kind: LabelKind) -> Option<&'a str> {
+     |                  ^^           ^^                                      ^^
+     |
+     = help: for further information visit https://rust-lang.github.io/rust-clippy/rust-1.99.0/index.html#needless_lifetimes
+     = note: `#[warn(clippy::needless_lifetimes)]` on by default
+help: elide the lifetimes
+     |
+1061 -     fn kind_path<'a>(labels: &'a [Label], kind: LabelKind) -> Option<&'a str> {
+1061 +     fn kind_path(labels: &[Label], kind: LabelKind) -> Option<&str> {
+     |
+
+warning: manual case-insensitive ASCII comparison
+  --> crates/overlook-provider/src/mime/mod.rs:35:84
+   |
+35 |         let decoded = if charset.to_ascii_lowercase().starts_with("iso-8859-1") || charset.to_ascii_lowercase() == "latin1" {
+   |                                                                                    ^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^
+   |
+   = help: for further information visit https://rust-lang.github.io/rust-clippy/rust-1.99.0/index.html#manual_ignore_case_cmp
+   = note: `#[warn(clippy::manual_ignore_case_cmp)]` on by default
+help: consider using `.eq_ignore_ascii_case()` instead
+   |
+35 -         let decoded = if charset.to_ascii_lowercase().starts_with("iso-8859-1") || charset.to_ascii_lowercase() == "latin1" {
+35 +         let decoded = if charset.to_ascii_lowercase().starts_with("iso-8859-1") || charset.eq_ignore_ascii_case("latin1") {
+   |
+
+warning: consider using `sort_by_key`
+   --> crates/overlook-provider/src/pop3/mod.rs:265:9
+    |
+265 |         unseen.sort_by(|a, b| b.0.cmp(&a.0));
+    |         ^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^
+    |
+    = help: for further information visit https://rust-lang.github.io/rust-clippy/rust-1.99.0/index.html#unnecessary_sort_by
+help: try
+    |
+265 -         unseen.sort_by(|a, b| b.0.cmp(&a.0));
+265 +         unseen.sort_by_key(|a| std::cmp::Reverse(a.0));
+    |
+
+warning: called `map(..).flatten()` on `Option`
+   --> crates/overlook-provider/src/imap/tests.rs:142:43
+    |
+142 |     assert_eq!(invite.invitation.as_ref().map(|i| i.summary.clone()).flatten().as_deref(), Some("Standup"));
+    |                                           ^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^ help: try replacing `map` with `and_then` and remove the `.flatten()`: `and_then(|i| i.summary.clone())`
+    |
+    = help: for further information visit https://rust-lang.github.io/rust-clippy/rust-1.99.0/index.html#map_flatten
+    = note: `#[warn(clippy::map_flatten)]` on by default
+
+warning: `overlook-provider` (lib) generated 13 warnings (run `cargo clippy --fix --lib -p overlook-provider -- ` to apply 5 suggestions)
+    Checking overlook v1.5.5 (/home/jason/coding/omarchy-overlook/crates/overlook-app)
+warning: unnecessary use of `clone` to create a slice from a reference
+   --> crates/overlook-provider/src/imap/tests.rs:390:35
+    |
+390 |     block(p.apply(&acct, &unstar, &[inbox3.clone()], &labels)).unwrap();
+    |                                   ^^^^^^^^^^^^^^^^^ help: try: `std::slice::from_ref(inbox3)`
+    |
+    = help: for further information visit https://rust-lang.github.io/rust-clippy/rust-1.99.0/index.html#cloned_ref_to_slice_refs
+    = note: `#[warn(clippy::cloned_ref_to_slice_refs)]` on by default
+
+warning: unnecessary use of `clone` to create a slice from a reference
+   --> crates/overlook-provider/src/imap/tests.rs:465:50
+    |
+465 |     let applied = block(p.apply(&acct, &untrash, &[a.clone()], &labels)).unwrap();
+    |                                                  ^^^^^^^^^^^^ help: try: `std::slice::from_ref(a)`
+    |
+    = help: for further information visit https://rust-lang.github.io/rust-clippy/rust-1.99.0/index.html#cloned_ref_to_slice_refs
+
+warning: unnecessary use of `clone` to create a slice from a reference
+   --> crates/overlook-provider/src/imap/tests.rs:485:101
+    |
+485 |     let applied = block(p.apply(&acct, &op(&acct, OperationKind::Trash { message_ids: ids(&[a]) }), &[a.clone()], &labels)).unwrap();
+    |                                                                                                     ^^^^^^^^^^^^ help: try: `std::slice::from_ref(a)`
+    |
+    = help: for further information visit https://rust-lang.github.io/rust-clippy/rust-1.99.0/index.html#cloned_ref_to_slice_refs
+
+warning: unnecessary use of `clone` to create a slice from a reference
+   --> crates/overlook-provider/src/imap/tests.rs:504:101
+    |
+504 |     let applied = block(p.apply(&acct, &op(&acct, OperationKind::Trash { message_ids: ids(&[a]) }), &[a.clone()], &labels)).unwrap();
+    |                                                                                                     ^^^^^^^^^^^^ help: try: `std::slice::from_ref(a)`
+    |
+    = help: for further information visit https://rust-lang.github.io/rust-clippy/rust-1.99.0/index.html#cloned_ref_to_slice_refs
+
+warning: unnecessary use of `clone` to create a slice from a reference
+   --> crates/overlook-provider/src/imap/tests.rs:521:46
+    |
+521 |     let applied = block(p.apply(&acct, &add, &[a.clone()], &labels)).unwrap();
+    |                                              ^^^^^^^^^^^^ help: try: `std::slice::from_ref(a)`
+    |
+    = help: for further information visit https://rust-lang.github.io/rust-clippy/rust-1.99.0/index.html#cloned_ref_to_slice_refs
+
+warning: unnecessary use of `clone` to create a slice from a reference
+   --> crates/overlook-provider/src/imap/tests.rs:534:52
+    |
+534 |     assert_eq!(block(p.apply(&acct, &remove_other, &[b.clone()], &labels)).unwrap(), AppliedChanges::default());
+    |                                                    ^^^^^^^^^^^^ help: try: `std::slice::from_ref(b)`
+    |
+    = help: for further information visit https://rust-lang.github.io/rust-clippy/rust-1.99.0/index.html#cloned_ref_to_slice_refs
+
+warning: unnecessary use of `clone` to create a slice from a reference
+   --> crates/overlook-provider/src/imap/tests.rs:541:49
+    |
+541 |     assert!(matches!(block(p.apply(&acct, &add, &[b.clone()], &with_local)), Err(ProviderError::Rejected(_))));
+    |                                                 ^^^^^^^^^^^^ help: try: `std::slice::from_ref(b)`
+    |
+    = help: for further information visit https://rust-lang.github.io/rust-clippy/rust-1.99.0/index.html#cloned_ref_to_slice_refs
+
+warning: unnecessary use of `clone` to create a slice from a reference
+   --> crates/overlook-provider/src/imap/tests.rs:556:43
+    |
+556 |     assert_eq!(block(p.apply(&acct, &add, &[a.clone()], &labels)), Err(ProviderError::Rejected("that folder no longer exists".into(...
+    |                                           ^^^^^^^^^^^^ help: try: `std::slice::from_ref(a)`
+    |
+    = help: for further information visit https://rust-lang.github.io/rust-clippy/rust-1.99.0/index.html#cloned_ref_to_slice_refs
+
+warning: unnecessary use of `clone` to create a slice from a reference
+   --> crates/overlook-provider/src/imap/tests.rs:562:44
+    |
+562 |     assert_eq!(block(p.apply(&acct, &star, &[w.clone()], &labels)), Ok(AppliedChanges::default()));
+    |                                            ^^^^^^^^^^^^ help: try: `std::slice::from_ref(w)`
+    |
+    = help: for further information visit https://rust-lang.github.io/rust-clippy/rust-1.99.0/index.html#cloned_ref_to_slice_refs
+
+warning: unnecessary use of `clone` to create a slice from a reference
+   --> crates/overlook-provider/src/imap/tests.rs:564:47
+    |
+564 |     assert_eq!(block(p.apply(&acct, &archive, &[w.clone()], &labels)), Ok(AppliedChanges::default()));
+    |                                               ^^^^^^^^^^^^ help: try: `std::slice::from_ref(w)`
+    |
+    = help: for further information visit https://rust-lang.github.io/rust-clippy/rust-1.99.0/index.html#cloned_ref_to_slice_refs
+
+warning: unnecessary use of `clone` to create a slice from a reference
+   --> crates/overlook-provider/src/imap/tests.rs:569:47
+    |
+569 |     assert_eq!(block(p.apply(&acct, &archive, &[a.clone()], &labels)), Err(ProviderError::Temporary("Mailbox is in use by another p...
+    |                                               ^^^^^^^^^^^^ help: try: `std::slice::from_ref(a)`
+    |
+    = help: for further information visit https://rust-lang.github.io/rust-clippy/rust-1.99.0/index.html#cloned_ref_to_slice_refs
+
+warning: unnecessary use of `clone` to create a slice from a reference
+   --> crates/overlook-provider/src/imap/tests.rs:572:47
+    |
+572 |     assert_eq!(block(p.apply(&acct, &archive, &[a.clone()], &labels)), Err(ProviderError::Temporary("Mailbox is being rebuilt".into...
+    |                                               ^^^^^^^^^^^^ help: try: `std::slice::from_ref(a)`
+    |
+    = help: for further information visit https://rust-lang.github.io/rust-clippy/rust-1.99.0/index.html#cloned_ref_to_slice_refs
+
+warning: unnecessary use of `clone` to create a slice from a reference
+   --> crates/overlook-provider/src/imap/tests.rs:574:53
+    |
+574 |     assert!(matches!(block(p.apply(&acct, &archive, &[a.clone()], &labels)), Err(ProviderError::Temporary(_))));
+    |                                                     ^^^^^^^^^^^^ help: try: `std::slice::from_ref(a)`
+    |
+    = help: for further information visit https://rust-lang.github.io/rust-clippy/rust-1.99.0/index.html#cloned_ref_to_slice_refs
+
+warning: unnecessary use of `clone` to create a slice from a reference
+   --> crates/overlook-provider/src/imap/tests.rs:580:47
+    |
+580 |     assert_eq!(block(p.apply(&acct, &archive, &[a.clone()], &labels)), Err(ProviderError::Offline));
+    |                                               ^^^^^^^^^^^^ help: try: `std::slice::from_ref(a)`
+    |
+    = help: for further information visit https://rust-lang.github.io/rust-clippy/rust-1.99.0/index.html#cloned_ref_to_slice_refs
+
+warning: unnecessary use of `clone` to create a slice from a reference
+   --> crates/overlook-provider/src/imap/tests.rs:582:47
+    |
+582 |     assert_eq!(block(p.apply(&acct, &archive, &[a.clone()], &labels)), Err(ProviderError::SignInRequired));
+    |                                               ^^^^^^^^^^^^ help: try: `std::slice::from_ref(a)`
+    |
+    = help: for further information visit https://rust-lang.github.io/rust-clippy/rust-1.99.0/index.html#cloned_ref_to_slice_refs
+
+warning: unnecessary use of `clone` to create a slice from a reference
+   --> crates/overlook-provider/src/pop3/tests.rs:250:42
+    |
+250 |     assert_eq!(block(p.apply(&acct, &op, &[plain.clone()], &labels)).unwrap(), AppliedChanges::default());
+    |                                          ^^^^^^^^^^^^^^^^ help: try: `std::slice::from_ref(&plain)`
+    |
+    = help: for further information visit https://rust-lang.github.io/rust-clippy/rust-1.99.0/index.html#cloned_ref_to_slice_refs
+
+warning: unnecessary use of `clone` to create a slice from a reference
+   --> crates/overlook-provider/src/pop3/tests.rs:253:39
+    |
+253 |     assert!(block(p.apply(&acct, &op, &[plain.clone()], &labels)).is_ok());
+    |                                       ^^^^^^^^^^^^^^^^ help: try: `std::slice::from_ref(&plain)`
+    |
+    = help: for further information visit https://rust-lang.github.io/rust-clippy/rust-1.99.0/index.html#cloned_ref_to_slice_refs
+
+warning: unnecessary use of `clone` to create a slice from a reference
+   --> crates/overlook-provider/src/pop3/tests.rs:257:41
+    |
+257 |     assert!(block(p.apply(&acct, &star, &[plain.clone()], &labels)).is_ok());
+    |                                         ^^^^^^^^^^^^^^^^ help: try: `std::slice::from_ref(&plain)`
+    |
+    = help: for further information visit https://rust-lang.github.io/rust-clippy/rust-1.99.0/index.html#cloned_ref_to_slice_refs
+
+warning: unnecessary use of `clone` to create a slice from a reference
+   --> crates/overlook-provider/src/pop3/tests.rs:259:44
+    |
+259 |     assert!(block(p.apply(&acct, &archive, &[plain.clone()], &labels)).is_ok());
+    |                                            ^^^^^^^^^^^^^^^^ help: try: `std::slice::from_ref(&plain)`
+    |
+    = help: for further information visit https://rust-lang.github.io/rust-clippy/rust-1.99.0/index.html#cloned_ref_to_slice_refs
+
+warning: large size difference between variants
+  --> crates/overlook-provider/examples/imap_spike.rs:65:1
+   |
+65 | / enum Stream {
+66 | |     Plain(TcpStream),
+   | |     ---------------- the second-largest variant contains at least 4 bytes
+67 | |     Tls(rustls::StreamOwned<rustls::ClientConnection, TcpStream>),
+   | |     ------------------------------------------------------------- the largest variant contains at least 1064 bytes
+68 | | }
+   | |_^ the entire enum is at least 1064 bytes
+   |
+   = help: for further information visit https://rust-lang.github.io/rust-clippy/rust-1.99.0/index.html#large_enum_variant
+   = note: `#[warn(clippy::large_enum_variant)]` on by default
+help: consider boxing the large fields or introducing indirection in some other way to reduce the total size of the enum
+   |
+67 -     Tls(rustls::StreamOwned<rustls::ClientConnection, TcpStream>),
+67 +     Tls(Box<rustls::StreamOwned<rustls::ClientConnection, TcpStream>>),
+   |
+
+warning: unnecessary use of `clone` to create a slice from a reference
+   --> crates/overlook-provider/src/smtp.rs:463:43
+    |
+463 |         let reply = transport.send(&from, &[to.clone()], &message).unwrap();
+    |                                           ^^^^^^^^^^^^^ help: try: `std::slice::from_ref(&to)`
+    |
+    = help: for further information visit https://rust-lang.github.io/rust-clippy/rust-1.99.0/index.html#cloned_ref_to_slice_refs
+
+warning: `overlook-provider` (example "imap_spike") generated 1 warning
+warning: `overlook-provider` (lib test) generated 34 warnings (13 duplicates) (run `cargo clippy --fix --lib -p overlook-provider --tests -- ` to apply 21 suggestions)
+warning: empty line after doc comment
+    --> crates/overlook-app/src/ui/mod.rs:2330:5
+     |
+2330 | /     /// Syncs the active account (manual: ignores the retry pause).
+2331 | |
+     | |_^
+2332 |       pub(crate) fn sync_now(&mut self, window: &mut Window, cx: &mut Context<Self>) {
+     |       ---------------------- the comment documents this function
+     |
+     = help: for further information visit https://rust-lang.github.io/rust-clippy/rust-1.99.0/index.html#empty_line_after_doc_comments
+     = note: `#[warn(clippy::empty_line_after_doc_comments)]` on by default
+     = help: if the empty line is unintentional, remove it
+
+warning: this let-binding has unit value
+   --> crates/overlook-app/src/browser_body.rs:280:9
+    |
+280 |         let _ = cx.update(|_| remember_render(FinishedRender { key, height, tiles: decoded }));
+    |         ^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^
+    |
+    = help: for further information visit https://rust-lang.github.io/rust-clippy/rust-1.99.0/index.html#let_unit_value
+    = note: `#[warn(clippy::let_unit_value)]` on by default
+help: omit the `let` binding
+    |
+280 -         let _ = cx.update(|_| remember_render(FinishedRender { key, height, tiles: decoded }));
+280 +         cx.update(|_| remember_render(FinishedRender { key, height, tiles: decoded }));
+    |
+
+warning: using `clone` on type `OperationState` which implements the `Copy` trait
+   --> crates/overlook-app/src/sync.rs:474:51
+    |
+474 |             let _ = store.set_operation_state(id, state.clone(), error);
+    |                                                   ^^^^^^^^^^^^^ help: try removing the `clone` call: `state`
+    |
+    = help: for further information visit https://rust-lang.github.io/rust-clippy/rust-1.99.0/index.html#clone_on_copy
+    = note: `#[warn(clippy::clone_on_copy)]` on by default
+
+warning: this expression creates a reference which is immediately dereferenced by the compiler
+   --> crates/overlook-app/src/sync.rs:500:51
+    |
+500 |                     match provider.reconcile_send(&account, &draft).await {
+    |                                                   ^^^^^^^^ help: change this to: `account`
+    |
+    = help: for further information visit https://rust-lang.github.io/rust-clippy/rust-1.99.0/index.html#needless_borrow
+    = note: `#[warn(clippy::needless_borrow)]` on by default
+
+warning: this expression creates a reference which is immediately dereferenced by the compiler
+   --> crates/overlook-app/src/sync.rs:504:82
+    |
+504 | ...   message: overlook_provider::sample::sent_message(&account, &draft, context.in_reply_to.as_ref(), &provider_id, &rfc, sent_lab...
+    |                                                        ^^^^^^^^ help: change this to: `account`
+    |
+    = help: for further information visit https://rust-lang.github.io/rust-clippy/rust-1.99.0/index.html#needless_borrow
+
+warning: this expression creates a reference which is immediately dereferenced by the compiler
+   --> crates/overlook-app/src/sync.rs:509:72
+    |
+509 |                         Ok(SendOutcome::NotDelivered) => provider.send(&account, &draft, context).await,
+    |                                                                        ^^^^^^^^ help: change this to: `account`
+    |
+    = help: for further information visit https://rust-lang.github.io/rust-clippy/rust-1.99.0/index.html#needless_borrow
+
+warning: this expression creates a reference which is immediately dereferenced by the compiler
+   --> crates/overlook-app/src/sync.rs:520:35
+    |
+520 |                     provider.send(&account, &draft, context).await
+    |                                   ^^^^^^^^ help: change this to: `account`
+    |
+    = help: for further information visit https://rust-lang.github.io/rust-clippy/rust-1.99.0/index.html#needless_borrow
+
+warning: this expression creates a reference which is immediately dereferenced by the compiler
+   --> crates/overlook-app/src/sync.rs:560:41
+    |
+560 |                     set_calendar_status(&store, &acct, &SyncState::SignInRequired);
+    |                                         ^^^^^^ help: change this to: `store`
+    |
+    = help: for further information visit https://rust-lang.github.io/rust-clippy/rust-1.99.0/index.html#needless_borrow
+
+warning: this expression creates a reference which is immediately dereferenced by the compiler
+   --> crates/overlook-app/src/sync.rs:567:53
+    |
+567 |                         Some((e, c)) => cal.respond(&account, &c, e, *response).await,
+    |                                                     ^^^^^^^^ help: change this to: `account`
+    |
+    = help: for further information visit https://rust-lang.github.io/rust-clippy/rust-1.99.0/index.html#needless_borrow
+
+warning: this expression creates a reference which is immediately dereferenced by the compiler
+   --> crates/overlook-app/src/sync.rs:571:58
+    |
+571 | ...   Some((e, c)) => cal.create_event(&account, &c, e).await.and_then(|created| store.upsert_events(&[created]).map_err(|e| Provid...
+    |                                        ^^^^^^^^ help: change this to: `account`
+    |
+    = help: for further information visit https://rust-lang.github.io/rust-clippy/rust-1.99.0/index.html#needless_borrow
+
+warning: this expression creates a reference which is immediately dereferenced by the compiler
+   --> crates/overlook-app/src/sync.rs:575:65
+    |
+575 | ...   Some((e, c)) => cal.update_event_scoped(&account, &c, e, *scope).await.and_then(|updated| store.upsert_events(&[updated]).map...
+    |                                               ^^^^^^^^ help: change this to: `account`
+    |
+    = help: for further information visit https://rust-lang.github.io/rust-clippy/rust-1.99.0/index.html#needless_borrow
+
+warning: this expression creates a reference which is immediately dereferenced by the compiler
+   --> crates/overlook-app/src/sync.rs:579:73
+    |
+579 | ...   (Some(c), Some(pid)) => cal.delete_event_scoped(&account, &c, pid, *scope, recurring_event_id.as_deref(), *original_start).aw...
+    |                                                       ^^^^^^^^ help: change this to: `account`
+    |
+    = help: for further information visit https://rust-lang.github.io/rust-clippy/rust-1.99.0/index.html#needless_borrow
+
+warning: this `match` can be collapsed into the outer `match`
+   --> crates/overlook-app/src/sync.rs:613:75
+    |
+613 |                       OperationKind::DeleteContact { resource_name, .. } => match resource_name {
+    |  ___________________________________________________________________________^
+614 | |                         Some(r) => provider.delete_contact(&account, r).await,
+615 | |                         None => Ok(()),
+616 | |                     },
+    | |_____________________^
+    |
+help: the outer pattern can be modified to include the inner pattern
+   --> crates/overlook-app/src/sync.rs:613:52
+    |
+613 |                     OperationKind::DeleteContact { resource_name, .. } => match resource_name {
+    |                                                    ^^^^^^^^^^^^^ replace this binding
+614 |                         Some(r) => provider.delete_contact(&account, r).await,
+    |                         ^^^^^^^ with this pattern, prefixed by `resource_name: `
+    = help: for further information visit https://rust-lang.github.io/rust-clippy/rust-1.99.0/index.html#collapsible_match
+    = note: `#[warn(clippy::collapsible_match)]` on by default
+
+warning: this expression creates a reference which is immediately dereferenced by the compiler
+   --> crates/overlook-app/src/sync.rs:606:60
+    |
+606 | ...   Some(c) => provider.create_contact(&account, c).await.and_then(|created| store.mark_contact_synced(&acct, contact_id, &create...
+    |                                          ^^^^^^^^ help: change this to: `account`
+    |
+    = help: for further information visit https://rust-lang.github.io/rust-clippy/rust-1.99.0/index.html#needless_borrow
+
+warning: this expression creates a reference which is immediately dereferenced by the compiler
+   --> crates/overlook-app/src/sync.rs:610:60
+    |
+610 | ...   Some(c) => provider.update_contact(&account, c).await.and_then(|updated| store.mark_contact_synced(&acct, contact_id, &update...
+    |                                          ^^^^^^^^ help: change this to: `account`
+    |
+    = help: for further information visit https://rust-lang.github.io/rust-clippy/rust-1.99.0/index.html#needless_borrow
+
+warning: this expression creates a reference which is immediately dereferenced by the compiler
+   --> crates/overlook-app/src/sync.rs:614:60
+    |
+614 |                         Some(r) => provider.delete_contact(&account, r).await,
+    |                                                            ^^^^^^^^ help: change this to: `account`
+    |
+    = help: for further information visit https://rust-lang.github.io/rust-clippy/rust-1.99.0/index.html#needless_borrow
+
+warning: this expression creates a reference which is immediately dereferenced by the compiler
+   --> crates/overlook-app/src/sync.rs:642:38
+    |
+642 |                 match provider.apply(&account, &op, &messages, &labels).await {
+    |                                      ^^^^^^^^ help: change this to: `account`
+    |
+    = help: for further information visit https://rust-lang.github.io/rust-clippy/rust-1.99.0/index.html#needless_borrow
+
+warning: useless conversion to the same type: `gpui_kit::Rgba`
+  --> crates/overlook-app/src/theme.rs:46:5
+   |
+46 |     Rgba::from(gpui_kit::rgb(hex)).into()
+   |     ^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^ help: consider removing `Rgba::from()`: `gpui_kit::rgb(hex)`
+   |
+   = help: for further information visit https://rust-lang.github.io/rust-clippy/rust-1.99.0/index.html#useless_conversion
+   = note: `#[warn(clippy::useless_conversion)]` on by default
+
+warning: useless conversion to the same type: `gpui_kit::Rgba`
+   --> crates/overlook-app/src/ui/calendar.rs:117:10
+    |
+117 |     Some(Rgba::from(gpui_kit::rgb(v)).into())
+    |          ^^^^^^^^^^^^^^^^^^^^^^^^^^^^ help: consider removing `Rgba::from()`: `gpui_kit::rgb(v)`
+    |
+    = help: for further information visit https://rust-lang.github.io/rust-clippy/rust-1.99.0/index.html#useless_conversion
+
+warning: the loop variable `k` is only used to index `result`
+    --> crates/overlook-app/src/ui/calendar.rs:1534:18
+     |
+1534 |         for k in i..j {
+     |                  ^^^^
+     |
+     = help: for further information visit https://rust-lang.github.io/rust-clippy/rust-1.99.0/index.html#needless_range_loop
+     = note: `#[warn(clippy::needless_range_loop)]` on by default
+help: consider using an iterator
+     |
+1534 -         for k in i..j {
+1534 +         for <item> in result.iter_mut().take(j).skip(i) {
+     |
+
+warning: length comparison to one
+   --> crates/overlook-app/src/ui/composer.rs:236:39
+    |
+236 |         c.suggestions = if focused && last_token.len() >= 1 {
+    |                                       ^^^^^^^^^^^^^^^^^^^^^ help: using `!is_empty` is clearer and more explicit: `!last_token.is_empty()`
+    |
+    = help: for further information visit https://rust-lang.github.io/rust-clippy/rust-1.99.0/index.html#len_zero
+    = note: `#[warn(clippy::len_zero)]` on by default
+
+warning: unneeded cloning of iterator items
+   --> crates/overlook-app/src/ui/composer.rs:499:27
+    |
+499 |                   .children(c.suggestions.iter().cloned().map(|a| {
+    |  ___________________________^
+500 | |                     let header = a.to_header();
+501 | |                     Button::new(SharedString::from(format!("suggest-{}", a.email)))
+502 | |                         .xsmall()
+503 | |                         .label(if a.name.is_some() { format!("{} · {}", a.display_name(), a.email) } else { a.email.clone() })
+504 | |                         .on_click(cx.listener(move |this, _, window, cx| this.accept_suggestion(header.clone(), window, cx)))
+505 | |                 }))
+    | |__________________^
+    |
+    = help: for further information visit https://rust-lang.github.io/rust-clippy/rust-1.99.0/index.html#redundant_iter_cloned
+    = note: `#[warn(clippy::redundant_iter_cloned)]` on by default
+help: try
+    |
+499 ~                 .children(c.suggestions.iter().map(|a| {
+500 +                     let header = a.to_header();
+501 +                     Button::new(SharedString::from(format!("suggest-{}", a.email)))
+502 +                         .xsmall()
+503 ~                         .label(if a.name.is_some() { format!("{} · {}", a.display_name(), a.email) } else { a.email.clone() })
+504 +                         .on_click(cx.listener(move |this, _, window, cx| this.accept_suggestion(header.clone(), window, cx)))
+505 ~                 }))
+    |
+
+warning: this manual char comparison can be written more succinctly
+   --> crates/overlook-app/src/ui/composer.rs:977:55
+    |
+977 |             let next = if let Some(dot) = marker.find(|c: char| c == '.' || c == ')') {
+    |                                                       ^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^ help: consider using an array of `char`: `['.', ')']`
+    |
+    = help: for further information visit https://rust-lang.github.io/rust-clippy/rust-1.99.0/index.html#manual_pattern_char_comparison
+    = note: `#[warn(clippy::manual_pattern_char_comparison)]` on by default
+
+warning: needlessly taken reference of left operand
+   --> crates/overlook-app/src/ui/contacts.rs:160:96
+    |
+160 |         let mut contact = match editing.as_deref().and_then(|id| self.contacts.iter().find(|c| &c.id == id).cloned()) {
+    |                                                                                                -----^^^^^^
+    |                                                                                                |
+    |                                                                                                help: use the left value directly: `c.id`
+    |
+    = help: for further information visit https://rust-lang.github.io/rust-clippy/rust-1.99.0/index.html#op_ref
+    = note: `#[warn(clippy::op_ref)]` on by default
+
+warning: stripping a prefix manually
+   --> crates/overlook-app/src/ui/mail_highlight.rs:155:34
+    |
+155 |             if let Some(close) = rest[1..].find('`') {
+    |                                  ^^^^^^^^^
+    |
+note: the prefix was tested here
+   --> crates/overlook-app/src/ui/mail_highlight.rs:154:9
+    |
+154 |         if rest.starts_with('`') {
+    |         ^^^^^^^^^^^^^^^^^^^^^^^^^
+    = help: for further information visit https://rust-lang.github.io/rust-clippy/rust-1.99.0/index.html#manual_strip
+    = note: `#[warn(clippy::manual_strip)]` on by default
+help: try using the `strip_prefix` method
+    |
+154 ~         if let Some(<stripped>) = rest.strip_prefix('`') {
+155 ~             if let Some(close) = <stripped>.find('`') {
+    |
+
+warning: consider using `sort_by_key`
+  --> crates/overlook-app/src/ui/palette.rs:96:9
+   |
+96 |         user.sort_by(|a, b| a.name.to_lowercase().cmp(&b.name.to_lowercase()));
+   |         ^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^
+   |
+   = help: for further information visit https://rust-lang.github.io/rust-clippy/rust-1.99.0/index.html#unnecessary_sort_by
+   = note: `#[warn(clippy::unnecessary_sort_by)]` on by default
+help: try
+   |
+96 -         user.sort_by(|a, b| a.name.to_lowercase().cmp(&b.name.to_lowercase()));
+96 +         user.sort_by_key(|a| a.name.to_lowercase());
+   |
+
+warning: useless use of `format!`
+   --> crates/overlook-app/src/ui/settings.rs:501:29
+    |
+501 |             .child(section(&format!("{}", account.email), Some(&connection_line)))
+    |                             ^^^^^^^^^^^^^^^^^^^^^^^^^^^^ help: consider using `.to_string()`: `account.email.to_string()`
+    |
+    = help: for further information visit https://rust-lang.github.io/rust-clippy/rust-1.99.0/index.html#useless_format
+    = note: `#[warn(clippy::useless_format)]` on by default
+
+warning: useless conversion to the same type: `gpui_kit::Rgba`
+    --> crates/overlook-app/src/ui/reader.rs:1143:27
+     |
+1143 |         let mut h: Hsla = Rgba::from(gpui_kit::rgb(hex)).into();
+     |                           ^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^ help: consider removing `Rgba::from()`: `gpui_kit::rgb(hex)`
+     |
+     = help: for further information visit https://rust-lang.github.io/rust-clippy/rust-1.99.0/index.html#useless_conversion
+
+warning: useless conversion to the same type: `gpui_kit::Rgba`
+    --> crates/overlook-app/src/ui/reader.rs:1148:9
+     |
+1148 |         Rgba::from(gpui_kit::rgb(hex)).into()
+     |         ^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^ help: consider removing `Rgba::from()`: `gpui_kit::rgb(hex)`
+     |
+     = help: for further information visit https://rust-lang.github.io/rust-clippy/rust-1.99.0/index.html#useless_conversion
+
+warning: very complex type used. Consider factoring parts into `type` definitions
+   --> crates/overlook-app/src/ui/mod.rs:402:32
+    |
+402 |     pub(crate) browser_bodies: std::cell::RefCell<HashMap<String, (u64, usize, Entity<crate::browser_body::BrowserBody>)>>,
+    |                                ^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^
+    |
+    = help: for further information visit https://rust-lang.github.io/rust-clippy/rust-1.99.0/index.html#type_complexity
+    = note: `#[warn(clippy::type_complexity)]` on by default
+
+warning: equality checks against false can be replaced by a negation
+   --> crates/overlook-app/src/ui/mod.rs:979:24
+    |
+979 |                       if this.update(cx, |this, cx| {
+    |  ________________________^
+980 | |                         if this.update.phase == UpdatePhase::Downloading {
+981 | |                             cx.notify();
+982 | |                             true
+...   |
+986 | |                     }).unwrap_or(false) == false
+    | |________________________________________________^
+    |
+    = help: for further information visit https://rust-lang.github.io/rust-clippy/rust-1.99.0/index.html#bool_comparison
+    = note: `#[warn(clippy::bool_comparison)]` on by default
+help: try
+    |
+979 ~                     if !this.update(cx, |this, cx| {
+980 +                         if this.update.phase == UpdatePhase::Downloading {
+981 +                             cx.notify();
+982 +                             true
+983 +                         } else {
+984 +                             false
+985 +                         }
+986 +                     }).unwrap_or(false)
+    |
+
+warning: this block may be rewritten with the `?` operator
+    --> crates/overlook-app/src/ui/mod.rs:1866:25
+     |
+1866 | /                         if m.body.html.is_none() {
+1867 | |                             return None; // Plain text is drawn natively.
+1868 | |                         }
+     | |_________________________^ help: replace it with: `m.body.html.as_ref()?;`
+     |
+     = help: for further information visit https://rust-lang.github.io/rust-clippy/rust-1.99.0/index.html#question_mark
+     = note: `#[warn(clippy::question_mark)]` on by default
+
+warning: this block may be rewritten with the `?` operator
+    --> crates/overlook-app/src/ui/mod.rs:3020:16
+     |
+3020 |           } else if let Some(reason) = self.active_issue() {
+     |  ________________^
+3021 | |             ("key-round", reason.clone(), Some((self.sign_in_again_label(), true)), p.warning)
+3022 | |         } else {
+3023 | |             return None;
+3024 | |         };
+     | |_________^
+     |
+     = help: for further information visit https://rust-lang.github.io/rust-clippy/rust-1.99.0/index.html#question_mark
+help: replace it with
+     |
+3020 ~         } else {
+3021 +             let reason = self.active_issue()?;
+3022 +             ("key-round", reason.clone(), Some((self.sign_in_again_label(), true)), p.warning)
+3023 ~         };
+     |
+
+warning: useless conversion to the same type: `gpui_kit::Rgba`
+    --> crates/overlook-app/src/ui/mod.rs:3124:26
+     |
+3124 |     let midnight: Hsla = Rgba::from(gpui_kit::rgb(0x101C24)).into();
+     |                          ^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^ help: consider removing `Rgba::from()`: `gpui_kit::rgb(0x101C24)`
+     |
+     = help: for further information visit https://rust-lang.github.io/rust-clippy/rust-1.99.0/index.html#useless_conversion
+
+warning: useless conversion to the same type: `gpui_kit::Rgba`
+    --> crates/overlook-app/src/ui/mod.rs:3125:23
+     |
+3125 |     let ivory: Hsla = Rgba::from(gpui_kit::rgb(0xF0EBDD)).into();
+     |                       ^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^ help: consider removing `Rgba::from()`: `gpui_kit::rgb(0xF0EBDD)`
+     |
+     = help: for further information visit https://rust-lang.github.io/rust-clippy/rust-1.99.0/index.html#useless_conversion
+
+warning: useless conversion to the same type: `gpui_kit::Rgba`
+    --> crates/overlook-app/src/ui/mod.rs:3126:23
+     |
+3126 |     let amber: Hsla = Rgba::from(gpui_kit::rgb(0xFF9D32)).into();
+     |                       ^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^ help: consider removing `Rgba::from()`: `gpui_kit::rgb(0xFF9D32)`
+     |
+     = help: for further information visit https://rust-lang.github.io/rust-clippy/rust-1.99.0/index.html#useless_conversion
+
+warning: `overlook` (bin "overlook") generated 36 warnings (run `cargo clippy --fix --bin "overlook" -p overlook -- ` to apply 30 suggestions)
+warning: variable does not need to be mutable
+    --> crates/overlook-app/src/browser_engine.rs:1955:22
+     |
+1955 |                 let (mut socket, _) = match server.accept() {
+     |                      ----^^^^^^
+     |                      |
+     |                      help: remove this `mut`
+     |
+     = note: `#[warn(unused_mut)]` (part of `#[warn(unused)]`) on by default
+
+warning: items after a test module
+   --> crates/overlook-app/src/main.rs:123:1
+    |
+123 | mod security_tests {
+    | ^^^^^^^^^^^^^^^^^^
+...
+155 | fn main() {
+    | ^^^^^^^^^
+    |
+    = help: for further information visit https://rust-lang.github.io/rust-clippy/rust-1.99.0/index.html#items_after_test_module
+    = note: `#[warn(clippy::items_after_test_module)]` on by default
+    = help: move the items to before the test module was defined
+
+warning: unnecessary use of `clone` to create a slice from a reference
+    --> crates/overlook-app/src/sync.rs:1324:68
+     |
+1324 |         let applied = pollster_block(live.apply(&env.account, &op, &[third.clone()], &labels)).unwrap();
+     |                                                                    ^^^^^^^^^^^^^^^^ help: try: `std::slice::from_ref(&third)`
+     |
+     = help: for further information visit https://rust-lang.github.io/rust-clippy/rust-1.99.0/index.html#cloned_ref_to_slice_refs
+     = note: `#[warn(clippy::cloned_ref_to_slice_refs)]` on by default
+
+warning: `overlook` (bin "overlook" test) generated 39 warnings (36 duplicates) (run `cargo clippy --fix --bin "overlook" -p overlook --tests -- ` to apply 3 suggestions)
+    Finished `dev` profile [optimized + debuginfo] target(s) in 1.86s

@@ -9,6 +9,9 @@
 pub mod appearance;
 pub mod browser;
 pub mod calendar;
+pub mod calendar_connection;
+pub mod caldav_change;
+pub use caldav_change::*;
 pub mod compose;
 pub mod focus;
 pub mod ics;
@@ -28,6 +31,7 @@ pub mod tz;
 pub use appearance::{AppearancePreference, ResolvedTheme, SystemAppearance};
 pub use browser::{prepare_document, BrowserDocument};
 pub use calendar::*;
+pub use calendar_connection::*;
 pub use focus::{classify_focus, FocusRule, FocusTab};
 pub use ids::*;
 pub use model::*;

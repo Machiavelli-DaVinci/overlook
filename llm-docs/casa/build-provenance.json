@@ -1,0 +1,9 @@
+{
+  "date": "2026-10-22",
+  "baseline": "b80893a5927d3d6d65592f845409b7b5984b351d",
+  "binary": "target/release/overlook",
+  "version": "overlook 1.5.5",
+  "sha256": "701c68bc49d45ad693f0ce3a2ac9a21f6cdcd259e2e16ebd8970b0d0114e7057",
+  "build": "cargo build --release --locked --offline -p overlook",
+  "installed_or_distributed": false
+}

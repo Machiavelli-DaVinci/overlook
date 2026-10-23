@@ -177,7 +177,7 @@ pub mod fake {
     use base64::Engine;
     use std::io::{BufRead, BufReader, Read, Write};
     use std::net::{Shutdown, SocketAddr, TcpListener, TcpStream};
-    use std::sync::{mpsc, Arc, Mutex};
+    use std::sync::{mpsc, Arc, Condvar, Mutex};
     use std::time::Duration;
 
     /// How the scripted server misbehaves, if at all.
@@ -221,9 +221,21 @@ pub mod fake {
         pub addr: SocketAddr,
         pub behaviour: Arc<Mutex<Behaviour>>,
         pub seen: Arc<Mutex<Vec<Seen>>>,
+        completed: Arc<Condvar>,
     }
 
     impl FakeSmtp {
+        /// The client can receive the QUIT reply before the worker publishes its
+        /// transcript. Wait for that separate completion instead of racing it.
+        pub fn wait_for_connections(&self, count: usize) -> Vec<Seen> {
+            let seen = self.seen.lock().unwrap();
+            let (seen, _) = self.completed.wait_timeout_while(
+                seen, Duration::from_secs(10), |seen| seen.len() < count,
+            ).unwrap();
+            assert!(seen.len() >= count, "SMTP fixture timed out: expected {count} completed connections, got {}", seen.len());
+            seen.clone()
+        }
+
         pub fn set(&self, behaviour: Behaviour) {
             *self.behaviour.lock().unwrap() = behaviour;
         }
@@ -238,20 +250,24 @@ pub mod fake {
         let addr = listener.local_addr().unwrap();
         let behaviour = Arc::new(Mutex::new(behaviour));
         let seen: Arc<Mutex<Vec<Seen>>> = Arc::new(Mutex::new(Vec::new()));
+        let completed = Arc::new(Condvar::new());
         let (b, s) = (behaviour.clone(), seen.clone());
+        let ready = completed.clone();
         std::thread::spawn(move || {
             for stream in listener.incoming() {
                 let Ok(stream) = stream else { break };
                 let _ = stream.set_read_timeout(Some(Duration::from_secs(5)));
                 let behaviour = *b.lock().unwrap();
                 let s = s.clone();
+                let ready = ready.clone();
                 std::thread::spawn(move || {
                     let result = script(stream, behaviour);
                     s.lock().unwrap().push(result);
+                    ready.notify_all();
                 });
             }
         });
-        FakeSmtp { addr, behaviour, seen }
+        FakeSmtp { addr, behaviour, seen, completed }
     }
 
     fn script(mut stream: TcpStream, behaviour: Behaviour) -> Seen {

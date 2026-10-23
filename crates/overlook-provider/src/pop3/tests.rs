@@ -374,7 +374,7 @@ fn send_goes_over_smtp_and_keeps_a_local_sent_copy() {
     let m = &receipt.message;
     assert_eq!(m.label_ids.iter().map(|l| l.as_str()).collect::<Vec<_>>(), vec!["pop3:jason@example.com:sent"]);
     assert!(m.is_read && m.is_outgoing && m.id.0.starts_with("pop3:jason@example.com:"));
-    let seen = smtp.seen.lock().unwrap();
+    let seen = smtp.wait_for_connections(1);
     assert_eq!(seen.len(), 1);
     assert_eq!(seen[0].auth.as_ref().map(|(u, p)| (u.as_str(), p.as_str())), Some(("jason@example.com", "other")));
     assert_eq!(seen[0].rcpt, vec!["RCPT TO:<ada@example.com>", "RCPT TO:<jason@example.com>"]);

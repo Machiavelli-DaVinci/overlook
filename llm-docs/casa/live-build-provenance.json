@@ -1,0 +1,11 @@
+{
+  "source_commit": "5146faa939922efc006732fc1f59060acac8aaee",
+  "binary_sha256": "7e1776bf9758faa80c6b222436a96ced215a8d7e9c582eae7c0d4d9ae510c226",
+  "version": "1.5.5",
+  "build_command": "cargo build --release --locked --offline -p overlook",
+  "cargo_lock_sha256": "1af23de08e85966328e49e6769f9dcd431be010165a7e5891d795aa90d97b289",
+  "cargo_lock_has_uncommitted_patch": true,
+  "initial_evidence_source_hashes_still_match": true,
+  "launched_locally": true,
+  "installed_published_or_distributed_by_assessment": false
+}

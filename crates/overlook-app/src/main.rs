@@ -5,6 +5,7 @@ mod backup;
 mod browser_engine;
 mod browser_body;
 mod credentials;
+mod caldav_sync;
 mod google_signin;
 mod notify;
 mod persist;

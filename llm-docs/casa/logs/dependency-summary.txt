@@ -1,0 +1,14 @@
+Scan: cargo-audit 0.22.2 / RustSec / 2026-10-22
+Known vulnerabilities: 0
+Maintenance warnings: 8 (not suppressed)
+Database: None
+
+Warnings:
+instant 0.1.13 — RUSTSEC-2024-0384 — `instant` is unmaintained
+paste 1.0.15 — RUSTSEC-2024-0436 — paste - no longer maintained
+rustls-pemfile 2.2.0 — RUSTSEC-2025-0134 — rustls-pemfile is unmaintained
+rustybuzz 0.20.1 — RUSTSEC-2026-0206 — `rustybuzz` is unmaintained
+ttf-parser 0.25.1 — RUSTSEC-2026-0192 — `ttf-parser` is unmaintained
+zbus_names 4.3.4 — RUSTSEC-2026-0371 — `zbus_names` is unmaintained
+zvariant 5.15.0 — RUSTSEC-2026-0370 — `zvariant` is unmaintained
+zvariant_derive 5.15.0 — RUSTSEC-2026-0372 — `zvariant_derive` is unmaintained

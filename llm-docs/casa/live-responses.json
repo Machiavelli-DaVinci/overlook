@@ -1,0 +1,16 @@
+[
+  {
+    "id": "6.5.1",
+    "applicable": "1",
+    "comment": "Overlook native Linux desktop app. OAuth tokens, client-secret values and PKCE verifiers have redacted Debug output; both log sinks exclude protocol/keyring logging even when trace is requested. A live Google sign-in was completed by the owner on 2026-10-22 using an isolated profile and the patched v1.5.5 build. Authenticated sync downloaded 93 messages and reported up-to-date; OS-keyring metadata confirmed one stored OAuth item without reading its secret. A real login-session log sample is attached with account identifiers redacted. Credential-pattern checks found no matches; this is supplementary evidence, not proof against every possible secret format. Live logging was info level; the earlier synthetic regression tests trace-level filtering. No payment process exists. See the live supplement for build identity and limitations.",
+    "validation": "User-completed live Google login, authenticated sync, OS-keyring metadata, and sanitized real log verified on 2026-10-22. Secret values were not retrieved. Earlier synthetic trace-level test remains supplemental.",
+    "evidence": "/home/jason/coding/omarchy-overlook/llm-docs/casa/evidence/casa-6.5.1-live.png"
+  },
+  {
+    "id": "2.2.1",
+    "applicable": "1",
+    "comment": "Overlook native Linux desktop app. Remove account disables the shared Gmail client, drains in-flight work, revokes the Google grant over HTTPS, clears in-memory tokens, then deletes OS-keyring entries and local account data. Failed revocation or keyring deletion reports incomplete removal and retains retry information. On 2026-10-22 the owner completed a live sign-in/removal test: authenticated sync downloaded 93 messages; before removal one OAuth keyring item existed; afterward the Gmail account, its cached messages/sync state and all matching keyring items were absent. The completed guarded cleanup demonstrates the revocation path returned success; no independent revoked-token replay or HTTP trace was captured. Removal requires connectivity and affects the user’s grant across this Google project’s devices/scopes. Provider passwords are removed locally, not changed at their issuer. See live supplement and source/regression evidence.",
+    "validation": "Live user-driven sign-in/removal and before/after profile/keyring metadata verified. Remote revocation success is inferred from the guarded application path; no independent token replay performed.",
+    "evidence": "/home/jason/coding/omarchy-overlook/llm-docs/casa/evidence/casa-2.2.1-live.png"
+  }
+]
